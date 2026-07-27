@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import {
   IconAlertTriangle,
-  IconCalendarTime,
   IconRefresh
 } from '@tabler/icons-vue'
 import type { CodexAccountView, CodexQuotaResult } from '#shared/types/codex'
@@ -10,6 +9,7 @@ const props = defineProps<{
   account: CodexAccountView
   quota?: CodexQuotaResult
   loading?: boolean
+  scheduleStatus?: 'available' | 'paused'
 }>()
 
 defineEmits<{ refresh: [id: string] }>()
@@ -29,7 +29,17 @@ const extraWindows = computed(() =>
   )
 )
 
+const weeklyWindow = computed(() =>
+  props.quota?.windows.find((window) => window.kind === 'weekly')
+)
+
+const quotaUnavailable = computed(() => {
+  const remaining = weeklyWindow.value?.remainingPercent
+  return typeof remaining === 'number' && remaining <= 0
+})
+
 const cardTone = computed(() => {
+  if (quotaUnavailable.value) return 'neutral'
   const values = [primaryWindow.value?.remainingPercent, secondaryWindow.value?.remainingPercent]
     .filter((value): value is number => typeof value === 'number')
   const minimum = values.length ? Math.min(...values) : null
@@ -65,13 +75,21 @@ function refreshedText(value: number | undefined) {
 </script>
 
 <template>
-  <article class="quota-ticket" :data-tone="cardTone">
+  <article class="quota-ticket" :data-tone="cardTone" :data-unavailable="quotaUnavailable">
     <header class="quota-ticket__header">
       <div class="quota-ticket__identity">
         <h2>{{ account.email || account.name }}</h2>
       </div>
-      <div class="quota-ticket__plan">
-        {{ quota?.planType || account.planType || 'Codex' }}
+      <div class="quota-ticket__meta">
+        <div class="quota-ticket__plan">
+          {{ quota?.planType || account.planType || 'Codex' }}
+        </div>
+        <div v-if="quotaUnavailable || scheduleStatus" class="quota-ticket__states">
+          <span v-if="quotaUnavailable" class="quota-ticket__state" data-tone="neutral">额度不可用</span>
+          <span v-if="scheduleStatus" class="quota-ticket__state" :data-tone="scheduleStatus === 'available' ? 'healthy' : 'warning'">
+            <strong>{{ scheduleStatus === 'available' ? '可调度' : '不可调度' }}</strong>
+          </span>
+        </div>
       </div>
     </header>
 
@@ -89,34 +107,32 @@ function refreshedText(value: number | undefined) {
     </div>
 
     <div v-else class="quota-ticket__content">
-      <section class="quota-ticket__primary">
-        <div class="quota-ticket__metric-label">
-          <span>{{ primaryWindow?.label || '5 小时额度' }}</span>
+      <section
+        class="quota-ticket__primary quota-ticket__window"
+        :style="{ '--quota-level': `${primaryWindow?.remainingPercent ?? 0}%` }"
+      >
+        <div>
+          <span class="quota-ticket__window-label">{{ primaryWindow?.label || '5 小时额度' }}</span>
+          <div class="quota-ticket__window-number">
+            <strong>{{ percent(primaryWindow?.remainingPercent) }}</strong><span>%</span>
+          </div>
         </div>
-        <div class="quota-ticket__number">
-          <strong>{{ percent(primaryWindow?.remainingPercent) }}</strong><span>%</span>
-        </div>
-        <p>当前可用</p>
-        <div class="quota-ticket__rule" aria-hidden="true">
-          <span :style="{ width: `${primaryWindow?.remainingPercent ?? 0}%` }" />
-        </div>
-        <div class="quota-ticket__reset">
-          <IconCalendarTime :size="18" :stroke-width="1.8" />
-          {{ resetText(primaryWindow?.resetAt) }}
+        <div class="quota-ticket__window-reset">
+          <strong>{{ resetText(primaryWindow?.resetAt) }}</strong>
         </div>
       </section>
 
       <section
-        class="quota-ticket__secondary"
+        class="quota-ticket__secondary quota-ticket__window"
         :style="{ '--quota-level': `${secondaryWindow?.remainingPercent ?? 0}%` }"
       >
         <div>
-          <span class="quota-ticket__secondary-label">{{ secondaryWindow?.label || '每周额度' }}</span>
-          <div class="quota-ticket__secondary-number">
+          <span class="quota-ticket__window-label">{{ secondaryWindow?.label || '每周额度' }}</span>
+          <div class="quota-ticket__window-number">
             <strong>{{ percent(secondaryWindow?.remainingPercent) }}</strong><span>%</span>
           </div>
         </div>
-        <div class="quota-ticket__secondary-reset">
+        <div class="quota-ticket__window-reset">
           <strong>{{ resetText(secondaryWindow?.resetAt) }}</strong>
         </div>
       </section>

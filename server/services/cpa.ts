@@ -326,5 +326,8 @@ export async function refreshAllCodexQuotas(event: H3Event, concurrency = 5) {
   }
 
   await Promise.all(Array.from({ length: Math.min(concurrency, accounts.length) }, () => worker()))
-  return results
+  return {
+    accounts: accounts.map((account) => account.view),
+    results
+  }
 }

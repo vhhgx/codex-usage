@@ -1,0 +1,40 @@
+export interface Sub2ApiAccountView {
+  id: string
+  name: string
+  notes: string | null
+  platform: string
+  accountType: string
+  status: string
+  schedulable: boolean
+  errorMessage: string | null
+  expiresAt: number | null
+  concurrency: number
+  currentConcurrency: number
+}
+
+export interface Sub2ApiAccountQuotaWindow {
+  id: string
+  label: string
+  usedPercent: number | null
+  remainingPercent: number | null
+  used: number | null
+  limit: number | null
+  resetAt: number | null
+}
+
+export interface Sub2ApiAccountQuotaResult extends Sub2ApiAccountView {
+  quotaStatus: 'success' | 'error'
+  planType: string | null
+  windows: Sub2ApiAccountQuotaWindow[]
+  refreshedAt: number
+  usageSource: 'passive' | 'active'
+  error?: string
+}
+
+export interface Sub2ApiAccountsResponse {
+  results: Sub2ApiAccountQuotaResult[]
+  accountCount: number
+  successCount: number
+  failureCount: number
+  generatedAt: number
+}

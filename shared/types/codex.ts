@@ -41,6 +41,7 @@ export interface CodexAccountsResponse {
 }
 
 export interface CodexRefreshAllResponse {
+  accounts: CodexAccountView[]
   results: CodexQuotaResult[]
   successCount: number
   failureCount: number

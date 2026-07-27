@@ -6,7 +6,14 @@ export function normalizeBaseUrl(value: unknown) {
 
 export function requireUpstreamConfig(
   event: H3Event,
-  keys: Array<'cpaBaseUrl' | 'cpaManagementKey' | 'cpampBaseUrl' | 'cpampAdminKey'>
+  keys: Array<
+    | 'cpaBaseUrl'
+    | 'cpaManagementKey'
+    | 'cpampBaseUrl'
+    | 'cpampAdminKey'
+    | 'sub2apiBaseUrl'
+    | 'sub2apiAdminApiKey'
+  >
 ) {
   const config = useRuntimeConfig(event)
   for (const key of keys) {

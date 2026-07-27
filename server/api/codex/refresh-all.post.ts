@@ -4,8 +4,9 @@ import { enforceRateLimit } from '../../utils/rate-limit'
 
 export default defineEventHandler(async (event): Promise<CodexRefreshAllResponse> => {
   enforceRateLimit(event, 'codex-refresh-all', 12, 60 * 1000)
-  const results = await refreshAllCodexQuotas(event)
+  const { accounts, results } = await refreshAllCodexQuotas(event)
   return {
+    accounts,
     results,
     successCount: results.filter((result) => result.quotaStatus === 'success').length,
     failureCount: results.filter((result) => result.quotaStatus === 'error').length,

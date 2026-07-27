@@ -31,3 +31,10 @@ export function opaqueAccountId(event: H3Event, authIndex: string) {
     .digest('base64url')
     .slice(0, 24)
 }
+
+export function opaqueSub2ApiAccountId(event: H3Event, accountId: number) {
+  return createHmac('sha256', requireAccountIdSecret(event))
+    .update(`sub2api-account:${accountId}`)
+    .digest('base64url')
+    .slice(0, 24)
+}

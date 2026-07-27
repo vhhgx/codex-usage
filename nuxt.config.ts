@@ -8,6 +8,8 @@ export default defineNuxtConfig({
     cpaManagementKey: '',
     cpampBaseUrl: '',
     cpampAdminKey: '',
+    sub2apiBaseUrl: '',
+    sub2apiAdminApiKey: '',
     accountIdSecret: '',
     public: {
       appName: 'Zephyr Console'

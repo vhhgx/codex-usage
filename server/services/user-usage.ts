@@ -152,6 +152,7 @@ export async function queryUserUsage(
       }
     )
     return {
+      source: 'cpa',
       range,
       from: resolved.from,
       to: resolved.to,
