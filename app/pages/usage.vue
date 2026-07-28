@@ -17,6 +17,7 @@ import type {
 } from '#shared/types/sub2api-admin'
 import type { CodexRadarModel, CodexRadarResponse } from '#shared/types/codex-radar'
 import {
+  CODEX_RADAR_INTELLIGENCE_URL,
   CODEX_RADAR_URL,
   parseCodexRadarPayload
 } from '#shared/utils/codex-radar'
@@ -171,15 +172,6 @@ const subCards = computed(() => subResults.value.map((item) => ({
   scheduleStatus: subScheduleStatus(item)
 })))
 
-const radarModelOrder = ['gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.5']
-const radarReasoningOrder = ['max', 'xhigh', 'high', 'medium', 'low', 'minimal']
-
-function radarModelGroup(model: string) {
-  const normalized = model.trim().toLowerCase()
-  if (normalized === 'gpt-5.6' || normalized === '5.6' || normalized.endsWith('5.6-sol')) return 'gpt-5.6-sol'
-  return radarModelOrder.find((name) => normalized === name || normalized.endsWith(name.slice(4))) || normalized
-}
-
 function radarModelLabel(model: string) {
   return model.replace(/^gpt-/i, '')
 }
@@ -187,28 +179,30 @@ function radarModelLabel(model: string) {
 const radarGroups = computed(() => {
   const groups = new Map<string, CodexRadarModel[]>()
   radar.value?.models.forEach((model) => {
-    const name = radarModelGroup(model.model)
+    const name = model.model.trim().toLowerCase()
     groups.set(name, [...(groups.get(name) || []), model])
   })
 
-  return [...groups.entries()]
-    .sort(([left], [right]) => {
-      const leftIndex = radarModelOrder.indexOf(left)
-      const rightIndex = radarModelOrder.indexOf(right)
-      if (leftIndex === -1 && rightIndex === -1) return left.localeCompare(right)
-      if (leftIndex === -1) return 1
-      if (rightIndex === -1) return -1
-      return leftIndex - rightIndex
-    })
-    .map(([model, models]) => ({
-      model,
-      models: models.sort((left, right) => {
-        const leftIndex = radarReasoningOrder.indexOf(left.reasoningEffort.toLowerCase())
-        const rightIndex = radarReasoningOrder.indexOf(right.reasoningEffort.toLowerCase())
-        return (leftIndex === -1 ? 99 : leftIndex) - (rightIndex === -1 ? 99 : rightIndex)
-      })
-    }))
+  return [...groups.entries()].map(([model, models]) => ({
+    model,
+    models: [...models].sort((left, right) =>
+      right.costUsd - left.costUsd || left.reasoningEffort.localeCompare(right.reasoningEffort)
+    )
+  }))
 })
+
+async function loadRadarDirect() {
+  let lastError: unknown
+  for (const url of [CODEX_RADAR_INTELLIGENCE_URL, CODEX_RADAR_URL]) {
+    try {
+      const payload = await $fetch<unknown>(url, { timeout: 10_000, retry: 0 })
+      return parseCodexRadarPayload(payload)
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError
+}
 
 async function loadSubAccounts() {
   subLoadingAccounts.value = true
@@ -268,10 +262,7 @@ async function loadRadar() {
       requestFetch<CodexRadarResponse>('/api/codex-radar')
     ]
     if (import.meta.client) {
-      requests.push(
-        $fetch<unknown>(CODEX_RADAR_URL, { timeout: 10_000, retry: 0 })
-          .then((payload) => parseCodexRadarPayload(payload))
-      )
+      requests.push(loadRadarDirect())
     }
     radar.value = await Promise.any(requests)
   } catch (value) {

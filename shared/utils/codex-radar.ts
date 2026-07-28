@@ -6,6 +6,7 @@ import type {
 type UnknownRecord = Record<string, unknown>
 
 export const CODEX_RADAR_URL = 'https://codexradar.com/current.json'
+export const CODEX_RADAR_INTELLIGENCE_URL = 'https://codexradar.com/data/intelligence-efficiency.json'
 
 function record(value: unknown): UnknownRecord | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -56,6 +57,31 @@ function modelFrom(value: unknown, fallbackId: string): CodexRadarModel | null {
   }
 }
 
+function intelligenceModelFrom(value: unknown, fallbackId: string): CodexRadarModel | null {
+  const item = record(value)
+  if (!item) return null
+  const model = text(item.model)
+  const reasoningEffort = text(item.effort)
+  const intelligenceScore = numberValue(item.iq)
+  const passed = nonNegative(item.passed)
+  const tasks = nonNegative(item.valid_tasks)
+  const costUsd = nonNegative(item.average_price_usd)
+  const averageMinutes = nonNegative(item.average_minutes)
+  if (!model || !reasoningEffort || intelligenceScore === null || passed === null ||
+    tasks === null || costUsd === null || averageMinutes === null) return null
+
+  return {
+    id: `${model}:${reasoningEffort}:${fallbackId}`,
+    model,
+    reasoningEffort,
+    intelligenceScore,
+    passed: Math.round(passed),
+    tasks: Math.round(tasks),
+    costUsd,
+    wallSeconds: averageMinutes * 60
+  }
+}
+
 function timestamp(value: unknown): number | null {
   const parsed = Date.parse(text(value))
   return Number.isNaN(parsed) ? null : parsed
@@ -66,6 +92,28 @@ export function parseCodexRadarPayload(
   now = Date.now()
 ): CodexRadarResponse {
   const root = record(payload)
+  const points = root?.points
+  if (Array.isArray(points)) {
+    const models: CodexRadarModel[] = []
+    const seen = new Set<string>()
+    points.forEach((point, index) => {
+      const model = intelligenceModelFrom(point, `point-${index}`)
+      if (!model) return
+      const key = `${model.model}:${model.reasoningEffort}`
+      if (seen.has(key)) return
+      seen.add(key)
+      models.push(model)
+    })
+
+    if (!models.length) throw new Error('CodexRadar 没有可用的模型评分')
+    return {
+      models,
+      updatedAt: timestamp(root?.source_updated_at),
+      fetchedAt: now,
+      sourceUrl: CODEX_RADAR_INTELLIGENCE_URL
+    }
+  }
+
   const modelIq = record(root?.model_iq)
   if (!modelIq) throw new Error('CodexRadar 响应缺少 model_iq')
 
@@ -90,10 +138,9 @@ export function parseCodexRadarPayload(
 
   if (!models.length) throw new Error('CodexRadar 没有可用的模型评分')
 
-  const quotaRadar = record(modelIq.quota_radar)
   return {
     models,
-    updatedAt: timestamp(quotaRadar?.updated_at),
+    updatedAt: timestamp(modelIq.updated_at) ?? timestamp(record(modelIq.latest)?.date),
     fetchedAt: now,
     sourceUrl: CODEX_RADAR_URL
   }
