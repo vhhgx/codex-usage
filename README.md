@@ -3,6 +3,7 @@
 Zephyr Hub 是基于 Nuxt 4/Nitro 的 OpenAI 兼容聚合网关。它使用统一的 Hub Key 接收客户端请求，在多个 CPA 或 Sub2API 渠道之间调度，并记录逐次调用日志、用量和成本。
 
 详细设计见 [HUB_ARCHITECTURE.md](./HUB_ARCHITECTURE.md)。
+完整的云服务器部署、数据迁移、更新和恢复步骤见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
 
 ## 主要能力
 
