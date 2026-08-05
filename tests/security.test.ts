@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { hashApiKey, safeEqual } from '../server/utils/security'
+import { rateLimitKey } from '../server/utils/rate-limit'
 
 describe('API key security helpers', () => {
   it('matches CPA Manager Plus SHA-256 normalization', () => {
@@ -11,5 +12,11 @@ describe('API key security helpers', () => {
   it('compares secrets without leaking string length', () => {
     expect(safeEqual('same-secret', 'same-secret')).toBe(true)
     expect(safeEqual('same-secret', 'different')).toBe(false)
+  })
+
+  it('does not store the client address in Redis rate-limit keys', () => {
+    const key = rateLimitKey('login', '203.0.113.8')
+    expect(key).toMatch(/^hub:rate-limit:login:[a-f0-9]{64}$/)
+    expect(key).not.toContain('203.0.113.8')
   })
 })

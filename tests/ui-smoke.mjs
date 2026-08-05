@@ -1,0 +1,432 @@
+import { mkdir } from 'node:fs/promises'
+import { createCipheriv, randomBytes, randomUUID } from 'node:crypto'
+import argon2 from 'argon2'
+import { chromium } from 'playwright'
+import postgres from 'postgres'
+
+const baseUrl = process.env.UI_SMOKE_URL || 'http://127.0.0.1:3000'
+let username = process.env.UI_SMOKE_ADMIN_USERNAME || 'admin'
+let password = process.env.UI_SMOKE_ADMIN_PASSWORD || process.env.NUXT_ADMIN_PASSWORD || ''
+let userUsername = process.env.UI_SMOKE_USER_USERNAME || ''
+let userPassword = process.env.UI_SMOKE_USER_PASSWORD || ''
+const output = process.env.UI_SMOKE_OUTPUT || '/tmp/zephyr-ui-smoke'
+const pages = process.env.UI_SMOKE_PAGES?.split(',').filter(Boolean) || ['/admin/users', '/admin/channels', '/admin/keys', '/admin/models', '/admin/settings', '/admin/audits', '/admin/account-vault', '/admin/upstreams']
+const userPages = process.env.UI_SMOKE_USER_PAGES?.split(',').filter(Boolean) || ['/console', '/console/keys', '/console/groups', '/console/models', '/console/announcements', '/console/logs']
+const viewports = [{ name: 'desktop', width: 1440, height: 1000 }, { name: 'mobile', width: 390, height: 844 }]
+const bootstrap = process.env.UI_SMOKE_BOOTSTRAP === '1'
+const skipFormLogin = process.env.UI_SMOKE_SKIP_FORM_LOGIN === '1'
+const skipUser = process.env.UI_SMOKE_SKIP_USER === '1'
+let fixtureDb
+let fixtureIds = []
+let fixtureAnnouncementIds = []
+let fixtureAccountIds = []
+let fixtureBindingIds = []
+let fixtureReceiverIds = []
+
+function syntheticJwt(payload) {
+  const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url')
+  return `${encode({ alg: 'none', typ: 'JWT' })}.${encode(payload)}.synthetic`
+}
+
+function encryptedFixturePassword(id, value) {
+  const key = Buffer.from(String(process.env.NUXT_ENCRYPTION_KEY || ''), 'base64')
+  if (key.length !== 32) throw new Error('UI smoke bootstrap requires a 32-byte NUXT_ENCRYPTION_KEY')
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', key, iv)
+  cipher.setAAD(Buffer.from(`zephyr-context-secret:account-vault:${id}:password:v2`, 'utf8'))
+  const encrypted = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()])
+  return `v2.${iv.toString('base64url')}.${cipher.getAuthTag().toString('base64url')}.${encrypted.toString('base64url')}`
+}
+
+if (bootstrap) {
+  fixtureDb = postgres(process.env.NUXT_DATABASE_URL, { max: 1 })
+  const suffix = randomUUID().slice(0, 8)
+  username = `ui-admin-${suffix}`
+  userUsername = `ui-user-${suffix}`
+  password = `UI-admin-${suffix}-password`
+  userPassword = `UI-user-${suffix}-password`
+  const [group] = await fixtureDb`select id from groups order by created_at limit 1`
+  if (!group) throw new Error('UI smoke bootstrap requires at least one group')
+  const [admin] = await fixtureDb`insert into users (username, display_name, password_hash, role, status, must_change_password, password_changed_at) values (${username}, 'UI Smoke Admin', ${await argon2.hash(password)}, 'super_admin', 'active', false, now()) returning id`
+  const [user] = await fixtureDb`insert into users (username, display_name, password_hash, role, status, must_change_password, password_changed_at) values (${userUsername}, 'UI Smoke User', ${await argon2.hash(userPassword)}, 'user', 'active', false, now()) returning id`
+  fixtureIds = [admin.id, user.id]
+  await fixtureDb`insert into group_memberships (group_id, user_id, role, created_by) values (${group.id}, ${admin.id}, 'manager', ${admin.id}), (${group.id}, ${user.id}, 'member', ${admin.id})`
+  const [announcement] = await fixtureDb`insert into announcements (title, content, tone, status, published_at, created_by) values ('UI Smoke 公告', '用户首页公告可见性检查', 'info', 'published', now(), ${admin.id}) returning id`
+  fixtureAnnouncementIds = [announcement.id]
+  const accountId = randomUUID()
+  await fixtureDb`insert into account_vault_entries (id, email, display_name, status, encrypted_password, purchase_date, warranty_status, created_by, updated_by) values (${accountId}, ${`ui-account-${suffix}@example.com`}, 'UI Smoke Account', 'Codex', ${encryptedFixturePassword(accountId, 'UI-Smoke-Account-Password')}, ${new Date().toISOString().slice(0, 10)}, '无质保', ${admin.id}, ${admin.id})`
+  fixtureAccountIds = [accountId]
+  let receivers = await fixtureDb`select id from sms_receivers where status = 'active' order by created_at`
+  if (!receivers.length) {
+    const receiverId = randomUUID()
+    await fixtureDb`insert into sms_receivers (id, phone, phone_key, provider_host, encrypted_fetch_url, note, status, created_by, updated_by) values (${receiverId}, '+1(202)5550100', '12025550100', 'sms-ui.example.com', 'ui-test-not-for-decryption', 'UI Smoke Receiver', 'active', ${admin.id}, ${admin.id})`
+    fixtureReceiverIds = [receiverId]
+    receivers = [{ id: receiverId }]
+  }
+  for (const receiver of receivers) {
+    const occupied = await fixtureDb`select slot from sms_receiver_bindings where receiver_id = ${receiver.id}`
+    const used = new Set(occupied.map(item => item.slot))
+    const slot = [1, 2, 3].find(value => !used.has(value))
+    if (!slot) continue
+    const bindingId = randomUUID()
+    await fixtureDb`insert into sms_receiver_bindings (id, receiver_id, account_id, account_email, account_display_name, slot, created_by) values (${bindingId}, ${receiver.id}, ${accountId}, ${`ui-account-${suffix}@example.com`}, 'UI Smoke Account', ${slot}, ${admin.id})`
+    fixtureBindingIds = [bindingId]
+    break
+  }
+}
+
+if (!password) throw new Error('UI_SMOKE_ADMIN_PASSWORD is required')
+await mkdir(output, { recursive: true })
+let browser
+const results = []
+try {
+  browser = await chromium.launch({ headless: true, executablePath: process.env.UI_SMOKE_BROWSER || undefined })
+  for (const viewport of viewports) {
+    const targets = [
+      { name: 'admin', username, password, login: '/api/auth/login', logout: '/api/auth/logout', pages },
+      ...(!skipUser && userUsername && userPassword ? [{ name: 'user', username: userUsername, password: userPassword, login: '/api/auth/login', logout: '/api/auth/logout', pages: userPages }] : [])
+    ]
+    for (const target of targets) {
+      const context = await browser.newContext({ viewport })
+      const page = await context.newPage()
+      const pageErrors = []
+      page.on('pageerror', error => pageErrors.push(error.message))
+      if (target.name === 'user' && !skipFormLogin) {
+        await page.goto(baseUrl)
+        await page.waitForURL(`${baseUrl}/login`)
+        await page.waitForLoadState('networkidle')
+        await page.getByLabel('用户名').fill(target.username)
+        await page.getByLabel('密码').fill(target.password)
+        await page.waitForFunction(() => {
+          const button = document.querySelector('button[type="submit"]')
+          return button instanceof HTMLButtonElement && !button.disabled
+        })
+        const [loginResponse] = await Promise.all([
+          page.waitForResponse(response => new URL(response.url()).pathname === '/api/auth/login' && response.request().method() === 'POST'),
+          page.getByRole('button', { name: '登录', exact: true }).click({ noWaitAfter: true })
+        ])
+        const loginResult = await loginResponse.json().catch(() => null)
+        if (!loginResponse.ok() || loginResult?.user?.role !== 'user' || loginResult?.home !== '/console') {
+          throw new Error(`ordinary-user form login returned an invalid response: HTTP ${loginResponse.status()} ${JSON.stringify(loginResult)}`)
+        }
+        const cookies = await context.cookies(baseUrl)
+        if (!cookies.some(cookie => cookie.name === 'zephyr_session')) {
+          throw new Error(`ordinary-user form login did not store zephyr_session: ${JSON.stringify(cookies.map(({ name, domain, path, secure, sameSite }) => ({ name, domain, path, secure, sameSite })))}`)
+        }
+        const sessionResponse = await context.request.get(`${baseUrl}/api/auth/session`)
+        const sessionResult = await sessionResponse.json().catch(() => null)
+        if (!sessionResponse.ok() || !sessionResult?.authenticated || sessionResult?.user?.role !== 'user') {
+          throw new Error(`ordinary-user session was not recognized after login: HTTP ${sessionResponse.status()} ${JSON.stringify(sessionResult)}`)
+        }
+        await page.waitForURL(`${baseUrl}/console`)
+        await context.request.post(`${baseUrl}${target.logout}`)
+      }
+      const login = await context.request.post(`${baseUrl}${target.login}`, { data: { username: target.username, password: target.password } })
+      if (!login.ok()) throw new Error(`${target.name} UI smoke login failed with HTTP ${login.status()}`)
+      if (target.name === 'admin') {
+        const loginResult = await login.json()
+        const selfReset = await context.request.post(`${baseUrl}/api/admin/users/${loginResult.user.id}/reset-password`, { data: { password: `Blocked-${randomUUID()}-password` } })
+        if (selfReset.status() !== 409) throw new Error(`self password reset must be rejected with HTTP 409, received ${selfReset.status()}`)
+      }
+      for (const path of target.pages) {
+        const response = await page.goto(`${baseUrl}${path}`)
+        if (!response?.ok()) throw new Error(`${path} returned HTTP ${response?.status()}`)
+        await page.waitForLoadState('networkidle')
+        if (target.name === 'admin' && path === '/admin') {
+          const labels = await page.locator('.admin-nav a span').allTextContents()
+          if (!labels.includes('运行总览') || !labels.includes('用户管理') || labels.includes('个人首页')) {
+            throw new Error(`administrator received incorrect navigation: ${JSON.stringify(labels)}`)
+          }
+        }
+        if (target.name === 'user' && path === '/console') {
+          const labels = await page.locator('.admin-nav a span').allTextContents()
+          if (!labels.includes('个人首页') || !labels.includes('我的 Keys') || !labels.includes('公告') || labels.includes('用户管理')) {
+            throw new Error(`ordinary user received incorrect navigation: ${JSON.stringify(labels)}`)
+          }
+          if (bootstrap && !await page.getByText('UI Smoke 公告', { exact: true }).count()) {
+            throw new Error('published administrator announcement is not visible on the user homepage')
+          }
+        }
+        if (target.name === 'user' && path === '/console/announcements' && bootstrap && !await page.getByText('UI Smoke 公告', { exact: true }).count()) {
+          throw new Error('published administrator announcement is not visible on the user announcement page')
+        }
+        if (target.name === 'admin' && path === '/admin/models') {
+          const response = await context.request.get(`${baseUrl}/api/admin/models`)
+          const models = (await response.json()).models || []
+          for (const model of models) {
+            const row = page.locator('.model-config-row').filter({ has: page.getByText(model.publicModel, { exact: true }) })
+            if (await row.locator('.image-price-editor').count() !== (model.imageCapable ? 1 : 0)) {
+              throw new Error(`image price editor capability mismatch for ${model.publicModel}`)
+            }
+          }
+          const syncPattern = /\/api\/admin\/models\/sync-prices$/
+          await page.route(syncPattern, route => route.fulfill({ status: 200, json: {
+            total: 2, updated: 2, unavailable: [], failed: [], imageTokenPricingNotImported: []
+          } }))
+          await page.getByRole('button', { name: '从上游同步价格', exact: true }).click()
+          await page.locator('.app-toast[data-tone="success"]', { hasText: '已从上游更新 2 / 2 个模型' }).waitFor()
+          await page.unroute(syncPattern)
+        }
+        const layout = await page.evaluate(() => ({
+          documentWidth: document.documentElement.scrollWidth,
+          viewportWidth: window.innerWidth,
+          fixedOverflow: [...document.querySelectorAll('button, select, input')].filter((element) => {
+            const rect = element.getBoundingClientRect()
+            const insideHorizontalScroller = [...function * parents(node) {
+              for (let parent = node.parentElement; parent; parent = parent.parentElement) yield parent
+            }(element)].some(parent => {
+              const overflow = getComputedStyle(parent).overflowX
+              return (overflow === 'auto' || overflow === 'scroll') && parent.scrollWidth > parent.clientWidth
+            })
+            return rect.width > 0 && !insideHorizontalScroller && (rect.left < -1 || rect.right > window.innerWidth + 1)
+          }).length
+        }))
+        const name = path === '/console' ? 'overview' : path.split('/').filter(Boolean).at(-1)
+        await page.screenshot({ path: `${output}/${viewport.name}-${target.name}-${name}.png`, fullPage: true })
+        results.push({ viewport: viewport.name, target: target.name, path, pageErrors: [...pageErrors], ...layout })
+        if (target.name === 'admin') {
+          const legacyTablists = await page.locator('[role="tablist"].admin-segment').count()
+          if (legacyTablists) throw new Error(`${path} still uses ${legacyTablists} legacy segmented tablist(s)`)
+          const unstyledTablists = await page.locator('[role="tablist"]:not(.admin-page-tabs)').count()
+          if (unstyledTablists) throw new Error(`${path} has ${unstyledTablists} tablist(s) without the shared admin page tab style`)
+        }
+        if (bootstrap && target.name === 'user' && path === '/console/keys') {
+          await page.getByRole('button', { name: '创建 Key', exact: true }).click()
+          const createDialog = page.getByRole('dialog').filter({ hasText: '创建 Hub Key' })
+          await createDialog.getByLabel('名称').fill(`UI Key ${viewport.name}`)
+          const createResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/console/keys' && response.request().method() === 'POST')
+          await createDialog.getByRole('button', { name: '创建 Key', exact: true }).click()
+          if (!(await createResponse).ok()) throw new Error('ordinary user could not create a Hub Key')
+          await page.getByText(`UI Key ${viewport.name}`, { exact: true }).waitFor()
+          await page.getByTitle('停用 Key').click()
+          await page.getByTitle('启用 Key').waitFor()
+          await page.getByTitle('查看和编辑').click()
+          const editDialog = page.locator('.admin-modal').filter({ hasText: `UI Key ${viewport.name}` })
+          await editDialog.getByLabel('当前密码').fill(target.password)
+          const revealResponse = page.waitForResponse(response => /\/api\/console\/keys\/[^/]+\/reveal$/.test(new URL(response.url()).pathname))
+          await editDialog.getByRole('button', { name: '查看完整值' }).click()
+          if (!(await revealResponse).ok()) throw new Error('ordinary user could not reveal their Hub Key')
+          if (!await editDialog.locator('.console-secret code').textContent()) throw new Error('revealed Hub Key was blank')
+          await editDialog.getByTitle('关闭').click()
+          await page.getByTitle('删除 Key').click()
+          const deleteDialog = page.getByRole('alertdialog')
+          const deleteResponse = page.waitForResponse(response => /\/api\/console\/keys\/[^/]+$/.test(new URL(response.url()).pathname) && response.request().method() === 'DELETE')
+          await deleteDialog.getByRole('button', { name: '确认删除' }).click()
+          if (!(await deleteResponse).ok()) throw new Error('ordinary user could not delete their Hub Key')
+          await page.getByText('还没有 Hub Key', { exact: true }).waitFor()
+        }
+        if (target.name === 'admin' && path === '/admin/channels') {
+          if (!await page.locator('.admin-nav').getByText('资源管理', { exact: true }).count()) throw new Error('combined resource navigation label is missing')
+          await page.getByRole('heading', { name: '资源管理', exact: true }).waitFor()
+          if (await page.locator('.resource-section-heading').count()) throw new Error('resource tabs still render duplicated section headings')
+          const resourceHeader = page.locator('.admin-page__header')
+          await resourceHeader.getByRole('button', { name: '添加渠道', exact: true }).waitFor()
+          for (const tabName of ['渠道', '分组', '套餐']) {
+            if (!await page.getByRole('tab', { name: tabName, exact: true }).count()) throw new Error(`combined resource tab is missing: ${tabName}`)
+          }
+          await page.getByRole('tab', { name: '分组', exact: true }).click()
+          await resourceHeader.getByRole('button', { name: '创建分组', exact: true }).waitFor()
+          if (await page.getByTitle('编辑分组').count()) {
+            await page.getByTitle('编辑分组').first().click()
+            await page.locator('.channel-policy-mode select').selectOption('custom')
+            await page.locator('.group-channel-rules').scrollIntoViewIfNeeded()
+            await page.screenshot({ path: `${output}/${viewport.name}-admin-groups-channel-policy.png`, fullPage: true })
+            await page.getByTitle('关闭').click()
+          }
+          await page.screenshot({ path: `${output}/${viewport.name}-admin-channels-groups-tab.png`, fullPage: true })
+          await page.getByRole('tab', { name: '套餐', exact: true }).click()
+          await resourceHeader.getByRole('button', { name: '新建套餐', exact: true }).waitFor()
+          await page.locator('.hub-plans-panel').waitFor()
+          await page.screenshot({ path: `${output}/${viewport.name}-admin-channels-plans-tab.png`, fullPage: true })
+        }
+        if (target.name === 'admin' && path === '/admin/upstreams') {
+          await page.getByRole('heading', { name: '号池配置', exact: true }).waitFor()
+          if (!await page.locator('.admin-nav').getByText('号池配置', { exact: true }).count()) throw new Error('pool settings navigation label was not updated')
+          if (await page.getByRole('tab', { name: 'CPA 认证', exact: true }).count()) throw new Error('CPA auth tab should be managed from account management')
+          if (await page.getByRole('tab', { name: 'Sub2API 账号', exact: true }).count()) throw new Error('duplicated Sub2API account tab should remain hidden from pool settings')
+          await page.getByRole('tab', { name: 'Sub2API 分组', exact: true }).waitFor()
+          await page.getByRole('tab', { name: '代理池', exact: true }).waitFor()
+          await page.getByRole('tab', { name: '代理池', exact: true }).click()
+          await page.getByText('Sub2API 新账号默认代理', { exact: true }).waitFor()
+          await page.getByText('CPA 全局默认代理', { exact: true }).waitFor()
+          await page.screenshot({ path: `${output}/${viewport.name}-admin-upstreams-proxy-pool.png`, fullPage: true })
+          const operationsPattern = /\/api\/admin\/upstreams\/operations(?:\?.*)?$/
+          await page.route(operationsPattern, route => route.fulfill({ status: 200, json: { operations: [{
+            id: 'ui-operation', requestId: 'ui-request', connectionId: 'sub2api', action: 'sub.account.import',
+            targetType: 'sub2api_account', targetRef: 'account-id', status: 'failed', upstreamStatus: 502,
+            safeSummary: { name: '测试账号', operationStage: '创建账号' }, errorMessage: '创建账号失败：代理不存在', startedAt: Date.now(), completedAt: Date.now()
+          }] } }))
+          await page.getByRole('tab', { name: '操作记录', exact: true }).click()
+          await page.getByText('导入 Sub2API 账号', { exact: true }).waitFor()
+          await page.getByText('Sub2API 账号', { exact: true }).waitFor()
+          await page.getByText('测试账号', { exact: true }).waitFor()
+          await page.getByText('创建账号失败：代理不存在', { exact: true }).waitFor()
+          if (await page.getByText('sub.account.import', { exact: true }).count() || await page.getByText('sub2api_account', { exact: true }).count()) {
+            throw new Error('operation audit table still exposes machine values')
+          }
+          await page.screenshot({ path: `${output}/${viewport.name}-admin-upstreams-operations.png`, fullPage: true })
+          await page.unroute(operationsPattern)
+        }
+        if (target.name === 'admin' && path === '/admin/account-vault') {
+          if (!await page.locator('.admin-shell > .admin-sidebar').count()) throw new Error('account management is not using the admin layout')
+          if (await page.locator('.site-header, .site-header__inner, .page-width.account-vault-page').count()) throw new Error('account management is incorrectly using the public site layout')
+          const accountTypography = await page.evaluate(() => ({
+            table: Number.parseFloat(getComputedStyle(document.querySelector('.account-workspace-table')).fontSize),
+            badge: Number.parseFloat(getComputedStyle(document.querySelector('.record-badge')).fontSize)
+          }))
+          if (accountTypography.table < 13 || accountTypography.badge < 11) throw new Error(`account management typography is too small: ${JSON.stringify(accountTypography)}`)
+          if (await page.locator('.vault-status-strip').count()) throw new Error('removed vault status strip is still rendered')
+          if (!await page.getByRole('tab', { name: '账号管理', exact: true }).count() || !await page.getByRole('tab', { name: '接码管理', exact: true }).count()) {
+            throw new Error('unified account page does not expose account and receiver tabs')
+          }
+          if (await page.getByRole('button', { name: '导入 Sub JSON', exact: true }).count()) throw new Error('standalone Sub2API JSON import action is still present')
+          if (await page.getByRole('button', { name: '上传 CPA JSON', exact: true }).count()) throw new Error('standalone CPA JSON upload action is still present')
+          if (await page.getByRole('button', { name: '导入 JSON', exact: true }).count()) throw new Error('legacy Vault backup import is still present')
+
+          await page.getByTitle('编辑账号资料').first().click()
+          const accountEditor = page.getByRole('dialog', { name: '编辑账号' })
+          await accountEditor.waitFor()
+          for (const removedField of ['购买日期', '质保日期', '质保状态']) {
+            if (await accountEditor.getByText(removedField, { exact: true }).count()) {
+              throw new Error(`account editor still exposes removed field: ${removedField}`)
+            }
+          }
+          if (!await accountEditor.getByText('接码手机号', { exact: true }).count()) throw new Error('account editor cannot manually bind a receiver')
+          await accountEditor.getByTitle('关闭').click()
+
+          if (await page.getByRole('button', { name: '导入发货文本' }).count()) {
+            throw new Error('delivery import still appears as a separate page action')
+          }
+          await page.getByRole('button', { name: '新增账号', exact: true }).click()
+          const accountCreator = page.getByRole('dialog', { name: '新增账号' })
+          await accountCreator.waitFor()
+          if (!await accountCreator.getByRole('tab', { name: '手动新增' }).count() || !await accountCreator.getByRole('tab', { name: '发货文本' }).count()) {
+            throw new Error('account creator does not expose both mutually exclusive creation modes')
+          }
+          if (!await accountCreator.getByRole('tab', { name: '表单新增' }).count() || !await accountCreator.getByRole('tab', { name: '上传新增' }).count()) {
+            throw new Error('manual account creator does not expose form and upload modes')
+          }
+          await accountCreator.getByRole('tab', { name: '上传新增' }).click()
+          const poolSelect = accountCreator.getByLabel('号池平台 *')
+          await poolSelect.selectOption('cpa')
+          await accountCreator.getByText('选择认证文件（每个最大 2 MiB，最多 20 个）', { exact: true }).waitFor()
+          if (await accountCreator.getByRole('button', { name: '导入 Sub2API', exact: true }).count()) throw new Error('Sub2API submit action is visible for the CPA pool')
+          await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-cpa-upload.png`, fullPage: true })
+          await poolSelect.selectOption('sub2api')
+          await accountCreator.getByLabel('JSON 内容 *').waitFor()
+          await accountCreator.getByRole('tab', { name: '凭据转换' }).click()
+          const conversionEmail = `converter-${viewport.name}@example.com`
+          const conversionAccess = syntheticJwt({
+            email: conversionEmail,
+            exp: Math.trunc(Date.now() / 1000) + 3600,
+            'https://api.openai.com/auth': {
+              chatgpt_account_id: `acct-converter-${viewport.name}`,
+              chatgpt_plan_type: 'plus'
+            }
+          })
+          const conversionRefresh = `synthetic-converter-refresh-${viewport.name}`
+          const conversionSession = `synthetic-converter-session-${viewport.name}`
+          const conversionInput = accountCreator.getByLabel('粘贴凭据 JSON')
+          await conversionInput.fill(JSON.stringify({
+            accessToken: conversionAccess,
+            refreshToken: conversionRefresh,
+            sessionToken: conversionSession,
+            user: { email: conversionEmail }
+          }))
+          await accountCreator.getByRole('button', { name: '解析凭据', exact: true }).click()
+          if (await conversionInput.inputValue() !== '') throw new Error('credential conversion textarea was not cleared after parsing')
+          const conversionPreview = accountCreator.getByLabel('转换账号预览')
+          await conversionPreview.locator('code', { hasText: conversionEmail }).waitFor()
+          await conversionPreview.getByText('合成 ID Token', { exact: true }).waitFor()
+          const previewText = await conversionPreview.innerText()
+          if ([conversionAccess, conversionRefresh, conversionSession].some(secret => previewText.includes(secret))) {
+            throw new Error('credential conversion preview exposes credentials')
+          }
+          await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-credential-converter.png`, fullPage: true })
+          await accountCreator.getByRole('tab', { name: '表单新增' }).click()
+          await accountCreator.getByLabel('邮箱 *').waitFor()
+          await accountCreator.getByRole('tab', { name: '发货文本' }).click()
+          await accountCreator.locator('textarea').fill([
+            'preview@icloud.com----https://mail.example/messages/preview',
+            'tokens@hotmail.com----secret-password----secret-at----secret-rt'
+          ].join('\n'))
+          await accountCreator.getByText('preview@icloud.com', { exact: true }).waitFor()
+          await accountCreator.getByText('密码 + AT / RT', { exact: true }).waitFor()
+          if (await accountCreator.locator('.vault-delivery-preview', { hasText: 'secret-password' }).count()) {
+            throw new Error('delivery preview exposes imported credentials')
+          }
+          await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-delivery-import.png`, fullPage: true })
+          await accountCreator.getByTitle('关闭').click()
+
+          const revealButton = page.getByTitle('显示密码').first()
+          if (!await revealButton.count()) throw new Error('account vault has no password reveal control')
+          const revealResponse = page.waitForResponse(response => /\/api\/admin\/account-vault\/[^/]+\/reveal$/.test(response.url()))
+          await revealButton.click()
+          if (!(await revealResponse).ok()) throw new Error('account password reveal failed without reauthentication')
+          if (await page.locator('.vault-security-modal').count()) throw new Error('account password reveal unexpectedly opened reauthentication')
+          if (!await page.locator('.revealed-password').first().textContent()) throw new Error('account password remained hidden after reveal')
+
+          const accountSmsCell = page.locator('.account-sms').first()
+          if (await accountSmsCell.count()) {
+            const refreshPattern = /\/api\/admin\/account-vault\/[^/]+\/sms\/refresh$/
+            await page.route(refreshPattern, route => route.fulfill({
+              status: 200,
+              json: { result: { receiverId: 'ui-smoke', phone: '13800138000', code: '864209', message: '已获取新的短信验证码', fetchedAt: Date.now() } }
+            }))
+            await accountSmsCell.getByTitle('获取短信验证码').click()
+            await accountSmsCell.getByText('864209', { exact: true }).waitFor()
+            await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-code-received.png`, fullPage: true })
+            await page.unroute(refreshPattern)
+          }
+
+          await page.getByRole('tab', { name: '接码管理', exact: true }).click()
+          await page.locator('.receiver-table').waitFor()
+          await page.getByRole('button', { name: '新增接码', exact: true }).click()
+          const receiverCreator = page.getByRole('dialog', { name: '新增接码' })
+          await receiverCreator.waitFor()
+          await receiverCreator.getByTitle('关闭').click()
+          if (await page.locator('.receiver-table tbody tr').count() < 1) throw new Error('receiver manager has no migrated receiver rows')
+          if (await page.locator('.receiver-table').getByTitle('解除账号绑定').count()) throw new Error('receiver list exposes per-account binding removal controls')
+          if (!await page.locator('.receiver-table tbody tr').first().getByText(/^[1-3]\/3$/).count()) throw new Error('receiver list does not show binding count')
+          const refreshPattern = /\/api\/admin\/sms-receivers\/[^/]+\/refresh$/
+          await page.route(refreshPattern, route => route.fulfill({
+            status: 200,
+            json: { result: { receiverId: 'ui-smoke', phone: '13800138000', code: '864209', message: '已获取新的短信验证码', fetchedAt: Date.now() } }
+          }))
+          await page.locator('.receiver-table tbody tr').first().getByTitle('刷新验证码').click()
+          await page.locator('.app-toast[data-tone="success"]', { hasText: '已获取新的短信验证码' }).waitFor()
+          await page.locator('.receiver-code code', { hasText: '864209' }).waitFor()
+          await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-receivers.png`, fullPage: true })
+          await page.unroute(refreshPattern)
+          await page.locator('.receiver-table tbody tr').first().getByTitle('编辑接码').click()
+          const receiverEditor = page.getByRole('dialog', { name: '编辑接码' })
+          await receiverEditor.waitFor()
+          if (!await receiverEditor.getByTitle('解除账号绑定').count()) throw new Error('receiver editor has no per-account binding removal control')
+          await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-receiver-editor.png`, fullPage: true })
+          await receiverEditor.getByTitle('关闭').click()
+        }
+      }
+      await context.request.post(`${baseUrl}${target.logout}`)
+      await context.close()
+    }
+  }
+} finally {
+  try {
+    await browser?.close()
+  } finally {
+    if (fixtureDb && fixtureIds.length) {
+      if (fixtureBindingIds.length) await fixtureDb`delete from sms_receiver_bindings where id in ${fixtureDb(fixtureBindingIds)}`
+      if (fixtureAccountIds.length) await fixtureDb`delete from account_vault_entries where id in ${fixtureDb(fixtureAccountIds)}`
+      if (fixtureReceiverIds.length) await fixtureDb`delete from sms_receivers where id in ${fixtureDb(fixtureReceiverIds)}`
+      if (fixtureAnnouncementIds.length) await fixtureDb`delete from announcements where id in ${fixtureDb(fixtureAnnouncementIds)}`
+      await fixtureDb`delete from audit_logs where admin_id in ${fixtureDb(fixtureIds)}`
+      await fixtureDb`delete from users where id in ${fixtureDb(fixtureIds)}`
+      await fixtureDb.end()
+    }
+  }
+}
+
+if (results.some(result => result.documentWidth > result.viewportWidth + 1 || result.fixedOverflow > 0 || result.pageErrors.length)) {
+  throw new Error(`UI overflow detected: ${JSON.stringify(results)}`)
+}
+console.log(JSON.stringify({ passed: true, results, output }))

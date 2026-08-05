@@ -4,6 +4,7 @@ import {
   fetchSub2ApiAccountQuota,
   parseSub2ApiAccountWindows
 } from '../server/services/sub2api-admin'
+import { parseSub2ApiOpenAiCallback } from '../server/services/sub2api-oauth'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -155,5 +156,27 @@ describe('Sub2API admin quota requests', () => {
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
       query: { source: 'active', force: 'true' }
     })
+  })
+})
+
+describe('Sub2API OpenAI OAuth callback parsing', () => {
+  it('extracts the one-time code and state from the official localhost callback', () => {
+    const result = parseSub2ApiOpenAiCallback(
+      'http://localhost:1455/auth/callback?code=code-value%2Fwith-symbols&state=abcdef0123456789'
+    )
+    expect(result).toEqual({
+      code: 'code-value/with-symbols',
+      state: 'abcdef0123456789'
+    })
+  })
+
+  it('rejects callbacks outside the official localhost redirect and callbacks without state', () => {
+    vi.stubGlobal('createError', (input: { message: string }) => Object.assign(new Error(input.message), input))
+    expect(() => parseSub2ApiOpenAiCallback(
+      'https://example.com/auth/callback?code=secret&state=abcdef0123456789'
+    )).toThrow(/localhost:1455/)
+    expect(() => parseSub2ApiOpenAiCallback(
+      'http://localhost:1455/auth/callback?code=secret'
+    )).toThrow(/OAuth state/)
   })
 })
