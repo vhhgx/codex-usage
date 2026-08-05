@@ -3,7 +3,7 @@ import { getAllSub2ApiAccountQuotas } from '../../services/sub2api-admin'
 import { enforceRateLimit } from '../../utils/rate-limit'
 
 export default defineEventHandler(async (event): Promise<Sub2ApiAccountsResponse> => {
-  enforceRateLimit(event, 'sub2api-accounts', 20, 60 * 1000)
+  await enforceRateLimit(event, 'sub2api-accounts', 20, 60 * 1000)
   const results = await getAllSub2ApiAccountQuotas(event)
   return {
     results,

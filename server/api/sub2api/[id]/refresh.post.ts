@@ -3,7 +3,7 @@ import { fetchSub2ApiAccountQuota, findSub2ApiAccount } from '../../../services/
 import { enforceRateLimit } from '../../../utils/rate-limit'
 
 export default defineEventHandler(async (event): Promise<Sub2ApiAccountQuotaResult> => {
-  enforceRateLimit(event, 'sub2api-refresh-one', 30, 60 * 1000)
+  await enforceRateLimit(event, 'sub2api-refresh-one', 30, 60 * 1000)
   const id = getRouterParam(event, 'id') || ''
   const account = await findSub2ApiAccount(event, id)
   if (!account) throw createError({ statusCode: 404, message: 'Sub2API 账号不存在' })

@@ -38,3 +38,17 @@ export function opaqueSub2ApiAccountId(event: H3Event, accountId: number) {
     .digest('base64url')
     .slice(0, 24)
 }
+
+export function opaqueSub2ApiGroupId(event: H3Event, groupId: number) {
+  return createHmac('sha256', requireAccountIdSecret(event))
+    .update(`sub2api-group:${groupId}`)
+    .digest('base64url')
+    .slice(0, 24)
+}
+
+export function opaqueSub2ApiProxyId(event: H3Event, proxyId: number) {
+  return createHmac('sha256', requireAccountIdSecret(event))
+    .update(`sub2api-proxy:${proxyId}`)
+    .digest('base64url')
+    .slice(0, 24)
+}

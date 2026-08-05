@@ -5,8 +5,11 @@ import type {
   CodexQuotaWindow,
   QuotaWindowKind
 } from '#shared/types/codex'
+import type { CpaAuthFileView } from '#shared/types/upstream-management'
 import { opaqueAccountId } from '../utils/security'
 import { normalizeBaseUrl, requireUpstreamConfig, upstreamError } from '../utils/upstream'
+import { getCpaDefaultProxyUpstreamId, setCpaDefaultProxyUpstreamId } from './hub-settings'
+import { listManagedSub2ApiProxies, resolveManagedSub2ApiProxy } from './sub2api-admin'
 
 interface AuthFileRecord {
   name?: unknown
@@ -95,11 +98,11 @@ function extractPlanType(file: AuthFileRecord) {
   )
 }
 
-async function managementFetch<T>(
+export async function cpaManagementFetch<T>(
   event: H3Event,
   path: string,
   options: Parameters<typeof $fetch<T>>[1] = {}
-) {
+): Promise<T> {
   const config = requireUpstreamConfig(event, ['cpaBaseUrl', 'cpaManagementKey'])
   const base = normalizeBaseUrl(config.cpaBaseUrl).replace(/\/v0\/management$/i, '')
   try {
@@ -109,15 +112,114 @@ async function managementFetch<T>(
         Authorization: `Bearer ${config.cpaManagementKey}`,
         ...(options.headers || {})
       },
-      timeout: 30_000
-    })
+      timeout: options.timeout ?? 30_000
+    }) as T
   } catch (error) {
     upstreamError(error, '无法连接 CLIProxyAPI Management API')
   }
 }
 
+function normalizedProxyUrl(value: unknown) {
+  const raw = text(value)
+  if (!raw) return ''
+  try {
+    const parsed = new URL(raw)
+    return parsed.toString().replace(/\/$/, '')
+  } catch {
+    return raw.replace(/\/$/, '')
+  }
+}
+
+function subProxyUrl(proxy: Awaited<ReturnType<typeof resolveManagedSub2ApiProxy>>) {
+  const url = new URL(`${proxy.view.protocol}://${proxy.view.host}:${proxy.view.port}`)
+  const username = text(proxy.raw.username)
+  const password = text(proxy.raw.password)
+  if (username) url.username = username
+  if (password) url.password = password
+  return normalizedProxyUrl(url.toString())
+}
+
+function cpaManagementConfigured(event: H3Event) {
+  const config = useRuntimeConfig(event)
+  return Boolean(normalizeBaseUrl(config.cpaBaseUrl) && text(config.cpaManagementKey))
+}
+
+export async function getManagedCpaProxyUrl(event: H3Event, timeout = 30_000) {
+  const response = await cpaManagementFetch<Record<string, unknown>>(event, '/proxy-url', { timeout })
+  return normalizedProxyUrl(response['proxy-url'] ?? response.proxyUrl ?? response.value)
+}
+
+async function writeManagedCpaProxyUrl(event: H3Event, proxyUrl: string) {
+  if (proxyUrl) {
+    await cpaManagementFetch(event, '/proxy-url', { method: 'PATCH', body: { value: proxyUrl } })
+  } else {
+    await cpaManagementFetch(event, '/proxy-url', { method: 'DELETE' })
+  }
+  const confirmed = await getManagedCpaProxyUrl(event)
+  if (confirmed !== normalizedProxyUrl(proxyUrl)) {
+    throw createError({ statusCode: 502, message: 'CPA 全局代理更新后对账不一致' })
+  }
+}
+
+export async function getManagedCpaProxyState(event: H3Event) {
+  if (!cpaManagementConfigured(event)) {
+    return { cpaDefaultProxyId: null, cpaProxyMode: 'unavailable' as const }
+  }
+  try {
+    const [proxyUrl, proxies, savedUpstreamId] = await Promise.all([
+      getManagedCpaProxyUrl(event, 3_000),
+      listManagedSub2ApiProxies(event, false),
+      getCpaDefaultProxyUpstreamId(event)
+    ])
+    if (!proxyUrl) {
+      if (savedUpstreamId) await setCpaDefaultProxyUpstreamId(event, null)
+      return { cpaDefaultProxyId: null, cpaProxyMode: 'direct' as const }
+    }
+    const matched = proxies.find(proxy => {
+      if (savedUpstreamId && proxy.upstreamId !== savedUpstreamId) return false
+      return subProxyUrl(proxy) === proxyUrl
+    }) || proxies.find(proxy => subProxyUrl(proxy) === proxyUrl)
+    if (matched) {
+      if (savedUpstreamId !== matched.upstreamId) {
+        await setCpaDefaultProxyUpstreamId(event, matched.upstreamId)
+      }
+      return { cpaDefaultProxyId: matched.view.id, cpaProxyMode: 'pool' as const }
+    }
+    if (savedUpstreamId) await setCpaDefaultProxyUpstreamId(event, null)
+    return { cpaDefaultProxyId: null, cpaProxyMode: 'custom' as const }
+  } catch {
+    return { cpaDefaultProxyId: null, cpaProxyMode: 'error' as const }
+  }
+}
+
+export async function setManagedCpaDefaultProxy(event: H3Event, opaqueId: string | null) {
+  if (!opaqueId) {
+    await writeManagedCpaProxyUrl(event, '')
+    await setCpaDefaultProxyUpstreamId(event, null)
+    return { cpaDefaultProxyId: null, cpaProxyMode: 'direct' as const }
+  }
+  const proxy = await resolveManagedSub2ApiProxy(event, opaqueId)
+  if (proxy.view.status !== 'active' || (proxy.view.expiresAt && proxy.view.expiresAt <= Date.now())) {
+    throw createError({ statusCode: 409, message: '停用或过期的代理不能设为 CPA 默认代理' })
+  }
+  await writeManagedCpaProxyUrl(event, subProxyUrl(proxy))
+  await setCpaDefaultProxyUpstreamId(event, proxy.upstreamId)
+  return { cpaDefaultProxyId: proxy.view.id, cpaProxyMode: 'pool' as const }
+}
+
+export async function syncManagedCpaDefaultProxy(event: H3Event, opaqueId: string) {
+  const proxy = await resolveManagedSub2ApiProxy(event, opaqueId)
+  if (await getCpaDefaultProxyUpstreamId(event) !== proxy.upstreamId) return false
+  if (proxy.view.status !== 'active' || (proxy.view.expiresAt && proxy.view.expiresAt <= Date.now())) {
+    await setManagedCpaDefaultProxy(event, null)
+  } else {
+    await setManagedCpaDefaultProxy(event, opaqueId)
+  }
+  return true
+}
+
 export async function listCodexAccounts(event: H3Event): Promise<InternalCodexAccount[]> {
-  const response = await managementFetch<{ files?: AuthFileRecord[] }>(event, '/auth-files')
+  const response = await cpaManagementFetch<{ files?: AuthFileRecord[] }>(event, '/auth-files')
   const files = Array.isArray(response.files) ? response.files : []
   return files
     .filter((file) => text(file.provider || file.type).toLowerCase().replace(/_/g, '-') === 'codex')
@@ -278,7 +380,7 @@ export async function fetchCodexQuota(
     }
     if (account.chatgptAccountId) headers['Chatgpt-Account-Id'] = account.chatgptAccountId
 
-    const response = await managementFetch<ApiCallResponse>(event, '/api-call', {
+    const response = await cpaManagementFetch<ApiCallResponse>(event, '/api-call', {
       method: 'POST',
       body: {
         auth_index: account.authIndex,
@@ -311,6 +413,80 @@ export async function fetchCodexQuota(
       error: error instanceof Error ? error.message : '查询 Codex 配额失败'
     }
   }
+}
+
+function managedAuthFileView(event: H3Event, file: AuthFileRecord): { authIndex: string; view: CpaAuthFileView } | null {
+  const authIndex = text(file.auth_index ?? file.authIndex)
+  const name = text(file.name)
+  if (!authIndex || !name) return null
+  return {
+    authIndex,
+    view: {
+      id: opaqueAccountId(event, authIndex),
+      name,
+      provider: text(file.provider || file.type) || 'unknown',
+      account: text(file.email || file.account) || null,
+      planType: extractPlanType(file),
+      status: text(file.status) || 'unknown',
+      statusMessage: text(file.status_message || file.statusMessage) || null,
+      disabled: booleanValue(file.disabled),
+      lastRefreshAt: timestampValue(file.last_refresh ?? file.lastRefresh)
+    }
+  }
+}
+
+export async function listManagedCpaAuthFiles(event: H3Event): Promise<Array<{ authIndex: string; view: CpaAuthFileView }>> {
+  const response = await cpaManagementFetch<{ files?: AuthFileRecord[] }>(event, '/auth-files')
+  return (Array.isArray(response.files) ? response.files : [])
+    .map(file => managedAuthFileView(event, file))
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+}
+
+export async function resolveManagedCpaAuthFile(event: H3Event, opaqueId: string) {
+  const item = (await listManagedCpaAuthFiles(event)).find(file => file.view.id === opaqueId)
+  if (!item) throw createError({ statusCode: 404, message: 'CPA 认证文件不存在或已变化' })
+  return item
+}
+
+export async function uploadManagedCpaAuthFile(event: H3Event, name: string, bytes: Buffer) {
+  await cpaManagementFetch(event, '/auth-files', {
+    method: 'POST',
+    query: { name },
+    headers: { 'content-type': 'application/json' },
+    body: bytes
+  })
+  const match = (await listManagedCpaAuthFiles(event)).find(item => item.view.name === name)
+  if (!match) throw createError({ statusCode: 502, message: 'CPA 返回上传成功，但重新读取时未找到认证文件' })
+  return match.view
+}
+
+export async function setManagedCpaAuthFileDisabled(event: H3Event, opaqueId: string, disabled: boolean) {
+  const target = await resolveManagedCpaAuthFile(event, opaqueId)
+  await cpaManagementFetch(event, '/auth-files/status', {
+    method: 'PATCH',
+    body: { name: target.view.name, auth_index: target.authIndex, disabled }
+  })
+  const confirmed = await resolveManagedCpaAuthFile(event, opaqueId)
+  if (confirmed.view.disabled !== disabled) throw createError({ statusCode: 502, message: 'CPA 状态更新后对账不一致' })
+  return confirmed.view
+}
+
+export async function verifyManagedCpaAuthFile(event: H3Event, opaqueId: string) {
+  const target = await resolveManagedCpaAuthFile(event, opaqueId)
+  const result = await cpaManagementFetch<{ models?: unknown[] }>(event, '/auth-files/models', {
+    query: { name: target.view.name }
+  })
+  return { ok: true, modelCount: Array.isArray(result.models) ? result.models.length : 0 }
+}
+
+export async function deleteManagedCpaAuthFile(event: H3Event, opaqueId: string) {
+  const target = await resolveManagedCpaAuthFile(event, opaqueId)
+  await cpaManagementFetch(event, '/auth-files', { method: 'DELETE', query: { name: target.view.name } })
+  const remaining = await listManagedCpaAuthFiles(event)
+  if (remaining.some(item => item.view.name === target.view.name)) {
+    throw createError({ statusCode: 502, message: 'CPA 返回删除成功，但认证文件仍然存在' })
+  }
+  return { deleted: true, name: target.view.name }
 }
 
 export async function refreshAllCodexQuotas(event: H3Event, concurrency = 5) {

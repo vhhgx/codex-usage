@@ -3,7 +3,7 @@ import { refreshAllCodexQuotas } from '../../services/cpa'
 import { enforceRateLimit } from '../../utils/rate-limit'
 
 export default defineEventHandler(async (event): Promise<CodexRefreshAllResponse> => {
-  enforceRateLimit(event, 'codex-refresh-all', 12, 60 * 1000)
+  await enforceRateLimit(event, 'codex-refresh-all', 12, 60 * 1000)
   const { accounts, results } = await refreshAllCodexQuotas(event)
   return {
     accounts,

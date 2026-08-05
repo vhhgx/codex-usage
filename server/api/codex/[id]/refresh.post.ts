@@ -3,7 +3,7 @@ import { fetchCodexQuota, listCodexAccounts } from '../../../services/cpa'
 import { enforceRateLimit } from '../../../utils/rate-limit'
 
 export default defineEventHandler(async (event): Promise<CodexQuotaResult> => {
-  enforceRateLimit(event, 'codex-refresh-one', 90, 60 * 1000)
+  await enforceRateLimit(event, 'codex-refresh-one', 90, 60 * 1000)
   const id = getRouterParam(event, 'id')
   const accounts = await listCodexAccounts(event)
   const account = accounts.find((item) => item.view.id === id && !item.view.disabled)
