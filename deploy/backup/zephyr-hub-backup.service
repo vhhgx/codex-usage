@@ -1,0 +1,9 @@
+[Unit]
+Description=Create a verified Zephyr Hub backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/zephyr-hub/deploy/hong-kong
+ExecStart=/usr/bin/docker compose --profile backup run --rm backup

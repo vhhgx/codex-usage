@@ -1,0 +1,13 @@
+.git
+.nuxt
+.output
+.data
+.cache
+.drizzle
+node_modules
+logs
+.env
+.env.*
+!.env.example
+deploy/edge/tls
+deploy/hong-kong/tls

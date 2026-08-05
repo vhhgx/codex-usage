@@ -1,0 +1,31 @@
+groups:
+  - name: zephyr-hub
+    rules:
+      - alert: ZephyrHubChannelUnavailable
+        expr: zephyr_hub_channel_healthy == 0 or zephyr_hub_channel_circuit_open == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Zephyr Hub channel is unavailable
+      - alert: ZephyrHubFailureRateHigh
+        expr: zephyr_hub_recent_requests >= 20 and zephyr_hub_recent_failure_ratio >= 0.2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Zephyr Hub five-minute failure rate is high
+      - alert: ZephyrHubFirstByteSlow
+        expr: zephyr_hub_recent_first_byte_p95_milliseconds >= 5000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Zephyr Hub P95 first-byte latency is high
+      - alert: ZephyrHubMemoryHigh
+        expr: zephyr_hub_process_resident_memory_bytes >= 805306368
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Zephyr Hub resident memory exceeds 768 MiB

@@ -1,0 +1,8 @@
+[Interface]
+Address = 10.20.0.2/30
+ListenPort = 51820
+PrivateKey = REPLACE_WITH_US_PRIVATE_KEY
+
+[Peer]
+PublicKey = REPLACE_WITH_HK_PUBLIC_KEY
+AllowedIPs = 10.20.0.1/32

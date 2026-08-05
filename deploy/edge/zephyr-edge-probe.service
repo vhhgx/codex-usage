@@ -1,0 +1,14 @@
+[Unit]
+Description=Zephyr Hub edge route probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zephyr
+Group=zephyr
+WorkingDirectory=/opt/zephyr-hub
+EnvironmentFile=/etc/zephyr-edge-probe.env
+ExecStart=/usr/bin/env npm run test:edge
+NoNewPrivileges=true
+PrivateTmp=true
