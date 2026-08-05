@@ -1,0 +1,1 @@
+ALTER TABLE "request_logs" ADD COLUMN "failover_count" integer DEFAULT 0 NOT NULL;

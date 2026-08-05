@@ -7,7 +7,7 @@ const ALLOWED_RANGES = new Set<UsageRange>(['today', '7d', '30d'])
 const ALLOWED_SOURCES = new Set<UsageSource>(['cpa', 'sub2api'])
 
 export default defineEventHandler(async (event) => {
-  enforceRateLimit(event, 'user-usage-query', 10, 60 * 1000)
+  await enforceRateLimit(event, 'user-usage-query', 10, 60 * 1000)
   const body = await readBody<{ apiKey?: unknown; range?: unknown; source?: unknown }>(event)
   const apiKey = typeof body?.apiKey === 'string' ? body.apiKey.trim() : ''
   const range = typeof body?.range === 'string' ? body.range : '7d'

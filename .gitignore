@@ -5,6 +5,7 @@
 .nitro
 .cache
 dist
+.drizzle
 
 # Node dependencies
 node_modules
@@ -20,5 +21,11 @@ logs
 
 # Local env files
 .env
+LOCAL_TEST_CREDENTIALS.md
+deploy/edge/tls/
+deploy/edge/edge-probe.env
+deploy/hong-kong/.env
+deploy/hong-kong/.metrics-token
+deploy/hong-kong/tls/
 .env.*
 !.env.example

@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { IconActivityHeartbeat, IconBook2, IconGauge, IconKey } from '@tabler/icons-vue'
+import { IconActivityHeartbeat, IconBook2, IconKey, IconLock } from '@tabler/icons-vue'
 
 const route = useRoute()
 const config = useRuntimeConfig()
 
 const links = [
   { to: '/key-usage', label: '查询用量', icon: IconKey },
-  { to: '/usage', label: '账号余量', icon: IconGauge },
-  { to: '/guide', label: '使用方法', icon: IconBook2 }
+  { to: '/guide', label: '使用方法', icon: IconBook2 },
+  { to: '/admin', label: '管理后台', icon: IconLock }
 ]
 </script>
 

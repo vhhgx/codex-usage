@@ -1,0 +1,1 @@
+ALTER TABLE "sms_receiver_bindings" ADD CONSTRAINT "sms_receiver_bindings_slot_check" CHECK ("sms_receiver_bindings"."slot" between 1 and 3);

@@ -7,22 +7,37 @@
     "dev": "nuxt dev",
     "generate": "nuxt generate",
     "test": "vitest run",
+    "test:hub-e2e": "npm run build && node tests/hub-e2e.mjs",
+    "test:hub-shadow": "node tests/hub-shadow.mjs",
+    "test:edge": "node deploy/edge/probe.mjs",
     "typecheck": "nuxt typecheck",
     "verify": "npm run test && npm run typecheck && npm run build",
     "preview": "nuxt preview",
-    "postinstall": "nuxt prepare"
+    "postinstall": "nuxt prepare",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:migrate:runtime": "node scripts/migrate.mjs",
+    "db:migrate:legacy-sms": "node scripts/migrate-account-sms-receivers.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1096.0",
+    "@aws-sdk/lib-storage": "^3.1096.0",
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "@fontsource-variable/manrope": "^5.2.8",
     "@tabler/icons-vue": "^3.45.0",
+    "argon2": "^0.45.1",
+    "drizzle-orm": "^0.45.2",
+    "ioredis": "^5.11.1",
     "nuxt": "^4.4.8",
+    "postgres": "^3.4.9",
     "vue": "^3.5.39",
     "vue-router": "^5.1.0"
   },
   "devDependencies": {
     "@vue/test-utils": "^2.4.11",
+    "drizzle-kit": "^0.31.10",
     "happy-dom": "^20.10.6",
+    "playwright": "^1.62.0",
     "typescript": "^5.9.3",
     "vitest": "^4.1.10",
     "vue-tsc": "^3.3.7"

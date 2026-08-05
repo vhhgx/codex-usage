@@ -1,0 +1,1 @@
+ALTER TABLE "system_settings" ADD COLUMN "sub2api_default_proxy_upstream_id" integer;

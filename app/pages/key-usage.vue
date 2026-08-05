@@ -1,4 +1,5 @@
 <script setup lang="ts">
+definePageMeta({ layout: 'admin', middleware: 'admin' })
 import {
   IconAlertTriangle,
   IconBolt,
@@ -21,6 +22,7 @@ import type {
   UserQuotaSummary,
   UserUsageResponse
 } from '#shared/types/usage'
+import { formatTokenCount } from '#shared/utils/number-format'
 
 useSeoMeta({ title: 'API Key 用量查询 | Zephyr Console' })
 
@@ -49,19 +51,6 @@ const ranges: Array<{ value: UsageRange; label: string }> = [
 
 function number(value: number) {
   return new Intl.NumberFormat('zh-CN').format(value)
-}
-
-function tokenNumber(value: number) {
-  const absolute = Math.abs(value)
-  const format = (divisor: number, suffix: string) => {
-    const scaled = value / divisor
-    const digits = Math.abs(scaled) >= 100 ? 0 : Math.abs(scaled) >= 10 ? 1 : 2
-    return `${scaled.toFixed(digits).replace(/\.0+$|(?<=\.[0-9])0+$/, '')}${suffix}`
-  }
-  if (absolute >= 1_000_000_000) return format(1_000_000_000, 'B')
-  if (absolute >= 1_000_000) return format(1_000_000, 'M')
-  if (absolute >= 1_000) return format(1_000, 'K')
-  return number(value)
 }
 
 function cost(value: number) {
@@ -284,8 +273,8 @@ watch(source, (nextSource) => {
         <article>
           <IconDatabase :size="20" :stroke-width="1.7" />
           <span>总 Token</span>
-          <strong>{{ tokenNumber(result.summary.totalTokens) }}</strong>
-          <small>缓存 {{ tokenNumber(result.summary.cachedTokens) }}</small>
+          <strong>{{ formatTokenCount(result.summary.totalTokens) }}</strong>
+          <small>缓存 {{ formatTokenCount(result.summary.cachedTokens) }}</small>
         </article>
         <article>
           <IconCoin :size="20" :stroke-width="1.7" />
@@ -310,10 +299,10 @@ watch(source, (nextSource) => {
         <section class="data-panel token-breakdown">
           <header><h2>Token 构成</h2></header>
           <dl>
-            <div><dt>输入</dt><dd>{{ tokenNumber(result.summary.inputTokens) }}</dd></div>
-            <div><dt>输出</dt><dd>{{ tokenNumber(result.summary.outputTokens) }}</dd></div>
-            <div><dt>推理</dt><dd>{{ tokenNumber(result.summary.reasoningTokens) }}</dd></div>
-            <div><dt>缓存</dt><dd>{{ tokenNumber(result.summary.cachedTokens) }}</dd></div>
+            <div><dt>输入</dt><dd>{{ formatTokenCount(result.summary.inputTokens) }}</dd></div>
+            <div><dt>输出</dt><dd>{{ formatTokenCount(result.summary.outputTokens) }}</dd></div>
+            <div><dt>推理</dt><dd>{{ formatTokenCount(result.summary.reasoningTokens) }}</dd></div>
+            <div><dt>缓存</dt><dd>{{ formatTokenCount(result.summary.cachedTokens) }}</dd></div>
           </dl>
         </section>
       </div>
@@ -328,7 +317,7 @@ watch(source, (nextSource) => {
                 <td><code>{{ model.model }}</code></td>
                 <td>{{ number(model.calls) }}</td>
                 <td>{{ model.successRate === null ? '-' : `${model.successRate.toFixed(1)}%` }}</td>
-                <td>{{ tokenNumber(model.totalTokens) }}</td>
+                <td>{{ formatTokenCount(model.totalTokens) }}</td>
                 <td>{{ cost(model.estimatedCost) }}</td>
               </tr>
             </tbody>
