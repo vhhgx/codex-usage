@@ -15,6 +15,10 @@ WORKDIR /app/.output
 COPY --from=build /app/.output ./
 COPY --from=build /app/drizzle ./drizzle
 COPY --from=build /app/scripts/migrate.mjs ./server/migrate.mjs
+# Nitro traces dependencies used by the app, but migrate.mjs is copied after
+# the build and its two migration-only modules must be included explicitly.
+COPY --from=build /app/node_modules/drizzle-orm/migrator.js ./server/node_modules/drizzle-orm/migrator.js
+COPY --from=build /app/node_modules/drizzle-orm/postgres-js/migrator.js ./server/node_modules/drizzle-orm/postgres-js/migrator.js
 USER node
 EXPOSE 3000
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
