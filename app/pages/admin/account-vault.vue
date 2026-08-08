@@ -8,8 +8,6 @@ import {
   IconDownload,
   IconEdit,
   IconExternalLink,
-  IconEye,
-  IconEyeOff,
   IconFileCode,
   IconLink,
   IconLock,
@@ -112,8 +110,7 @@ const { data: proxyData, refresh: refreshProxies } = useLazyFetch<ProxyPoolState
 const activeTab = ref<PageTab>('accounts')
 const search = ref('')
 const loadingAll = ref(false)
-const revealed = reactive<Record<string, string>>({})
-const revealTimers = new Map<string, number>()
+const accountPasswords = reactive<Record<string, string>>({})
 const accountTotpCodes = reactive<Record<string, AccountTotpCodeResult>>({})
 const totpTimers = new Map<string, number>()
 const generatingTotp = reactive<Record<string, boolean>>({})
@@ -389,6 +386,73 @@ function statusTone(status: string, schedulable = true) {
   return 'error'
 }
 
+function localizedStatus(status: string) {
+  const labels: Record<string, string> = {
+    active: '运行中',
+    success: '运行中',
+    pending: '待检测',
+    inactive: '已停用',
+    disabled: '已停用',
+    error: '异常',
+    unknown: '未知',
+    Codex: 'Codex 已接入',
+    '已登录': '已登录',
+    '仅Web': '仅 Web',
+    '已过期': '已过期',
+    '已封禁': '已封禁',
+    '接码失效': '接码失效'
+  }
+  return labels[status] || status || '未知'
+}
+
+function subHasAuthFailure(row: UnifiedAccountRow) {
+  const detail = [row.sub?.errorMessage, row.quota?.error, row.quota?.probeError?.message].filter(Boolean).join(' ')
+  return /\b(?:401|403)\b|token\s+revoked|invalid(?:ated)?\s+oauth|unauthori[sz]ed/i.test(detail)
+}
+
+function subIsRateLimited(row: UnifiedAccountRow) {
+  return Boolean(row.quota?.windows.some((windowItem) => {
+    if (windowItem.remainingPercent !== null) return windowItem.remainingPercent <= 0
+    return windowItem.used !== null && windowItem.limit !== null && windowItem.limit > 0 && windowItem.used >= windowItem.limit
+  }))
+}
+
+function subStatusLabel(row: UnifiedAccountRow) {
+  if (!row.sub) return ''
+  if (subHasAuthFailure(row)) return '认证失效'
+  if (row.quota?.quotaStatus === 'error') return '检测失败'
+  if (subIsRateLimited(row)) return '已限流'
+  return localizedStatus(row.sub.status)
+}
+
+function subStatusTone(row: UnifiedAccountRow) {
+  if (subHasAuthFailure(row) || row.quota?.quotaStatus === 'error') return 'error'
+  if (subIsRateLimited(row)) return 'pending'
+  return statusTone(row.sub?.status || 'unknown')
+}
+
+function localSmsStatus(item: AccountVaultView) {
+  if (!item.smsReceiver) return '未分配接码'
+  return item.smsVerifiedAt ? '已接码' : '未接码'
+}
+
+function localSmsTone(item: AccountVaultView) {
+  if (!item.smsReceiver) return 'neutral'
+  return item.smsVerifiedAt ? 'active' : 'neutral'
+}
+
+function localPoolStatus(row: UnifiedAccountRow) {
+  if (row.sub || row.subPoolStatus === 'active') return '已登录'
+  if (row.subPoolStatus === 'deleted') return 'SUB 已删除'
+  return '未进入 SUB 号池'
+}
+
+function localPoolTone(row: UnifiedAccountRow) {
+  if (row.subPoolStatus === 'deleted') return 'error'
+  if (row.sub || row.subPoolStatus === 'active') return 'active'
+  return 'neutral'
+}
+
 function time(value: number | null) {
   return value ? new Intl.DateTimeFormat('zh-CN', {
     month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false
@@ -404,10 +468,45 @@ function smsMessageSummary(result: SmsCodeResult) {
   return result.message.split('|', 1)[0]?.trim() || '暂无新验证码'
 }
 
+function accountEmail(row: UnifiedAccountRow) {
+  return row.vault?.email
+    || row.sub?.name
+    || row.cpaFiles[0]?.account
+    || row.cpaFiles[0]?.name.replace(/\.json$/i, '')
+    || '未命名账号'
+}
+
+function accountPlan(row: UnifiedAccountRow) {
+  return row.quota?.planType || row.cpaFiles.find(item => item.planType)?.planType || ''
+}
+
+function accountTypeLabel(row: UnifiedAccountRow) {
+  if (row.sub) return ''
+  if (row.cpaFiles.length) return `${row.cpaFiles[0]?.provider || '未知服务'} / 认证文件`
+  if (row.vault?.credentialKind === 'tokens') return 'AT / RT'
+  if (row.vault?.credentialKind === 'email_code_url') return '邮箱链接'
+  if (row.vault?.hasTotpSecret) return '密码 + 2FA'
+  return '密码'
+}
+
+function belongsToSub(row: UnifiedAccountRow) {
+  return Boolean(row.sub || row.subPoolStatus === 'active' || row.subPoolStatus === 'deleted')
+}
+
+async function loadAccountPasswords() {
+  try {
+    const result = await $fetch<{ items: Array<{ id: string; password: string }> }>('/api/admin/account-vault/passwords', { method: 'POST' })
+    Object.keys(accountPasswords).forEach(id => delete accountPasswords[id])
+    result.items.forEach((item) => { accountPasswords[item.id] = item.password })
+  } catch (value) {
+    showToast(failure(value, '读取账号密码失败'), 'error')
+  }
+}
+
 async function refreshAllData(includeQuota = true) {
   loadingAll.value = true
   try {
-    const tasks: Promise<unknown>[] = [refreshVault(), refreshReceivers(), refreshManaged(), refreshCpa(), refreshGroups(), refreshProxies()]
+    const tasks: Promise<unknown>[] = [refreshVault(), refreshReceivers(), refreshManaged(), refreshCpa(), refreshGroups(), refreshProxies(), loadAccountPasswords()]
     if (includeQuota) tasks.push(refreshQuotas())
     await Promise.all(tasks)
   } finally {
@@ -824,32 +923,6 @@ async function importDelivery() {
   }
 }
 
-async function reveal(item: AccountVaultView, copy = false) {
-  const current = revealed[item.id]
-  if (current) {
-    if (copy) await copyText(current, '账号密码已复制')
-    else {
-      delete revealed[item.id]
-      window.clearTimeout(revealTimers.get(item.id))
-      revealTimers.delete(item.id)
-    }
-    return
-  }
-  try {
-    const result = await $fetch<{ password: string }>(`/api/admin/account-vault/${item.id}/reveal`, { method: 'POST' })
-    revealed[item.id] = result.password
-    window.clearTimeout(revealTimers.get(item.id))
-    revealTimers.set(item.id, window.setTimeout(() => {
-      delete revealed[item.id]
-      revealTimers.delete(item.id)
-    }, 60_000))
-    if (copy) await copyText(result.password, '账号密码已复制')
-    else showToast('账号密码将在 60 秒后自动隐藏', 'info')
-  } catch (value) {
-    showToast(failure(value, '读取账号密码失败'), 'error')
-  }
-}
-
 function openExport() {
   exportPassword.value = ''
   exportError.value = ''
@@ -1004,7 +1077,7 @@ async function toggleSubScheduling(item: SubAccountManagementView, schedulable: 
   try {
     await $fetch(`/api/admin/upstreams/sub/accounts/${item.id}`, { method: 'PATCH', body: { schedulable } })
     await refreshManaged()
-    showToast(schedulable ? '账号已加入调度' : '账号已暂停调度', 'success')
+    showToast(schedulable ? '账号调度已启用' : '账号调度已暂停', 'success')
   } catch (value) {
     showToast(failure(value, '修改调度状态失败'), 'error')
     await refreshManaged()
@@ -1307,7 +1380,7 @@ async function confirmDelete() {
   try {
     if (target.kind === 'vault') {
       await $fetch(`/api/admin/account-vault/${target.item.id}`, { method: 'DELETE' })
-      delete revealed[target.item.id]
+      delete accountPasswords[target.item.id]
       delete accountTotpCodes[target.item.id]
       window.clearTimeout(totpTimers.get(target.item.id))
       await Promise.all([refreshVault(), refreshReceivers()])
@@ -1344,10 +1417,9 @@ async function confirmDelete() {
   }
 }
 
-onBeforeUnmount(() => {
-  revealTimers.forEach(timer => window.clearTimeout(timer))
-  totpTimers.forEach(timer => window.clearTimeout(timer))
-})
+onMounted(() => { void loadAccountPasswords() })
+
+onBeforeUnmount(() => { totpTimers.forEach(timer => window.clearTimeout(timer)) })
 </script>
 
 <template>
@@ -1379,54 +1451,68 @@ onBeforeUnmount(() => {
 
     <section v-if="activeTab === 'accounts'" class="admin-table-wrap account-workspace-table-wrap">
       <table class="admin-table account-workspace-table">
-        <thead><tr><th>账号 / 备注</th><th>号池 / 状态</th><th>账号类型</th><th>容量 / 调度</th><th>用量窗口</th><th>短信接码</th><th aria-label="操作" /></tr></thead>
+        <thead><tr><th>账号</th><th>号池 / 凭据 / 状态</th><th>容量 / 调度</th><th>用量窗口</th><th>短信接码</th><th aria-label="操作" /></tr></thead>
         <tbody>
           <tr v-for="row in filteredRows" :key="row.key">
             <td>
               <div class="account-identity">
-                <strong>{{ row.vault?.displayName || row.vault?.email || row.sub?.name || row.cpaFiles[0]?.account || row.cpaFiles[0]?.name || '未命名账号' }}</strong>
-                <template v-if="row.vault">
-                  <div class="account-email-line">
-                    <a v-if="row.vault.hasEmailCodeUrl" class="account-email-link" :href="`/api/admin/account-vault/${row.vault.id}/email-link`" target="_blank" rel="noopener noreferrer" :title="`打开 ${row.vault.email} 的邮箱接码页面`"><IconExternalLink :size="13" />{{ row.vault.email }}</a>
-                    <code v-else>{{ row.vault.email }}</code>
-                  </div>
-                  <code v-if="revealed[row.vault.id]" class="revealed-password">{{ revealed[row.vault.id] }}</code>
-                  <div v-if="accountTotpCodes[row.vault.id]" class="account-totp-inline"><code>{{ accountTotpCodes[row.vault.id]?.code }}</code><button class="icon-button" type="button" title="复制 2FA 验证码" aria-label="复制 2FA 验证码" @click="copyText(accountTotpCodes[row.vault.id]!.code, '2FA 验证码已复制')"><IconCopy :size="13" /></button></div>
-                  <small v-if="row.vault.remark" class="account-remark" :title="row.vault.remark">{{ row.vault.remark }}</small>
-                </template>
-                <code v-else>{{ row.sub?.notes || row.sub?.name || row.cpaFiles.map(item => item.name).join('、') }}</code>
+                <div v-if="belongsToSub(row) || row.cpaFiles.length || accountPlan(row)" class="account-badge-row">
+                  <span v-if="belongsToSub(row)" class="record-badge" data-tone="sub">SUB</span>
+                  <span v-if="row.cpaFiles.length" class="record-badge" data-tone="cpa">CPA</span>
+                  <span v-if="accountPlan(row)" class="record-badge" data-tone="plan">{{ accountPlan(row) }}</span>
+                </div>
+                <div class="account-email-row">
+                  <a v-if="row.vault?.hasEmailCodeUrl" class="account-email-link" :href="`/api/admin/account-vault/${row.vault.id}/email-link`" target="_blank" rel="noopener noreferrer" :title="`打开 ${row.vault.email} 的邮箱接码页面`"><IconExternalLink :size="13" /><span>{{ row.vault.email }}</span></a>
+                  <code v-else class="account-email" :title="accountEmail(row)">{{ accountEmail(row) }}</code>
+                </div>
+                <button v-if="row.vault && accountPasswords[row.vault.id]" class="password-copy" type="button" :title="`复制密码 ${accountPasswords[row.vault.id]}`" @click="copyText(accountPasswords[row.vault.id]!, '账号密码已复制')"><IconCopy :size="13" /><span>{{ accountPasswords[row.vault.id] }}</span></button>
               </div>
             </td>
             <td>
               <div class="pool-status">
-                <div class="badge-stack badge-stack--row">
-                  <span v-if="row.sub" class="record-badge" data-tone="sub">Sub2API</span>
-                  <span v-else-if="row.subPoolStatus === 'deleted'" class="record-badge" data-tone="error">Sub 已删除</span>
-                  <span v-else-if="row.vault" class="record-badge">待接入</span>
-                  <span v-if="row.cpaFiles.length" class="record-badge" data-tone="cpa">CPA</span>
-                </div>
-                <span v-if="row.sub" class="status-dot" :data-status="statusTone(row.sub.status, row.sub.schedulable)"><i />{{ row.sub.schedulable ? row.sub.status : '暂停调度' }}</span>
-                <span v-else-if="row.cpaFiles.length" class="status-dot" :data-status="row.cpaFiles.every(item => item.disabled) ? 'disabled' : statusTone(row.cpaFiles[0]?.status || 'unknown')"><i />{{ row.cpaFiles.every(item => item.disabled) ? '已停用' : row.cpaFiles[0]?.status }}</span>
-                <span v-else-if="row.vault" class="status-dot" :data-status="statusTone(row.vault.status)"><i />{{ row.vault.status }}</span>
+                <template v-if="row.sub">
+                  <span class="status-dot" :data-status="subStatusTone(row)"><i />{{ subStatusLabel(row) }}</span>
+                  <div v-if="row.vault" class="local-account-status">
+                    <span class="record-badge" :data-tone="localSmsTone(row.vault)">{{ localSmsStatus(row.vault) }}</span>
+                    <span class="record-badge" data-tone="active">{{ localPoolStatus(row) }}</span>
+                  </div>
+                </template>
+                <template v-else-if="row.cpaFiles.length">
+                  <span class="status-dot" :data-status="row.cpaFiles.every(item => item.disabled) ? 'disabled' : statusTone(row.cpaFiles[0]?.status || 'unknown')"><i />{{ row.cpaFiles.every(item => item.disabled) ? '已停用' : localizedStatus(row.cpaFiles[0]?.status || 'unknown') }}</span>
+                  <div v-if="row.vault" class="local-account-status">
+                    <span class="record-badge" :data-tone="localSmsTone(row.vault)">{{ localSmsStatus(row.vault) }}</span>
+                    <span class="record-badge" :data-tone="localPoolTone(row)">{{ localPoolStatus(row) }}</span>
+                  </div>
+                </template>
+                <template v-else-if="row.subPoolStatus === 'deleted'">
+                  <div v-if="row.vault" class="local-account-status">
+                    <span class="record-badge" :data-tone="localSmsTone(row.vault)">{{ localSmsStatus(row.vault) }}</span>
+                    <span class="record-badge" data-tone="error">SUB 已删除</span>
+                  </div>
+                  <span v-else class="status-dot" data-status="error"><i />SUB 已删除</span>
+                </template>
+                <template v-else-if="row.vault">
+                  <div class="local-account-status">
+                    <span class="record-badge" :data-tone="localSmsTone(row.vault)">{{ localSmsStatus(row.vault) }}</span>
+                    <span class="record-badge" :data-tone="localPoolTone(row)">{{ localPoolStatus(row) }}</span>
+                  </div>
+                </template>
+                <span v-if="accountTypeLabel(row)" class="record-badge account-kind-badge">{{ accountTypeLabel(row) }}</span>
+                <small v-if="row.sub?.groupNames.length" class="table-sub">{{ row.sub.groupNames.join('、') }}</small>
                 <small v-if="row.sub?.errorMessage" class="table-sub account-error" :title="row.sub.errorMessage">{{ row.sub.errorMessage }}</small>
-                <small v-else-if="row.quota?.planType" class="table-sub">{{ row.quota.planType }}</small>
-                <small v-else-if="row.cpaFiles.length" class="table-sub">{{ row.cpaFiles.length }} 个认证文件 · {{ row.cpaFiles[0]?.planType || '未知套餐' }}</small>
               </div>
-            </td>
-            <td>
-              <strong class="table-value">{{ row.sub ? `${row.sub.platform} / ${row.sub.type}` : row.cpaFiles.length ? `${row.cpaFiles[0]?.provider} / 认证文件` : row.vault?.credentialKind === 'tokens' ? 'AT / RT' : row.vault?.credentialKind === 'email_code_url' ? '邮箱链接' : row.vault?.hasTotpSecret ? '密码 + 2FA' : '密码' }}</strong>
-              <small v-if="row.sub?.groupNames.length" class="table-sub">{{ row.sub.groupNames.join('、') }}</small>
             </td>
             <td>
               <template v-if="row.sub">
                 <strong class="table-value tabular-nums">{{ row.sub.currentConcurrency }} / {{ row.sub.concurrency }}</strong>
                 <label class="compact-switch" :class="{ disabled: subMutating[row.sub.id] }">
                   <input type="checkbox" :checked="row.sub.schedulable" :disabled="subMutating[row.sub.id]" @change="toggleSubScheduling(row.sub!, ($event.target as HTMLInputElement).checked)">
-                  <span aria-hidden="true" /><em>{{ row.sub.schedulable ? '参与调度' : '暂停调度' }}</em>
+                  <span aria-hidden="true" /><em>{{ row.sub.schedulable ? '已启用调度' : '已暂停调度' }}</em>
                 </label>
               </template>
               <span v-else-if="row.cpaFiles.length" class="table-muted">{{ row.cpaFiles.length }} 个认证文件<br>CPA 全局调度</span>
-              <span v-else class="table-muted">尚未进入号池</span>
+              <span v-else-if="row.subPoolStatus === 'deleted'" class="table-muted">Sub 已删除，不参与调度</span>
+              <span v-else class="table-muted">未进入 SUB 号池</span>
             </td>
             <td>
               <div v-if="row.quota?.windows.length" class="quota-windows">
@@ -1442,34 +1528,38 @@ onBeforeUnmount(() => {
             <td>
               <div v-if="row.vault?.smsReceiver" class="account-sms">
                 <button class="phone-copy" type="button" :title="`复制 ${row.vault.smsReceiver.copyValue}`" @click="copyText(row.vault.smsReceiver.copyValue, '手机号已复制（不含 +1）')"><IconCopy :size="13" />{{ row.vault.smsReceiver.phone }}</button>
-                <div class="account-sms-meta"><span class="record-badge" :data-tone="row.vault.smsVerifiedAt ? 'active' : 'neutral'">{{ row.vault.smsVerifiedAt ? '已接码' : '未接码' }}</span><span>{{ row.vault.smsReceiver.bindingCount }}/3</span></div>
-                <div>
+                <div class="account-sms-meta">
+                  <IconUsers :size="12" />
+                  <span>绑定</span>
+                  <strong class="tabular-nums">{{ row.vault.smsReceiver.bindingCount }}/3</strong>
+                  <i aria-hidden="true" />
+                  <span>当前槽位</span>
+                  <strong class="tabular-nums">#{{ row.vault.smsReceiver.slot }}</strong>
+                </div>
+                <div class="account-sms-code-row">
                   <code v-if="accountSmsCodes[row.vault.id]?.code">{{ accountSmsCodes[row.vault.id]?.code }}</code>
                   <small v-else-if="accountSmsCodes[row.vault.id]" :title="accountSmsCodes[row.vault.id]?.message">{{ smsMessageSummary(accountSmsCodes[row.vault.id]!) }}</small>
                   <small v-else>未获取验证码</small>
-                  <button v-if="accountSmsCodes[row.vault.id]?.code" class="icon-button" type="button" title="复制验证码" aria-label="复制验证码" @click="copyText(accountSmsCodes[row.vault.id]!.code!, '验证码已复制')"><IconCopy :size="14" /></button>
-                  <button class="icon-button" type="button" title="获取短信验证码" aria-label="获取短信验证码" :disabled="refreshingAccountCodes[row.vault.id]" @click="refreshAccountSmsCode(row.vault)"><IconRefresh :size="14" :class="{ 'is-spinning': refreshingAccountCodes[row.vault.id] }" /></button>
+                  <button v-if="accountSmsCodes[row.vault.id]?.code" class="icon-button account-sms-icon" type="button" title="复制验证码" aria-label="复制验证码" @click="copyText(accountSmsCodes[row.vault.id]!.code!, '验证码已复制')"><IconCopy :size="13" /></button>
+                  <button class="icon-button account-sms-icon" type="button" title="获取短信验证码" aria-label="获取短信验证码" :disabled="refreshingAccountCodes[row.vault.id]" @click="refreshAccountSmsCode(row.vault)"><IconRefresh :size="13" :class="{ 'is-spinning': refreshingAccountCodes[row.vault.id] }" /></button>
                 </div>
               </div>
               <span v-else class="table-muted">未分配手机号</span>
             </td>
             <td>
               <div class="table-actions account-row-actions">
-                <button v-if="row.vault && !row.sub" class="icon-button account-auth-button" type="button" title="Auth 登录并接入 Codex" aria-label="Auth 登录并接入 Codex" @click="openOAuth(row.vault)"><IconLogin2 :size="16" /></button>
-                <button v-if="row.cpaFiles.length" class="icon-button" type="button" title="管理 CPA 认证文件" aria-label="管理 CPA 认证文件" @click="openCpaManager(row.cpaFiles)"><IconFileCode :size="16" /></button>
-                <button v-if="row.sub" class="icon-button" type="button" title="主动验活" aria-label="主动验活" :disabled="subMutating[row.sub.id]" @click="verifySub(row.sub)"><IconCircleCheck :size="16" /></button>
-                <button v-if="row.sub" class="icon-button" type="button" title="检测账号状态并刷新用量窗口" aria-label="检测账号状态并刷新用量窗口" :disabled="quotaRefreshing[row.sub.id]" @click="refreshQuota(row.sub)"><IconRefresh :size="16" :class="{ 'is-spinning': quotaRefreshing[row.sub.id] }" /></button>
-                <button v-if="row.sub" class="icon-button" type="button" title="编辑 Sub2API 配置" aria-label="编辑 Sub2API 配置" @click="openSubEdit(row.sub)"><IconEdit :size="16" /></button>
-                <button v-if="row.vault?.hasTotpSecret" class="icon-button" type="button" title="生成 2FA 动态验证码" aria-label="生成 2FA 动态验证码" :disabled="generatingTotp[row.vault.id]" @click="generateAccountTotp(row.vault)"><IconShieldCheck :size="16" /></button>
-                <button v-if="row.vault && row.vault.credentialKind !== 'email_code_url'" class="icon-button" type="button" :title="revealed[row.vault.id] ? '隐藏密码' : '显示密码'" :aria-label="revealed[row.vault.id] ? '隐藏密码' : '显示密码'" @click="reveal(row.vault)"><IconEyeOff v-if="revealed[row.vault.id]" :size="16" /><IconEye v-else :size="16" /></button>
-                <button v-if="row.vault && row.vault.credentialKind !== 'email_code_url'" class="icon-button" type="button" title="复制密码" aria-label="复制密码" @click="reveal(row.vault, true)"><IconCopy :size="16" /></button>
-                <button v-if="row.vault" class="icon-button" type="button" title="编辑账号资料" aria-label="编辑账号资料" @click="openEdit(row.vault)"><IconAddressBook :size="16" /></button>
-                <button v-if="row.vault" class="icon-button danger" type="button" title="删除本地账号" aria-label="删除本地账号" @click="deleting = { kind: 'vault', item: row.vault }"><IconTrash :size="16" /></button>
-                <button v-else-if="row.sub" class="icon-button danger" type="button" title="删除 Sub2API 账号" aria-label="删除 Sub2API 账号" @click="deleting = { kind: 'sub', item: row.sub }"><IconTrash :size="16" /></button>
+                <button v-if="row.vault && !row.sub" class="account-action-button" type="button" title="Auth 登录并接入 Codex" @click="openOAuth(row.vault)"><IconLogin2 :size="14" />授权</button>
+                <button v-if="row.cpaFiles.length" class="account-action-button" type="button" title="管理 CPA 认证文件" @click="openCpaManager(row.cpaFiles)"><IconFileCode :size="14" />CPA</button>
+                <button v-if="row.sub" class="account-action-button" type="button" title="主动验活" :disabled="subMutating[row.sub.id]" @click="verifySub(row.sub)"><IconCircleCheck :size="14" />验活</button>
+                <button v-if="row.sub" class="account-action-button" type="button" title="检测账号状态并刷新用量窗口" :disabled="quotaRefreshing[row.sub.id]" @click="refreshQuota(row.sub)"><IconRefresh :size="14" :class="{ 'is-spinning': quotaRefreshing[row.sub.id] }" />刷新</button>
+                <button v-if="row.sub" class="account-action-button" type="button" title="编辑 Sub2API 配置" @click="openSubEdit(row.sub)"><IconEdit :size="14" />编辑</button>
+                <button v-if="row.vault" class="account-action-button" type="button" title="编辑账号资料" @click="openEdit(row.vault)"><IconAddressBook :size="14" />资料</button>
+                <button v-if="row.vault" class="account-action-button account-action-button--danger" type="button" title="删除本地账号" @click="deleting = { kind: 'vault', item: row.vault }"><IconTrash :size="14" />删除</button>
+                <button v-else-if="row.sub" class="account-action-button account-action-button--danger" type="button" title="删除 Sub2API 账号" @click="deleting = { kind: 'sub', item: row.sub }"><IconTrash :size="14" />删除</button>
               </div>
             </td>
           </tr>
-          <tr v-if="!filteredRows.length"><td colspan="7"><div class="admin-empty account-empty"><IconAddressBook :size="24" /><span>{{ unifiedRows.length ? '没有匹配的账号' : '还没有账号' }}</span><button v-if="!unifiedRows.length" class="button button--primary" type="button" @click="openCreate">新增第一个账号</button></div></td></tr>
+          <tr v-if="!filteredRows.length"><td colspan="6"><div class="admin-empty account-empty"><IconAddressBook :size="24" /><span>{{ unifiedRows.length ? '没有匹配的账号' : '还没有账号' }}</span><button v-if="!unifiedRows.length" class="button button--primary" type="button" @click="openCreate">新增第一个账号</button></div></td></tr>
         </tbody>
       </table>
     </section>
@@ -1500,7 +1590,7 @@ onBeforeUnmount(() => {
           <div class="cpa-file-list">
             <div v-for="item in managingCpaFiles" :key="item.id">
               <span><strong>{{ item.name }}</strong><small>{{ item.account || '未提供账号标识' }} · {{ item.provider }} / {{ item.planType || '未知套餐' }}</small></span>
-              <span class="status-dot" :data-status="item.disabled ? 'disabled' : statusTone(item.status)"><i />{{ item.disabled ? '已停用' : item.status }}</span>
+              <span class="status-dot" :data-status="item.disabled ? 'disabled' : statusTone(item.status)"><i />{{ item.disabled ? '已停用' : localizedStatus(item.status) }}</span>
               <time>{{ time(item.lastRefreshAt) }}</time>
               <div class="table-actions">
                 <button class="icon-button" type="button" title="验证能力" aria-label="验证 CPA 认证能力" :disabled="cpaMutating[item.id]" @click="verifyCpa(item)"><IconShieldCheck :size="16" /></button>
@@ -1672,10 +1762,10 @@ onBeforeUnmount(() => {
         <header><div><span>SUB2API ACCOUNT</span><h2 class="text-balance">编辑号池账号</h2></div><button class="icon-button" type="button" title="关闭" aria-label="关闭" @click="editingSub = null"><IconX :size="18" /></button></header>
         <form class="admin-form" @submit.prevent="saveSub">
           <div class="form-grid"><label><span>账号名称 *</span><input v-model="subForm.name" required maxlength="160"></label><label><span>备注</span><input v-model="subForm.notes" maxlength="2000"></label></div>
-          <div class="form-grid form-grid--four"><label><span>并发容量</span><input v-model.number="subForm.concurrency" type="number" min="1"></label><label><span>优先级</span><input v-model.number="subForm.priority" type="number" min="0"></label><label><span>倍率</span><input v-model.number="subForm.rateMultiplier" type="number" min="0" step="0.01"></label><label><span>状态</span><AppSelect v-model="subForm.status"><option value="active">active</option><option value="inactive">inactive</option><option value="error">error</option></AppSelect></label></div>
+          <div class="form-grid form-grid--four"><label><span>并发容量</span><input v-model.number="subForm.concurrency" type="number" min="1"></label><label><span>优先级</span><input v-model.number="subForm.priority" type="number" min="0"></label><label><span>倍率</span><input v-model.number="subForm.rateMultiplier" type="number" min="0" step="0.01"></label><label><span>状态</span><AppSelect v-model="subForm.status"><option value="active">运行中</option><option value="inactive">已停用</option><option value="error">异常</option></AppSelect></label></div>
           <label><span>账号代理</span><AppSelect v-model="subForm.proxyId" :disabled="!editingSub.proxyEditable"><option :value="null">不使用代理（直连）</option><option v-for="item in activeProxies()" :key="item.id" :value="item.id">{{ item.name }} · {{ item.protocol }}://{{ item.host }}:{{ item.port }}</option></AppSelect><small v-if="!editingSub.proxyEditable">影子账号继承主账号代理，不能单独修改。</small></label>
           <fieldset class="group-picker"><legend>所属分组</legend><label v-for="item in groups" :key="item.id"><input v-model="subForm.groupIds" type="checkbox" :value="item.id"><span>{{ item.name }}<small>{{ item.platform }}</small></span></label></fieldset>
-          <label class="switch"><input v-model="subForm.schedulable" type="checkbox"><span />参与调度</label>
+              <label class="switch"><input v-model="subForm.schedulable" type="checkbox"><span />{{ subForm.schedulable ? '已启用调度' : '已暂停调度' }}</label>
           <p v-if="subFormError" class="form-error">{{ subFormError }}</p>
           <footer><button class="button button--secondary" type="button" @click="editingSub = null">取消</button><button class="button button--primary" :disabled="saving">{{ saving ? '保存中' : '保存配置' }}</button></footer>
         </form>
@@ -1696,31 +1786,32 @@ onBeforeUnmount(() => {
 <style scoped>
 .account-toolbar { margin-bottom: 12px; }
 .account-toolbar > span { margin-left: auto; color: #737b74; font-size: 12px; font-variant-numeric: tabular-nums; }
-.account-workspace-table { min-width: 1410px; table-layout: fixed; }
-.account-workspace-table th:nth-child(1) { width: 285px; }
-.account-workspace-table th:nth-child(2) { width: 175px; }
-.account-workspace-table th:nth-child(3) { width: 150px; }
-.account-workspace-table th:nth-child(4) { width: 145px; }
-.account-workspace-table th:nth-child(5) { width: 260px; }
-.account-workspace-table th:nth-child(6) { width: 220px; }
-.account-workspace-table th:nth-child(7) { width: 175px; }
-.account-identity { min-width: 0; display: grid; gap: 5px; }
-.account-identity > strong, .account-identity > code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.account-email-line { min-width: 0; }
-.account-email-line code { max-width: 100%; overflow: hidden; display: block; text-overflow: ellipsis; white-space: nowrap; }
-.account-email-link { min-width: 0; max-width: 100%; display: inline-flex; align-items: center; gap: 5px; overflow: hidden; color: #176144; font-family: var(--font-mono); font-size: 12px; text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
+.account-workspace-table { width: 100%; table-layout: auto; }
+.account-workspace-table th:nth-child(1) { min-width: 300px; }
+.account-workspace-table th:nth-child(2) { width: 250px; }
+.account-workspace-table th:nth-child(3) { width: 145px; }
+.account-workspace-table th:nth-child(4) { width: 260px; }
+.account-workspace-table th:nth-child(5) { width: 220px; }
+.account-workspace-table th:nth-child(6) { width: 175px; }
+.account-identity { min-width: max-content; display: grid; justify-items: start; gap: 6px; }
+.account-badge-row { display: flex; align-items: center; gap: 5px; min-height: 22px; }
+.account-email-row { width: max-content; display: flex; align-items: center; gap: 6px; }
+.account-email { margin-top: 0; display: inline; color: #303831; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.account-email-link { display: inline-flex; align-items: center; gap: 5px; color: #176144; font-family: var(--font-mono); font-size: 12px; font-weight: 700; text-decoration: none; white-space: nowrap; }
+.account-email-link svg { flex: 0 0 auto; }
+.account-email-link span { white-space: nowrap; }
 .account-email-link:hover { text-decoration: underline; }
-.revealed-password { color: #176144; }
-.account-remark { overflow: hidden; color: #747d75; font-size: 11px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
-.account-totp-inline { display: flex; align-items: center; gap: 5px; }
-.account-totp-inline code { color: #176144; font-size: 13px; font-weight: 850; }
-.account-totp-inline .icon-button { width: 25px; height: 25px; }
-.badge-stack { display: grid; justify-items: start; gap: 5px; }
-.badge-stack--row { display: flex; flex-wrap: wrap; }
+.password-copy { max-width: 100%; padding: 0; border: 0; display: inline-flex; align-items: center; gap: 5px; overflow: hidden; color: #245f49; background: transparent; font-family: var(--font-mono); font-size: 12px; font-weight: 700; cursor: pointer; }
+.password-copy svg { flex: 0 0 auto; }
+.password-copy span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.password-copy:hover { text-decoration: underline; }
 .pool-status { min-width: 0; display: grid; justify-items: start; gap: 6px; }
+.local-account-status { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.account-kind-badge { color: #303831; background: #f5f6f4; }
 .record-badge { min-height: 22px; padding: 2px 7px; border: 1px solid #cfd4cf; border-radius: 4px; display: inline-flex; align-items: center; color: #6f7770; background: #f2f3f1; font-size: 11px; font-weight: 800; white-space: nowrap; }
 .record-badge[data-tone='active'] { border-color: #a9cdbb; color: #176144; background: #e9f4ee; }
 .record-badge[data-tone='sub'] { border-color: #b7c7d8; color: #345d7e; background: #edf3f8; }
+.record-badge[data-tone='plan'] { border-color: #a9cfcb; color: #286b6d; background: #e8f3f2; }
 .record-badge[data-tone='cpa'] { border-color: #d2c3a5; color: #70592e; background: #f6f1e7; }
 .record-badge[data-tone='error'] { border-color: #dfb7b2; color: #9d332c; background: #f9ecea; }
 .table-value { display: block; font-variant-numeric: tabular-nums; }
@@ -1743,15 +1834,25 @@ onBeforeUnmount(() => {
 .quota-windows i b { height: 100%; display: block; background: #287858; }
 .quota-windows small { grid-column: 2; grid-row: 1 / span 2; color: #7e867f; font-size: 10px; line-height: 1.35; text-align: right; }
 .account-sms { min-width: 0; display: grid; gap: 5px; }
-.account-sms > span { color: #7e867f; font-size: 11px; }
 .account-sms > div { display: flex; align-items: center; gap: 5px; }
-.account-sms-meta { color: #7e867f; font-size: 11px; }
-.account-sms-meta .record-badge { min-height: 20px; padding-block: 1px; }
+.account-sms-meta { color: #7e867f; font-size: 10px; line-height: 1; }
+.account-sms-meta svg { color: #949b95; }
+.account-sms-meta strong { color: #535c54; font-size: 10px; font-weight: 800; }
+.account-sms-meta i { width: 1px; height: 10px; margin-inline: 2px; background: #d7dbd7; }
+.account-sms-code-row { min-height: 26px; }
+.account-sms-code-row > :first-child { margin-right: auto; }
+.account-sms .account-sms-icon { width: 26px; height: 26px; border-radius: 5px; }
 .account-sms code { color: #176144; font-size: 13px; font-weight: 800; }
 .account-sms small { max-width: 130px; overflow: hidden; color: #858d86; text-overflow: ellipsis; white-space: nowrap; }
 .phone-copy { max-width: 100%; padding: 0; border: 0; display: inline-flex; align-items: center; gap: 5px; overflow: hidden; color: #245f49; background: transparent; font: inherit; font-size: 12px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .phone-copy:hover { text-decoration: underline; }
-.account-row-actions { flex-wrap: wrap; }
+.account-row-actions { justify-content: flex-start; flex-wrap: wrap; gap: 4px 9px; }
+.account-action-button { padding: 2px 0; border: 0; display: inline-flex; align-items: center; gap: 4px; color: #245f49; background: transparent; font: inherit; font-size: 11px; font-weight: 750; line-height: 1.4; white-space: nowrap; cursor: pointer; }
+.account-action-button svg { flex: 0 0 auto; }
+.account-action-button:hover { color: #176144; text-decoration: none; }
+.account-action-button:disabled { cursor: wait; opacity: .5; }
+.account-action-button--danger { color: #b74137; }
+.account-action-button--danger:hover { color: #922f27; }
 .account-auth-button { color: #176144; background: #e9f4ee; }
 .account-empty { gap: 10px; padding: 28px; }
 .receiver-table-wrap--page { max-height: none; }

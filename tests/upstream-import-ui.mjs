@@ -58,6 +58,7 @@ try {
     let conversionSubImportBody = null
     page.on('pageerror', error => pageErrors.push(error.message))
     await page.route('**/api/admin/account-vault', route => route.fulfill({ json: { items: [localAccount] } }))
+    await page.route('**/api/admin/account-vault/passwords', route => route.fulfill({ json: { items: [{ id: fixtureId, password: 'OAuth-UI-Account-Password' }] } }))
     await page.route('**/api/admin/sms-receivers', route => route.fulfill({ json: { items: [] } }))
     await page.route('**/api/sub2api/accounts', route => route.fulfill({ json: {
       results: [], accountCount: 0, successCount: 0, failureCount: 0, generatedAt: Date.now()
@@ -125,7 +126,10 @@ try {
       throw new Error(`account create button missing; header=${JSON.stringify(await page.locator('.admin-page__header').innerText())}; errors=${JSON.stringify(pageErrors)}`)
     }
     const accountRow = page.locator('.account-workspace-table tbody tr').filter({ hasText: fixtureEmail })
-    await accountRow.getByText('CPA', { exact: true }).waitFor()
+    const accountIdentity = accountRow.locator('.account-identity')
+    await accountIdentity.getByText('CPA', { exact: true }).waitFor()
+    await accountIdentity.getByText('plus', { exact: true }).waitFor()
+    await accountIdentity.locator('.password-copy', { hasText: 'OAuth-UI-Account-Password' }).waitFor()
     await accountRow.getByTitle('管理 CPA 认证文件').click()
     const cpaManager = page.getByRole('dialog', { name: '管理 CPA 认证文件' })
     await cpaManager.getByText('codex-oauth.json', { exact: true }).waitFor()

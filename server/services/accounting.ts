@@ -352,6 +352,21 @@ export async function revealAccountVaultPassword(event: H3Event, id: string) {
   }
 }
 
+export async function revealAccountVaultPasswords(event: H3Event) {
+  const rows = await useDatabase(event).select({
+    id: accountVaultEntries.id,
+    encryptedPassword: accountVaultEntries.encryptedPassword
+  }).from(accountVaultEntries).orderBy(desc(accountVaultEntries.updatedAt))
+  try {
+    return rows.flatMap((row) => {
+      const password = decryptContextSecret(row.encryptedPassword, accountContext(row.id), event)
+      return password ? [{ id: row.id, password }] : []
+    })
+  } catch {
+    throw createError({ statusCode: 500, message: '账号密码密文无法解密，请检查加密密钥配置' })
+  }
+}
+
 export async function revealAccountVaultCredentials(event: H3Event, id: string) {
   const row = await accountRow(event, id)
   try {

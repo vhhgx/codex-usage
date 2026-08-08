@@ -290,13 +290,20 @@ try {
           if (await page.getByRole('button', { name: '导入 Sub JSON', exact: true }).count()) throw new Error('standalone Sub2API JSON import action is still present')
           if (await page.getByRole('button', { name: '上传 CPA JSON', exact: true }).count()) throw new Error('standalone CPA JSON upload action is still present')
           if (await page.getByRole('button', { name: '导入 JSON', exact: true }).count()) throw new Error('legacy Vault backup import is still present')
-          await page.getByText('UI Smoke 账号备注', { exact: true }).waitFor()
           if (await page.getByRole('columnheader', { name: '运行状态', exact: true }).count() || await page.getByRole('columnheader', { name: '号池 / 接码', exact: true }).count()) {
             throw new Error('account table still exposes duplicated status columns')
           }
-          const fixtureRow = page.locator('.account-workspace-table tbody tr', { hasText: 'UI Smoke Account' })
-          await fixtureRow.getByTitle('生成 2FA 动态验证码').click()
-          await fixtureRow.locator('.account-totp-inline code').filter({ hasText: /^\d{6}$/ }).waitFor()
+          await page.getByRole('columnheader', { name: '号池 / 凭据 / 状态', exact: true }).waitFor()
+          if (await page.getByRole('columnheader', { name: '账号类型', exact: true }).count()) throw new Error('account type column was not merged into pool status')
+          const fixtureRow = page.locator('.account-workspace-table tbody tr', { hasText: 'UI-Smoke-Account-Password' })
+          await fixtureRow.waitFor()
+          const fixtureIdentity = fixtureRow.locator('.account-identity')
+          if ((await fixtureIdentity.innerText()).includes('UI Smoke Account')) throw new Error('account identity still renders legacy displayName')
+          if ((await fixtureIdentity.innerText()).includes('UI Smoke 账号备注')) throw new Error('account identity still renders remarks')
+          const passwordButton = fixtureIdentity.locator('.password-copy', { hasText: 'UI-Smoke-Account-Password' })
+          await passwordButton.waitFor()
+          await passwordButton.click()
+          await page.getByText('账号密码已复制', { exact: true }).waitFor()
 
           await page.getByTitle('编辑账号资料').first().click()
           const accountEditor = page.getByRole('dialog', { name: '编辑账号' })
@@ -372,13 +379,9 @@ try {
           await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-delivery-import.png`, fullPage: true })
           await accountCreator.getByTitle('关闭').click()
 
-          const revealButton = page.getByTitle('显示密码').first()
-          if (!await revealButton.count()) throw new Error('account vault has no password reveal control')
-          const revealResponse = page.waitForResponse(response => /\/api\/admin\/account-vault\/[^/]+\/reveal$/.test(response.url()))
-          await revealButton.click()
-          if (!(await revealResponse).ok()) throw new Error('account password reveal failed without reauthentication')
-          if (await page.locator('.vault-security-modal').count()) throw new Error('account password reveal unexpectedly opened reauthentication')
-          if (!await page.locator('.revealed-password').first().textContent()) throw new Error('account password remained hidden after reveal')
+          if (await page.getByTitle('显示密码').count() || await page.getByTitle('隐藏密码').count()) {
+            throw new Error('account table still exposes legacy password reveal controls')
+          }
 
           const accountSmsCell = page.locator('.account-sms').first()
           if (await accountSmsCell.count()) {
