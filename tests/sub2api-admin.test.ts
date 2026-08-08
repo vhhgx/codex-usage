@@ -43,6 +43,7 @@ function stubAdminFetch() {
     }
   })
   vi.stubGlobal('$fetch', fetchMock)
+  vi.stubGlobal('createError', (input: { message: string }) => Object.assign(new Error(input.message), input))
   return fetchMock
 }
 
@@ -153,9 +154,86 @@ describe('Sub2API admin quota requests', () => {
 
     await fetchSub2ApiAccountQuota({} as H3Event, account(), true)
 
-    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[0]).toEqual([
+      'https://sub2api.example.com/api/v1/admin/openai/accounts/7/quota/refresh',
+      expect.objectContaining({ method: 'POST' })
+    ])
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://sub2api.example.com/api/v1/admin/accounts/7/usage')
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
       query: { source: 'active', force: 'true' }
     })
+  })
+
+  it('does not query usage windows when the OpenAI quota probe fails', async () => {
+    const fetchMock = stubAdminFetch()
+    fetchMock.mockRejectedValueOnce({
+      response: { status: 502 },
+      data: {
+        code: 502,
+        message: 'upstream returned 402: {"detail":{"code":"deactivated_workspace"}}',
+        reason: 'OPENAI_QUOTA_UPSTREAM_ERROR'
+      }
+    })
+
+    await expect(fetchSub2ApiAccountQuota({} as H3Event, account(), true)).resolves.toMatchObject({
+      quotaStatus: 'error',
+      error: 'upstream returned 402: {"detail":{"code":"deactivated_workspace"}}',
+      probeError: {
+        code: 502,
+        message: 'upstream returned 402: {"detail":{"code":"deactivated_workspace"}}',
+        reason: 'OPENAI_QUOTA_UPSTREAM_ERROR'
+      }
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('preserves an OpenAI account probe 401 instead of reporting a bad Sub2API management key', async () => {
+    const fetchMock = stubAdminFetch()
+    fetchMock.mockRejectedValueOnce({
+      response: { status: 401 },
+      data: {
+        code: 401,
+        message: 'upstream returned 401: {"detail":{"code":"invalid_token"}}',
+        reason: 'OPENAI_QUOTA_UPSTREAM_ERROR'
+      }
+    })
+
+    await expect(fetchSub2ApiAccountQuota({} as H3Event, account(), true)).resolves.toMatchObject({
+      quotaStatus: 'error',
+      error: 'upstream returned 401: {"detail":{"code":"invalid_token"}}',
+      probeError: {
+        code: 401,
+        message: 'upstream returned 401: {"detail":{"code":"invalid_token"}}',
+        reason: 'OPENAI_QUOTA_UPSTREAM_ERROR',
+      }
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('still reports actual Sub2API management authentication failures as configuration errors', async () => {
+    const fetchMock = stubAdminFetch()
+    fetchMock.mockRejectedValueOnce({
+      response: { status: 401 },
+      data: { code: 401, message: 'Authorization required', reason: 'UNAUTHORIZED' }
+    })
+
+    await expect(fetchSub2ApiAccountQuota({} as H3Event, account(), true)).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'Sub2API 管理密钥无效或权限不足'
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('skips the OpenAI-only quota probe for other platforms', async () => {
+    const fetchMock = stubAdminFetch()
+    const nonOpenAi = account()
+    nonOpenAi.view.platform = 'anthropic'
+
+    await fetchSub2ApiAccountQuota({} as H3Event, nonOpenAi, true)
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://sub2api.example.com/api/v1/admin/accounts/7/usage')
   })
 })
 

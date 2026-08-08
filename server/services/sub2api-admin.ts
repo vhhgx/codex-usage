@@ -7,6 +7,7 @@ import type {
 import type { SubAccountManagementView, SubGroupView, SubProxyProtocol, SubProxyView } from '#shared/types/upstream-management'
 import { opaqueSub2ApiAccountId, opaqueSub2ApiGroupId, opaqueSub2ApiProxyId } from '../utils/security'
 import { normalizeBaseUrl, redactSensitiveText, requireUpstreamConfig } from '../utils/upstream'
+import { markAccountVaultSub2ApiDeleted, reconcileAccountVaultSub2ApiAccounts } from './accounting'
 import { getCpaDefaultProxyUpstreamId, getSub2ApiDefaultProxyUpstreamId, setSub2ApiDefaultProxyUpstreamId } from './hub-settings'
 
 type UnknownRecord = Record<string, unknown>
@@ -124,7 +125,12 @@ function unwrap<T>(payload: unknown): T {
   if (!envelope) throw new Error('Sub2API 管理接口响应格式不正确')
   const code = numberValue(envelope.code)
   if (code !== null && code !== 0) {
-    throw new Error(text(envelope.message) || `Sub2API 管理接口返回错误 ${code}`)
+    const message = text(envelope.message) || `Sub2API 管理接口返回错误 ${code}`
+    throw createError({
+      statusCode: code >= 400 && code < 600 ? code : 502,
+      message,
+      data: { code, message, reason: text(envelope.reason) }
+    })
   }
   return (Object.prototype.hasOwnProperty.call(envelope, 'data') ? envelope.data : envelope) as T
 }
@@ -151,14 +157,21 @@ export async function sub2ApiAdminFetch<T>(
   } catch (error) {
     const status = Number((error as { response?: { status?: number }; statusCode?: number })?.response?.status ||
       (error as { statusCode?: number })?.statusCode || 0)
+    const responseData = record((error as { data?: unknown })?.data)
+    const nestedData = record(responseData?.data)
+    const reason = text(responseData?.reason ?? nestedData?.reason)
     const rawMessage = errorMessage(error, '无法连接 Sub2API 管理接口')
     const ambiguous = !status && /timeout|timed out|abort|socket|network|fetch failed/i.test(rawMessage)
+    const accountProbeFailure = reason === 'OPENAI_QUOTA_UPSTREAM_ERROR' ||
+      (/^\/openai\/accounts\/\d+\/quota\/refresh$/.test(path) && /upstream returned \d{3}\b/i.test(rawMessage))
     throw createError({
-      statusCode: status === 401 || status === 403 ? 502 : status >= 400 && status < 500 ? status : 502,
-      message: status === 401 || status === 403
+      statusCode: accountProbeFailure && status >= 400 ? status : status === 401 || status === 403 ? 502 : status >= 400 && status < 500 ? status : 502,
+      message: (status === 401 || status === 403) && !accountProbeFailure
         ? 'Sub2API 管理密钥无效或权限不足'
         : redactSensitiveText(rawMessage),
-      data: ambiguous ? { reconciliationRequired: true } : undefined
+      data: accountProbeFailure
+        ? { code: numberValue(responseData?.code) ?? (status || 502), reason: reason || 'OPENAI_QUOTA_UPSTREAM_ERROR', upstreamStatus: status || 502 }
+        : ambiguous ? { reconciliationRequired: true } : undefined
     })
   }
 }
@@ -341,6 +354,30 @@ export async function fetchSub2ApiAccountQuota(
   account: InternalAccount,
   active = false
 ): Promise<Sub2ApiAccountQuotaResult> {
+  if (active && account.view.platform.toLowerCase() === 'openai') {
+    try {
+      await sub2ApiAdminFetch(event, `/openai/accounts/${account.upstreamId}/quota/refresh`, { method: 'POST' })
+    } catch (error) {
+      const details = record((error as { data?: unknown })?.data)
+      if (text(details?.reason) !== 'OPENAI_QUOTA_UPSTREAM_ERROR') throw error
+      const parsed = parseSub2ApiAccountWindows(account.raw, null)
+      const message = errorMessage(error, 'OpenAI 账号检测失败')
+      return {
+        ...account.view,
+        quotaStatus: 'error',
+        planType: parsed.planType,
+        windows: parsed.windows,
+        refreshedAt: Date.now(),
+        usageSource: 'active',
+        error: message,
+        probeError: {
+          code: numberValue(details?.code) ?? (Number((error as { statusCode?: number }).statusCode) || 502),
+          message,
+          reason: text(details?.reason) || null
+        }
+      }
+    }
+  }
   try {
     const usage = await sub2ApiAdminFetch<UnknownRecord>(
       event,
@@ -744,6 +781,7 @@ export function managedAccountView(event: H3Event, account: InternalAccount, pro
 
 export async function listManagedSub2ApiAccounts(event: H3Event) {
   const [accounts, proxies] = await Promise.all([listSub2ApiAccounts(event), listManagedSub2ApiProxies(event, false)])
+  await reconcileAccountVaultSub2ApiAccounts(event, new Set(accounts.map(account => account.view.id)))
   return accounts.map(account => ({
     upstreamId: account.upstreamId,
     raw: account.raw,
@@ -956,13 +994,14 @@ export async function verifyManagedSub2ApiAccount(event: H3Event, opaqueId: stri
   return { ok: true, activated: activate, message: null }
 }
 
-export async function deleteManagedSub2ApiAccount(event: H3Event, opaqueId: string) {
+export async function deleteManagedSub2ApiAccount(event: H3Event, opaqueId: string, actorId?: string) {
   const target = await resolveManagedSub2ApiAccount(event, opaqueId)
   if (target.view.currentConcurrency > 0) throw createError({ statusCode: 409, message: '账号仍有进行中的请求，不能永久删除' })
   await sub2ApiAdminFetch(event, `/accounts/${target.upstreamId}`, { method: 'DELETE' })
   if ((await listSub2ApiAccounts(event)).some(item => item.upstreamId === target.upstreamId)) {
     throw createError({ statusCode: 502, message: 'Sub2API 返回删除成功，但账号仍然存在' })
   }
+  await markAccountVaultSub2ApiDeleted(event, target.view.id, actorId)
   return { deleted: true, name: target.view.name }
 }
 

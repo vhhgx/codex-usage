@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { normalizeLedgerTransaction, parseAccountDeliveryText, summarizeLedger, yuanToCents } from '../server/services/accounting'
+import {
+  missingActiveSub2ApiVaultIds,
+  normalizeLedgerTransaction,
+  parseAccountDeliveryText,
+  summarizeLedger,
+  yuanToCents
+} from '../server/services/accounting'
 import { decryptContextSecret, encryptContextSecret } from '../server/utils/hub-crypto'
 
 beforeEach(() => {
@@ -44,6 +50,19 @@ describe('purchased account delivery parsing', () => {
     expect(line).toMatchObject({ kind: 'invalid' })
     expect(line?.message).not.toContain('top-secret')
     expect(line?.message).not.toContain('extra-secret')
+  })
+})
+
+describe('account vault Sub2API lifecycle', () => {
+  it('marks only previously active accounts missing from a complete Sub2API list as deleted', () => {
+    const missing = missingActiveSub2ApiVaultIds([
+      { id: 'present', sub2apiAccountId: 'sub-present', sub2apiPoolStatus: 'active' },
+      { id: 'removed', sub2apiAccountId: 'sub-removed', sub2apiPoolStatus: 'active' },
+      { id: 'never-added', sub2apiAccountId: null, sub2apiPoolStatus: 'not_added' },
+      { id: 'already-deleted', sub2apiAccountId: null, sub2apiPoolStatus: 'deleted' }
+    ], new Set(['sub-present']))
+
+    expect(missing).toEqual(['removed'])
   })
 })
 

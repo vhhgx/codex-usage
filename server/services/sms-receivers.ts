@@ -524,8 +524,15 @@ export async function refreshAccountSmsReceiverCode(event: H3Event, accountId: s
   if (!binding) throw createError({ statusCode: 409, message: '该账号尚未分配接码手机号' })
   const result = await refreshSmsReceiverCode(event, binding.receiverId)
   if (result.code) {
-    await useDatabase(event).update(smsReceiverBindings).set({ codeReceivedAt: new Date(result.fetchedAt) })
-      .where(eq(smsReceiverBindings.id, binding.id))
+    const verifiedAt = new Date(result.fetchedAt)
+    await useDatabase(event).transaction(async (transaction) => {
+      await transaction.update(smsReceiverBindings).set({ codeReceivedAt: verifiedAt })
+        .where(eq(smsReceiverBindings.id, binding.id))
+      await transaction.update(accountVaultEntries).set({
+        smsVerifiedAt: verifiedAt,
+        updatedAt: verifiedAt
+      }).where(eq(accountVaultEntries.id, accountId))
+    })
   }
   return result
 }

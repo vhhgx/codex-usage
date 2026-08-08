@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { and, desc, eq, gte, ilike, lte, or } from 'drizzle-orm'
+import { and, desc, eq, gte, ilike, inArray, isNotNull, lte, or } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import {
   ACCOUNT_VAULT_STATUSES,
@@ -7,6 +7,7 @@ import {
   WARRANTY_STATUSES,
   type AccountVaultStatus,
   type AccountCredentialKind,
+  type AccountSub2ApiPoolStatus,
   type AccountVaultView,
   type LedgerSummary,
   type LedgerTransactionType,
@@ -119,8 +120,11 @@ function accountView(
     status: row.status as AccountVaultStatus,
     credentialKind: credentialKind(row),
     hasEmailCodeUrl: Boolean(row.encryptedEmailCodeUrl),
+    smsVerifiedAt: row.smsVerifiedAt?.getTime() || null,
     sub2apiAccountId: row.sub2apiAccountId,
+    sub2apiPoolStatus: row.sub2apiPoolStatus as AccountSub2ApiPoolStatus,
     codexAddedAt: row.codexAddedAt?.getTime() || null,
+    sub2apiRemovedAt: row.sub2apiRemovedAt?.getTime() || null,
     maskedPassword: '••••••••',
     purchaseDate: row.purchaseDate,
     warrantyDate: row.warrantyDate,
@@ -257,13 +261,61 @@ export async function markAccountVaultCodexAdded(event: H3Event, id: string, sub
   const current = await accountRow(event, id)
   const [updated] = await useDatabase(event).update(accountVaultEntries).set({
     sub2apiAccountId,
+    sub2apiPoolStatus: 'active',
     codexAddedAt: new Date(),
+    sub2apiRemovedAt: null,
     status: '已登录',
     updatedBy: actorId,
     updatedAt: new Date()
   }).where(eq(accountVaultEntries.id, current.id)).returning()
   if (!updated) throw createError({ statusCode: 500, message: '账号已进入 Sub2API，但本地状态更新失败' })
   return getAccountVaultEntry(event, id)
+}
+
+export function missingActiveSub2ApiVaultIds(
+  rows: Array<{ id: string; sub2apiAccountId: string | null; sub2apiPoolStatus: string }>,
+  activeAccountIds: ReadonlySet<string>
+) {
+  return rows
+    .filter(row => row.sub2apiPoolStatus === 'active' && row.sub2apiAccountId && !activeAccountIds.has(row.sub2apiAccountId))
+    .map(row => row.id)
+}
+
+export async function reconcileAccountVaultSub2ApiAccounts(event: H3Event, activeAccountIds: ReadonlySet<string>) {
+  const db = useDatabase(event)
+  const linked = await db.select({
+    id: accountVaultEntries.id,
+    sub2apiAccountId: accountVaultEntries.sub2apiAccountId,
+    sub2apiPoolStatus: accountVaultEntries.sub2apiPoolStatus
+  }).from(accountVaultEntries).where(and(
+    eq(accountVaultEntries.sub2apiPoolStatus, 'active'),
+    isNotNull(accountVaultEntries.sub2apiAccountId)
+  ))
+  const missingIds = missingActiveSub2ApiVaultIds(linked, activeAccountIds)
+  if (!missingIds.length) return []
+  const removedAt = new Date()
+  await db.update(accountVaultEntries).set({
+    sub2apiAccountId: null,
+    sub2apiPoolStatus: 'deleted',
+    sub2apiRemovedAt: removedAt,
+    updatedAt: removedAt
+  }).where(inArray(accountVaultEntries.id, missingIds))
+  return missingIds
+}
+
+export async function markAccountVaultSub2ApiDeleted(event: H3Event, sub2apiAccountId: string, actorId?: string) {
+  const removedAt = new Date()
+  const rows = await useDatabase(event).update(accountVaultEntries).set({
+    sub2apiAccountId: null,
+    sub2apiPoolStatus: 'deleted',
+    sub2apiRemovedAt: removedAt,
+    ...(actorId ? { updatedBy: actorId } : {}),
+    updatedAt: removedAt
+  }).where(and(
+    eq(accountVaultEntries.sub2apiPoolStatus, 'active'),
+    eq(accountVaultEntries.sub2apiAccountId, sub2apiAccountId)
+  )).returning({ id: accountVaultEntries.id })
+  return rows.map(row => row.id)
 }
 
 export async function deleteAccountVaultEntry(event: H3Event, id: string) {

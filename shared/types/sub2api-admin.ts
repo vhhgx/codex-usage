@@ -22,6 +22,12 @@ export interface Sub2ApiAccountQuotaWindow {
   resetAt: number | null
 }
 
+export interface Sub2ApiAccountProbeError {
+  code: number
+  message: string
+  reason: string | null
+}
+
 export interface Sub2ApiAccountQuotaResult extends Sub2ApiAccountView {
   quotaStatus: 'success' | 'error'
   planType: string | null
@@ -29,6 +35,7 @@ export interface Sub2ApiAccountQuotaResult extends Sub2ApiAccountView {
   refreshedAt: number
   usageSource: 'passive' | 'active'
   error?: string
+  probeError?: Sub2ApiAccountProbeError
 }
 
 export interface Sub2ApiAccountsResponse {

@@ -12,6 +12,7 @@ export type AccountVaultStatus = typeof ACCOUNT_VAULT_STATUSES[number]
 export type WarrantyStatus = typeof WARRANTY_STATUSES[number]
 export type LedgerTransactionType = typeof LEDGER_TRANSACTION_TYPES[number]
 export type AccountCredentialKind = 'password' | 'email_code_url' | 'tokens'
+export type AccountSub2ApiPoolStatus = 'not_added' | 'active' | 'deleted'
 
 export interface AccountSmsReceiverView {
   id: string
@@ -32,8 +33,11 @@ export interface AccountVaultView {
   status: AccountVaultStatus
   credentialKind: AccountCredentialKind
   hasEmailCodeUrl: boolean
+  smsVerifiedAt: number | null
   sub2apiAccountId: string | null
+  sub2apiPoolStatus: AccountSub2ApiPoolStatus
   codexAddedAt: number | null
+  sub2apiRemovedAt: number | null
   maskedPassword: string
   purchaseDate: string | null
   warrantyDate: string | null

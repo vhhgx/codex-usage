@@ -13,7 +13,7 @@ export default defineEventHandler(async (event) => {
     targetType: 'sub2api_account', targetRef: id, fingerprint: { id, name: target.view.name },
     idempotencyFallback: getHeader(event, 'idempotency-key') || null,
     safeSummary: { name: target.view.name, platform: target.view.platform }
-  }, async () => ({ result: await deleteManagedSub2ApiAccount(event, id) }))
+  }, async () => ({ result: await deleteManagedSub2ApiAccount(event, id, admin.userId) }))
   await writeAudit(event, admin.userId, 'sub.account.delete', 'sub2api_account', id, {
     name: target.view.name, result: 'succeeded', requestId: getResponseHeader(event, 'x-request-id')
   })

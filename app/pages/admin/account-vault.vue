@@ -26,6 +26,7 @@ import {
 } from '@tabler/icons-vue'
 import {
   ACCOUNT_VAULT_STATUSES,
+  type AccountSub2ApiPoolStatus,
   type AccountVaultStatus,
   type AccountVaultView,
   type SmsCodeResult,
@@ -66,6 +67,7 @@ interface UnifiedAccountRow {
   key: string
   vault: AccountVaultView | null
   sub: SubAccountManagementView | null
+  subPoolStatus: AccountSub2ApiPoolStatus | null
   cpaFiles: CpaAuthFileView[]
   quota: Sub2ApiAccountQuotaResult | null
 }
@@ -260,13 +262,21 @@ const unifiedRows = computed<UnifiedAccountRow[]>(() => {
     return matches
   }
   const rows = (vaultData.value?.items || []).map((vault): UnifiedAccountRow => {
+    const identityMatch = vault.sub2apiPoolStatus === 'deleted'
+      ? null
+      : subByIdentity.get(identity(vault.email))
+        || (vault.displayName ? subByIdentity.get(identity(vault.displayName)) : null)
     const sub = (vault.sub2apiAccountId ? subById.get(vault.sub2apiAccountId) : null)
-      || subByIdentity.get(identity(vault.email))
-      || (vault.displayName ? subByIdentity.get(identity(vault.displayName)) : null)
+      || identityMatch
       || null
     if (sub) usedSubIds.add(sub.id)
     const cpaFiles = takeCpaFiles([vault.email, vault.displayName, sub?.name])
-    return { key: `vault:${vault.id}`, vault, sub, cpaFiles, quota: sub ? quotaById.get(sub.id) || null : null }
+    const subPoolStatus = sub
+      ? 'active'
+      : vault.sub2apiPoolStatus === 'active' && managedData.value
+        ? 'deleted'
+        : vault.sub2apiPoolStatus
+    return { key: `vault:${vault.id}`, vault, sub, subPoolStatus, cpaFiles, quota: sub ? quotaById.get(sub.id) || null : null }
   })
   managedAccounts.value.forEach((sub) => {
     if (!usedSubIds.has(sub.id)) {
@@ -274,6 +284,7 @@ const unifiedRows = computed<UnifiedAccountRow[]>(() => {
         key: `sub:${sub.id}`,
         vault: null,
         sub,
+        subPoolStatus: 'active',
         cpaFiles: takeCpaFiles([sub.name]),
         quota: quotaById.get(sub.id) || null
       })
@@ -286,7 +297,7 @@ const unifiedRows = computed<UnifiedAccountRow[]>(() => {
     unmatchedGroups.set(key, [...(unmatchedGroups.get(key) || []), item])
   })
   unmatchedGroups.forEach((cpaFiles) => {
-    rows.push({ key: `cpa:${cpaFiles[0]!.id}`, vault: null, sub: null, cpaFiles, quota: null })
+    rows.push({ key: `cpa:${cpaFiles[0]!.id}`, vault: null, sub: null, subPoolStatus: null, cpaFiles, quota: null })
   })
   return rows
 })
@@ -950,11 +961,16 @@ async function verifySub(item: SubAccountManagementView) {
 async function refreshQuota(item: SubAccountManagementView) {
   quotaRefreshing[item.id] = true
   try {
-    await $fetch(`/api/sub2api/${item.id}/refresh`, { method: 'POST' })
-    await refreshQuotas()
-    showToast('用量窗口已刷新', 'success')
+    const result = await $fetch<Sub2ApiAccountQuotaResult>(`/api/sub2api/${item.id}/refresh`, { method: 'POST' })
+    await Promise.all([refreshManaged(), refreshQuotas()])
+    if (result.probeError || result.quotaStatus === 'error') {
+      showToast(result.probeError?.message || result.error || '账号检测失败', 'error')
+    } else {
+      showToast('账号状态与用量窗口已刷新', 'success')
+    }
   } catch (value) {
     showToast(failure(value, '刷新用量失败'), 'error')
+    await Promise.allSettled([refreshManaged(), refreshQuotas()])
   } finally {
     quotaRefreshing[item.id] = false
   }
@@ -1274,10 +1290,9 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
             </td>
             <td>
               <div class="badge-stack">
-                <span v-if="row.sub" class="record-badge" data-tone="sub">Sub2API</span>
+                <span v-if="row.subPoolStatus" class="record-badge" :data-tone="row.subPoolStatus === 'active' ? 'sub' : row.subPoolStatus === 'deleted' ? 'error' : undefined">{{ row.subPoolStatus === 'active' ? 'Sub 已添加' : row.subPoolStatus === 'deleted' ? 'Sub 已删除' : 'Sub 未添加' }}</span>
                 <span v-if="row.cpaFiles.length" class="record-badge" data-tone="cpa">CPA</span>
-                <span v-if="!row.sub && !row.cpaFiles.length" class="record-badge">未入号池</span>
-                <span v-if="row.vault" class="record-badge" :data-tone="row.vault.smsReceiver?.codeReceivedAt ? 'active' : 'neutral'">{{ row.vault.smsReceiver?.codeReceivedAt ? '已接码' : '未接码' }}</span>
+                <span v-if="row.vault" class="record-badge" :data-tone="row.vault.smsVerifiedAt ? 'active' : 'neutral'">{{ row.vault.smsVerifiedAt ? '已接码' : '未接码' }}</span>
               </div>
             </td>
             <td>
@@ -1333,7 +1348,7 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
                 <button v-if="row.vault && !row.sub" class="icon-button account-auth-button" type="button" title="Auth 登录并接入 Codex" aria-label="Auth 登录并接入 Codex" @click="openOAuth(row.vault)"><IconLogin2 :size="16" /></button>
                 <button v-if="row.cpaFiles.length" class="icon-button" type="button" title="管理 CPA 认证文件" aria-label="管理 CPA 认证文件" @click="openCpaManager(row.cpaFiles)"><IconFileCode :size="16" /></button>
                 <button v-if="row.sub" class="icon-button" type="button" title="主动验活" aria-label="主动验活" :disabled="subMutating[row.sub.id]" @click="verifySub(row.sub)"><IconCircleCheck :size="16" /></button>
-                <button v-if="row.sub" class="icon-button" type="button" title="刷新用量窗口" aria-label="刷新用量窗口" :disabled="quotaRefreshing[row.sub.id]" @click="refreshQuota(row.sub)"><IconRefresh :size="16" :class="{ 'is-spinning': quotaRefreshing[row.sub.id] }" /></button>
+                <button v-if="row.sub" class="icon-button" type="button" title="检测账号状态并刷新用量窗口" aria-label="检测账号状态并刷新用量窗口" :disabled="quotaRefreshing[row.sub.id]" @click="refreshQuota(row.sub)"><IconRefresh :size="16" :class="{ 'is-spinning': quotaRefreshing[row.sub.id] }" /></button>
                 <button v-if="row.sub" class="icon-button" type="button" title="编辑 Sub2API 配置" aria-label="编辑 Sub2API 配置" @click="openSubEdit(row.sub)"><IconEdit :size="16" /></button>
                 <button v-if="row.vault && row.vault.credentialKind !== 'email_code_url'" class="icon-button" type="button" :title="revealed[row.vault.id] ? '隐藏密码' : '显示密码'" :aria-label="revealed[row.vault.id] ? '隐藏密码' : '显示密码'" @click="reveal(row.vault)"><IconEyeOff v-if="revealed[row.vault.id]" :size="16" /><IconEye v-else :size="16" /></button>
                 <button v-if="row.vault && row.vault.credentialKind !== 'email_code_url'" class="icon-button" type="button" title="复制密码" aria-label="复制密码" @click="reveal(row.vault, true)"><IconCopy :size="16" /></button>

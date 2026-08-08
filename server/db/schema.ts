@@ -447,8 +447,11 @@ export const accountVaultEntries = pgTable('account_vault_entries', {
   encryptedAccessToken: text('encrypted_access_token'),
   encryptedRefreshToken: text('encrypted_refresh_token'),
   encryptedEmailCodeUrl: text('encrypted_email_code_url'),
+  smsVerifiedAt: timestamp('sms_verified_at', { withTimezone: true }),
   sub2apiAccountId: text('sub2api_account_id'),
+  sub2apiPoolStatus: text('sub2api_pool_status').notNull().default('not_added'),
   codexAddedAt: timestamp('codex_added_at', { withTimezone: true }),
+  sub2apiRemovedAt: timestamp('sub2api_removed_at', { withTimezone: true }),
   purchaseDate: text('purchase_date'),
   warrantyDate: text('warranty_date'),
   warrantyStatus: text('warranty_status').notNull().default('有质保'),
@@ -462,6 +465,7 @@ export const accountVaultEntries = pgTable('account_vault_entries', {
 }, table => [
   index('account_vault_email_idx').on(table.email),
   index('account_vault_status_idx').on(table.status),
+  index('account_vault_sub2api_pool_status_idx').on(table.sub2apiPoolStatus),
   index('account_vault_sub2api_account_idx').on(table.sub2apiAccountId),
   uniqueIndex('account_vault_source_ref_idx').on(table.sourceRef)
 ])
