@@ -1,0 +1,1 @@
+ALTER TABLE "account_vault_entries" ADD COLUMN "encrypted_totp_secret" text;

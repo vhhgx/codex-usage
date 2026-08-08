@@ -37,7 +37,7 @@ const fixtureEmail = `oauth-ui-${fixtureId.slice(0, 8)}@example.com`
 await fixtureDb`insert into account_vault_entries (id, email, status, encrypted_password, purchase_date, warranty_status) values (${fixtureId}, ${fixtureEmail}, 'Codex', 'ui-test-not-for-decryption', '2026-08-05', '无质保')`
 const localAccount = {
   id: fixtureId, email: fixtureEmail, displayName: null, status: 'Codex', credentialKind: 'password',
-  hasEmailCodeUrl: false, sub2apiAccountId: null, codexAddedAt: null, maskedPassword: '••••••••',
+  hasEmailCodeUrl: false, hasTotpSecret: false, sub2apiAccountId: null, codexAddedAt: null, maskedPassword: '••••••••',
   purchaseDate: '2026-08-05', warrantyDate: null, warrantyStatus: '无质保', smsReceiver: null,
   remark: null, createdAt: Date.now(), updatedAt: Date.now()
 }

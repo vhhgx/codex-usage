@@ -5,6 +5,7 @@ import {
   ACCOUNT_VAULT_STATUSES,
   LEDGER_TRANSACTION_TYPES,
   WARRANTY_STATUSES,
+  type AccountDeliveryFormat,
   type AccountVaultStatus,
   type AccountCredentialKind,
   type AccountSub2ApiPoolStatus,
@@ -17,6 +18,7 @@ import {
 import { useDatabase, withDatabaseTransaction } from '../db'
 import { accountVaultEntries, ledgerTransactions, smsReceiverBindings } from '../db/schema'
 import { decryptContextSecret, encryptContextSecret } from '../utils/hub-crypto'
+import { generateTotpCode, normalizeTotpSecret } from '../utils/totp'
 import { zonedDateKey } from '../utils/time-zone'
 import {
   accountSmsReceiverMap,
@@ -99,7 +101,7 @@ function emailCodeUrl(value: unknown) {
   return parsed.toString()
 }
 
-function accountContext(id: string, field: 'password' | 'access-token' | 'refresh-token' | 'email-code-url' = 'password') {
+function accountContext(id: string, field: 'password' | 'access-token' | 'refresh-token' | 'email-code-url' | 'totp-secret' = 'password') {
   return `account-vault:${id}:${field}`
 }
 
@@ -120,6 +122,7 @@ function accountView(
     status: row.status as AccountVaultStatus,
     credentialKind: credentialKind(row),
     hasEmailCodeUrl: Boolean(row.encryptedEmailCodeUrl),
+    hasTotpSecret: Boolean(row.encryptedTotpSecret),
     smsVerifiedAt: row.smsVerifiedAt?.getTime() || null,
     sub2apiAccountId: row.sub2apiAccountId,
     sub2apiPoolStatus: row.sub2apiPoolStatus as AccountSub2ApiPoolStatus,
@@ -181,8 +184,10 @@ export async function createAccountVaultEntry(event: H3Event, body: UnknownRecor
     const accessToken = accountSecret(body.accessToken, 'Access Token', 16_000)
     const refreshToken = accountSecret(body.refreshToken, 'Refresh Token', 16_000)
     const codeUrl = emailCodeUrl(body.emailCodeUrl)
+    const totpSecret = normalizeTotpSecret(body.totpSecret)
     if (Boolean(accessToken) !== Boolean(refreshToken)) throw createError({ statusCode: 400, message: 'Access Token 和 Refresh Token 必须同时提供' })
     if (codeUrl && (accessToken || refreshToken)) throw createError({ statusCode: 400, message: '邮箱验证码链接与 Token 凭据不能同时提供' })
+    if (codeUrl && totpSecret) throw createError({ statusCode: 400, message: '邮箱验证码链接与 2FA 密钥不能同时提供' })
     const password = accountPassword(body.password, !codeUrl)
     const values = {
       ...accountValues(body),
@@ -200,6 +205,7 @@ export async function createAccountVaultEntry(event: H3Event, body: UnknownRecor
       encryptedAccessToken: accessToken ? encryptContextSecret(accessToken, accountContext(id, 'access-token'), event) : null,
       encryptedRefreshToken: refreshToken ? encryptContextSecret(refreshToken, accountContext(id, 'refresh-token'), event) : null,
       encryptedEmailCodeUrl: codeUrl ? encryptContextSecret(codeUrl, accountContext(id, 'email-code-url'), event) : null,
+      encryptedTotpSecret: totpSecret ? encryptContextSecret(totpSecret, accountContext(id, 'totp-secret'), event) : null,
       sourceRef,
       createdBy: actorId,
       updatedBy: actorId
@@ -215,6 +221,7 @@ export async function updateAccountVaultEntry(event: H3Event, id: string, body: 
   const current = await accountRow(event, id)
   const password = accountPassword(body.password, false)
   const nextEmailCodeUrl = Object.prototype.hasOwnProperty.call(body, 'emailCodeUrl') ? emailCodeUrl(body.emailCodeUrl) : undefined
+  const nextTotpSecret = Object.prototype.hasOwnProperty.call(body, 'totpSecret') ? normalizeTotpSecret(body.totpSecret) : undefined
   const values = accountValues({
     email: body.email ?? current.email,
     displayName: body.displayName === undefined ? current.displayName : body.displayName,
@@ -230,6 +237,11 @@ export async function updateAccountVaultEntry(event: H3Event, id: string, body: 
     ...(nextEmailCodeUrl !== undefined ? {
       encryptedEmailCodeUrl: nextEmailCodeUrl
         ? encryptContextSecret(nextEmailCodeUrl, accountContext(id, 'email-code-url'), event)
+        : null
+    } : {}),
+    ...(nextTotpSecret !== undefined ? {
+      encryptedTotpSecret: nextTotpSecret
+        ? encryptContextSecret(nextTotpSecret, accountContext(id, 'totp-secret'), event)
         : null
     } : {}),
     updatedBy: actorId,
@@ -347,30 +359,47 @@ export async function revealAccountVaultCredentials(event: H3Event, id: string) 
       password: decryptContextSecret(row.encryptedPassword, accountContext(id), event),
       accessToken: row.encryptedAccessToken ? decryptContextSecret(row.encryptedAccessToken, accountContext(id, 'access-token'), event) : '',
       refreshToken: row.encryptedRefreshToken ? decryptContextSecret(row.encryptedRefreshToken, accountContext(id, 'refresh-token'), event) : '',
-      emailCodeUrl: row.encryptedEmailCodeUrl ? decryptContextSecret(row.encryptedEmailCodeUrl, accountContext(id, 'email-code-url'), event) : ''
+      emailCodeUrl: row.encryptedEmailCodeUrl ? decryptContextSecret(row.encryptedEmailCodeUrl, accountContext(id, 'email-code-url'), event) : '',
+      totpSecret: row.encryptedTotpSecret ? decryptContextSecret(row.encryptedTotpSecret, accountContext(id, 'totp-secret'), event) : ''
     }
   } catch {
     throw createError({ statusCode: 500, message: '账号凭据密文无法解密，请检查加密密钥配置' })
   }
 }
 
+export async function generateAccountVaultTotp(event: H3Event, id: string) {
+  const row = await accountRow(event, id)
+  if (!row.encryptedTotpSecret) throw createError({ statusCode: 404, message: '该账号尚未保存 2FA 密钥' })
+  try {
+    const secret = decryptContextSecret(row.encryptedTotpSecret, accountContext(id, 'totp-secret'), event)
+    return { accountId: id, ...generateTotpCode(secret) }
+  } catch (error) {
+    if ((error as { statusCode?: number }).statusCode) throw error
+    throw createError({ statusCode: 500, message: '2FA 密钥无法解密，请检查加密密钥配置' })
+  }
+}
+
 export interface AccountDeliveryLine {
   index: number
   email: string
-  kind: 'email_code_url' | 'tokens' | 'invalid'
+  kind: AccountDeliveryFormat | 'invalid'
   record: UnknownRecord | null
   message: string | null
   fingerprint: string
 }
 
-export function parseAccountDeliveryText(value: unknown): AccountDeliveryLine[] {
+export function parseAccountDeliveryText(value: unknown, format: unknown): AccountDeliveryLine[] {
   if (typeof value !== 'string') throw createError({ statusCode: 400, message: '发货内容必须是文本' })
+  if (!['email_code_url', 'tokens', 'password_totp'].includes(String(format))) {
+    throw createError({ statusCode: 400, message: '请先选择发货格式' })
+  }
+  const selectedFormat = format as AccountDeliveryFormat
   if (Buffer.byteLength(value, 'utf8') > 2 * 1024 * 1024) throw createError({ statusCode: 413, message: '发货内容不能超过 2 MiB' })
   const lines = value.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
   if (!lines.length) throw createError({ statusCode: 400, message: '发货内容不能为空' })
   if (lines.length > 1000) throw createError({ statusCode: 400, message: '单次最多导入 1000 个账号' })
   return lines.map((line, index) => {
-    const fingerprint = createHash('sha256').update(line).digest('hex')
+    const fingerprint = createHash('sha256').update(selectedFormat).update('\0').update(line).digest('hex')
     if (Buffer.byteLength(line, 'utf8') > 64 * 1024) {
       return { index, email: '', kind: 'invalid', record: null, message: '单行内容不能超过 64 KiB', fingerprint }
     }
@@ -378,19 +407,29 @@ export function parseAccountDeliveryText(value: unknown): AccountDeliveryLine[] 
     const email = fields[0] || ''
     try {
       emailText(email)
-      if (fields.length === 2) {
+      if (selectedFormat === 'email_code_url' && fields.length === 2) {
         const codeUrl = emailCodeUrl(fields[1])
         if (!codeUrl) throw createError({ statusCode: 400, message: '邮箱验证码链接不能为空' })
         return { index, email, kind: 'email_code_url', record: { email, password: '', emailCodeUrl: codeUrl }, message: null, fingerprint }
       }
-      if (fields.length === 4) {
+      if (selectedFormat === 'tokens' && fields.length === 4) {
         const password = accountPassword(fields[1], true)
         const accessToken = accountSecret(fields[2], 'Access Token', 16_000)
         const refreshToken = accountSecret(fields[3], 'Refresh Token', 16_000)
         if (!accessToken || !refreshToken) throw createError({ statusCode: 400, message: 'Access Token 和 Refresh Token 不能为空' })
         return { index, email, kind: 'tokens', record: { email, password, accessToken, refreshToken }, message: null, fingerprint }
       }
-      throw createError({ statusCode: 400, message: '仅支持“邮箱----验证码链接”或“邮箱----密码----AT----RT”格式' })
+      if (selectedFormat === 'password_totp' && fields.length === 3) {
+        const password = accountPassword(fields[1], true)
+        const totpSecret = normalizeTotpSecret(fields[2], true)
+        return { index, email, kind: 'password_totp', record: { email, password, totpSecret }, message: null, fingerprint }
+      }
+      const formatMessage = selectedFormat === 'email_code_url'
+        ? '格式应为“邮箱----邮箱验证码链接”'
+        : selectedFormat === 'tokens'
+          ? '格式应为“邮箱----密码----AT----RT”'
+          : '格式应为“邮箱----密码----2FA密钥”'
+      throw createError({ statusCode: 400, message: formatMessage })
     } catch (error) {
       const message = error instanceof Error ? error.message : '发货格式不正确'
       return { index, email, kind: 'invalid', record: null, message, fingerprint }
@@ -405,8 +444,8 @@ function safeAccountImportError(error: unknown) {
     : '账号创建失败'
 }
 
-export async function importAccountDeliveryText(event: H3Event, value: unknown, actorId: string) {
-  const lines = parseAccountDeliveryText(value)
+export async function importAccountDeliveryText(event: H3Event, value: unknown, format: unknown, actorId: string) {
+  const lines = parseAccountDeliveryText(value, format)
   let created = 0
   let skipped = 0
   const failed: Array<{ index: number; email: string; message: string }> = []

@@ -3,9 +3,9 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { isIP } from 'node:net'
 import { randomUUID } from 'node:crypto'
-import { and, asc, eq, sql } from 'drizzle-orm'
+import { and, asc, eq, inArray, sql } from 'drizzle-orm'
 import type { H3Event } from 'h3'
-import type { AccountSmsReceiverView, SmsCodeResult, SmsReceiverView } from '#shared/types/accounting'
+import type { AccountSmsReceiverView, SmsCodeResult, SmsReceiverImportResult, SmsReceiverView } from '#shared/types/accounting'
 import { useDatabase } from '../db'
 import { accountVaultEntries, smsReceiverBindings, smsReceivers } from '../db/schema'
 import { decryptContextSecret, encryptContextSecret } from '../utils/hub-crypto'
@@ -15,6 +15,9 @@ type UnknownRecord = Record<string, unknown>
 export const MAX_SMS_RECEIVER_BINDINGS = 3
 const MAX_RESPONSE_BYTES = 256 * 1024
 const FETCH_TIMEOUT_MS = 12_000
+const MAX_IMPORT_BYTES = 2 * 1024 * 1024
+const MAX_IMPORT_LINES = 1_000
+const MAX_IMPORT_LINE_BYTES = 4 * 1024
 
 function text(value: unknown, label: string, maxLength: number, required = false) {
   const normalized = typeof value === 'string' ? value.trim() : ''
@@ -63,6 +66,61 @@ function parsedFetchUrl(value: unknown) {
   if (url.username || url.password) throw createError({ statusCode: 400, message: '接码接口 URL 不能包含 Basic Auth 凭据' })
   url.hash = ''
   return url
+}
+
+interface SmsReceiverImportCandidate {
+  line: number
+  phone: string
+  phoneKey: string
+  url: URL
+}
+
+function serviceErrorMessage(error: unknown, fallback: string) {
+  const typed = error as { data?: { message?: string }; statusMessage?: string; message?: string }
+  return typed.data?.message || typed.statusMessage || typed.message || fallback
+}
+
+export function parseSmsReceiverImportText(value: unknown) {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw createError({ statusCode: 400, message: '接码发货文本不能为空' })
+  }
+  if (Buffer.byteLength(value, 'utf8') > MAX_IMPORT_BYTES) {
+    throw createError({ statusCode: 413, message: '接码发货文本不能超过 2 MiB' })
+  }
+  const lines = value.split(/\r?\n/)
+  if (lines.length > MAX_IMPORT_LINES) {
+    throw createError({ statusCode: 400, message: `单次最多导入 ${MAX_IMPORT_LINES} 行接码资源` })
+  }
+
+  const candidates: SmsReceiverImportCandidate[] = []
+  const failed: SmsReceiverImportResult['failed'] = []
+  lines.forEach((rawLine, index) => {
+    const line = rawLine.trim()
+    if (!line) return
+    const lineNumber = index + 1
+    if (Buffer.byteLength(line, 'utf8') > MAX_IMPORT_LINE_BYTES) {
+      failed.push({ line: lineNumber, phone: null, error: '单行内容不能超过 4 KiB' })
+      return
+    }
+    const separator = line.indexOf('|')
+    const phoneValue = separator >= 0 ? line.slice(0, separator).trim() : ''
+    const urlValue = separator >= 0 ? line.slice(separator + 1).trim() : ''
+    if (!phoneValue || !urlValue) {
+      failed.push({ line: lineNumber, phone: phoneValue || null, error: '格式应为“手机号|接码接口 URL”' })
+      return
+    }
+    try {
+      const { phone, phoneKey } = normalizeSmsPhone(phoneValue)
+      candidates.push({ line: lineNumber, phone, phoneKey, url: parsedFetchUrl(urlValue) })
+    } catch (error) {
+      failed.push({ line: lineNumber, phone: phoneValue, error: serviceErrorMessage(error, '接码内容格式不正确') })
+    }
+  })
+
+  if (!candidates.length && !failed.length) {
+    throw createError({ statusCode: 400, message: '接码发货文本没有可导入的内容' })
+  }
+  return { candidates, failed }
 }
 
 function privateIpv4(address: string) {
@@ -198,6 +256,26 @@ function collectStrings(value: unknown, output: string[], depth = 0) {
   }
 }
 
+function collectExplicitCodes(value: unknown, output: string[], depth = 0) {
+  if (depth > 5 || output.length >= 20 || !value || typeof value !== 'object') return
+  if (Array.isArray(value)) {
+    value.slice(0, 50).forEach(item => collectExplicitCodes(item, output, depth + 1))
+    return
+  }
+  const record = value as UnknownRecord
+  const codeKeys = new Set(['code', 'smscode', 'verificationcode', 'otp'])
+  Object.entries(record).slice(0, 50).forEach(([key, candidate]) => {
+    const normalizedKey = key.toLowerCase().replace(/[_-]/g, '')
+    if (codeKeys.has(normalizedKey)) {
+      const normalized = typeof candidate === 'number' && Number.isInteger(candidate)
+        ? String(candidate)
+        : typeof candidate === 'string' ? candidate.trim() : ''
+      if (/^\d{6}$/.test(normalized)) output.push(normalized)
+    }
+    collectExplicitCodes(candidate, output, depth + 1)
+  })
+}
+
 export function parseSmsProviderResponse(raw: string, contentType = '') {
   const normalized = raw.trim()
   let parsed: unknown = normalized
@@ -207,12 +285,16 @@ export function parseSmsProviderResponse(raw: string, contentType = '') {
   const strings: string[] = []
   collectStrings(parsed, strings)
   if (!strings.length && normalized) strings.push(normalized)
+  const explicitCodes: string[] = []
+  collectExplicitCodes(parsed, explicitCodes)
+  const uniqueExplicitCodes = new Set(explicitCodes)
   const keywordPatterns = [
-    /(?:验证代码|验证码|短信代码|校验码|动态码|安全码|verification\s*code|security\s*code|otp|code)[^\d]{0,30}(\d{4,8})(?!\d)/i,
-    /(?<!\d)(\d{4,8})[^\d]{0,30}(?:是您|为您|验证代码|验证码|短信代码|校验码|verification\s*code|otp|code)/i
+    /(?:验证代码|验证码|短信代码|校验码|动态码|安全码|verification\s*code|security\s*code|otp|code)[^\d]{0,30}(\d{6})(?!\d)/i,
+    /(?<!\d)(\d{6})[^\d]{0,30}(?:是您|为您|验证代码|验证码|短信代码|校验码|verification\s*code|otp|code)/i
   ]
-  let code: string | null = null
+  let code: string | null = uniqueExplicitCodes.size === 1 ? [...uniqueExplicitCodes][0] || null : null
   for (const candidate of strings) {
+    if (code) break
     for (const pattern of keywordPatterns) {
       const match = candidate.match(pattern)
       if (match?.[1]) { code = match[1]; break }
@@ -220,10 +302,19 @@ export function parseSmsProviderResponse(raw: string, contentType = '') {
     if (code) break
   }
   if (!code) {
+    const possibleCodes = new Set<string>()
     for (const candidate of strings) {
-      const match = candidate.match(/^\D{0,20}(\d{4,8})\D{0,20}$/)
-      if (match?.[1]) { code = match[1]; break }
+      if (/(?:\bno\s*sms\b|暂无短信|没有短信|无短信|已过期|expired|pending)/i.test(candidate)) continue
+      const sanitized = candidate
+        .replace(/https?:\/\/\S+/gi, ' ')
+        .replace(/\b(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|key|id)\s*[:=]\s*\d{6}\b/gi, ' ')
+        .replace(/\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?\b/g, ' ')
+        .replace(/[+()]?(?:\d[\s().-]*){10,15}/g, ' ')
+      for (const match of sanitized.matchAll(/(?<!\d)(\d{6})(?!\d)/g)) {
+        if (match[1]) possibleCodes.add(match[1])
+      }
     }
+    if (possibleCodes.size === 1) code = [...possibleCodes][0] || null
   }
   const message = (strings.find(value => value !== code) || (code ? '已获取新的短信验证码' : '供应商未返回短信')).slice(0, 500)
   return { code, message }
@@ -347,6 +438,82 @@ export async function createSmsReceiver(event: H3Event, body: UnknownRecord, act
   }).returning()
   if (!created) throw createError({ statusCode: 500, message: '创建接码资源失败' })
   return (await listSmsReceivers(event)).find(item => item.id === id)!
+}
+
+export async function importSmsReceivers(event: H3Event, value: unknown, actorId: string): Promise<SmsReceiverImportResult> {
+  const parsed = parseSmsReceiverImportText(value)
+  const skipped: SmsReceiverImportResult['skipped'] = []
+  const failed = [...parsed.failed]
+  const uniqueCandidates: SmsReceiverImportCandidate[] = []
+  const seenPhoneKeys = new Set<string>()
+  for (const candidate of parsed.candidates) {
+    if (seenPhoneKeys.has(candidate.phoneKey)) {
+      skipped.push({ line: candidate.line, phone: candidate.phone, reason: '同一批次手机号重复' })
+      continue
+    }
+    seenPhoneKeys.add(candidate.phoneKey)
+    uniqueCandidates.push(candidate)
+  }
+
+  const hostErrors = new Map<string, string | null>()
+  for (const candidate of uniqueCandidates) {
+    const host = candidate.url.hostname.toLowerCase()
+    if (hostErrors.has(host)) continue
+    try {
+      await publicAddresses(candidate.url)
+      hostErrors.set(host, null)
+    } catch (error) {
+      hostErrors.set(host, serviceErrorMessage(error, '接码供应商域名校验失败'))
+    }
+  }
+  const addressSafeCandidates = uniqueCandidates.filter((candidate) => {
+    const error = hostErrors.get(candidate.url.hostname.toLowerCase())
+    if (!error) return true
+    failed.push({ line: candidate.line, phone: candidate.phone, error })
+    return false
+  })
+
+  const db = useDatabase(event)
+  const existingRows = addressSafeCandidates.length
+    ? await db.select({ phoneKey: smsReceivers.phoneKey }).from(smsReceivers)
+        .where(inArray(smsReceivers.phoneKey, addressSafeCandidates.map(item => item.phoneKey)))
+    : []
+  const existingKeys = new Set(existingRows.map(item => item.phoneKey))
+  const insertCandidates = addressSafeCandidates.filter((candidate) => {
+    if (!existingKeys.has(candidate.phoneKey)) return true
+    skipped.push({ line: candidate.line, phone: candidate.phone, reason: '手机号已存在' })
+    return false
+  })
+
+  const values = insertCandidates.map((candidate) => {
+    const id = randomUUID()
+    return {
+      id,
+      phone: candidate.phone,
+      phoneKey: candidate.phoneKey,
+      providerHost: candidate.url.hostname,
+      encryptedFetchUrl: encryptContextSecret(candidate.url.toString(), smsContext(id), event),
+      status: 'active',
+      createdBy: actorId,
+      updatedBy: actorId
+    }
+  })
+  const inserted = values.length
+    ? await db.insert(smsReceivers).values(values).onConflictDoNothing({ target: smsReceivers.phoneKey }).returning({
+        id: smsReceivers.id,
+        phoneKey: smsReceivers.phoneKey,
+        phone: smsReceivers.phone,
+        providerHost: smsReceivers.providerHost
+      })
+    : []
+  const insertedByKey = new Map(inserted.map(item => [item.phoneKey, item]))
+  const created: SmsReceiverImportResult['created'] = []
+  for (const candidate of insertCandidates) {
+    const item = insertedByKey.get(candidate.phoneKey)
+    if (item) created.push({ line: candidate.line, id: item.id, phone: item.phone, providerHost: item.providerHost })
+    else skipped.push({ line: candidate.line, phone: candidate.phone, reason: '手机号已被其他请求导入' })
+  }
+  return { created, skipped, failed: failed.sort((left, right) => left.line - right.line) }
 }
 
 export async function updateSmsReceiver(event: H3Event, id: string, body: UnknownRecord, actorId: string) {

@@ -29,27 +29,44 @@ describe('secure account record encryption', () => {
     expect(decryptContextSecret(accessToken, 'account-vault:a:access-token')).toBe('access-token-value')
     expect(() => decryptContextSecret(accessToken, 'account-vault:a:refresh-token')).toThrow()
   })
+
+  it('isolates TOTP secrets from every other account credential context', () => {
+    const totpSecret = encryptContextSecret('MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7', 'account-vault:a:totp-secret')
+    expect(totpSecret).not.toContain('MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7')
+    expect(decryptContextSecret(totpSecret, 'account-vault:a:totp-secret')).toBe('MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7')
+    expect(() => decryptContextSecret(totpSecret, 'account-vault:a:password')).toThrow()
+  })
 })
 
 describe('purchased account delivery parsing', () => {
   it('parses email-code links and password/AT/RT deliveries without echoing secrets in metadata', () => {
-    const lines = parseAccountDeliveryText([
-      'first@icloud.com----https://mail.example/messages/first',
-      'second@hotmail.com----account-password----access-token----refresh-token'
-    ].join('\n'))
-    expect(lines).toHaveLength(2)
-    expect(lines[0]).toMatchObject({ email: 'first@icloud.com', kind: 'email_code_url', message: null })
-    expect(lines[0]?.record).toMatchObject({ emailCodeUrl: 'https://mail.example/messages/first' })
-    expect(lines[1]).toMatchObject({ email: 'second@hotmail.com', kind: 'tokens', message: null })
-    expect(lines[1]?.record).toMatchObject({ password: 'account-password', accessToken: 'access-token', refreshToken: 'refresh-token' })
-    expect(JSON.stringify(lines.map(line => ({ email: line.email, kind: line.kind, message: line.message, fingerprint: line.fingerprint })))).not.toContain('account-password')
+    const [emailLink] = parseAccountDeliveryText('first@icloud.com----https://mail.example/messages/first', 'email_code_url')
+    const [tokens] = parseAccountDeliveryText('second@hotmail.com----account-password----access-token----refresh-token', 'tokens')
+    expect(emailLink).toMatchObject({ email: 'first@icloud.com', kind: 'email_code_url', message: null })
+    expect(emailLink?.record).toMatchObject({ emailCodeUrl: 'https://mail.example/messages/first' })
+    expect(tokens).toMatchObject({ email: 'second@hotmail.com', kind: 'tokens', message: null })
+    expect(tokens?.record).toMatchObject({ password: 'account-password', accessToken: 'access-token', refreshToken: 'refresh-token' })
+    expect(JSON.stringify([emailLink, tokens].map(line => ({ email: line?.email, kind: line?.kind, message: line?.message, fingerprint: line?.fingerprint })))).not.toContain('account-password')
   })
 
   it('rejects malformed deliveries without including their credential value in errors', () => {
-    const [line] = parseAccountDeliveryText('buyer@example.com----top-secret----extra-secret')
+    const [line] = parseAccountDeliveryText('buyer@example.com----top-secret----extra-secret', 'tokens')
     expect(line).toMatchObject({ kind: 'invalid' })
     expect(line?.message).not.toContain('top-secret')
     expect(line?.message).not.toContain('extra-secret')
+  })
+
+  it('parses password and TOTP deliveries only when that format is selected', () => {
+    const source = 'buyer@example.com----account-password----MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7'
+    const [line] = parseAccountDeliveryText(source, 'password_totp')
+    expect(line).toMatchObject({ email: 'buyer@example.com', kind: 'password_totp', message: null })
+    expect(line?.record).toMatchObject({ password: 'account-password', totpSecret: 'MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7' })
+    expect(parseAccountDeliveryText(source, 'tokens')[0]).toMatchObject({ kind: 'invalid' })
+    expect(JSON.stringify({ email: line?.email, kind: line?.kind, message: line?.message })).not.toContain('MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7')
+  })
+
+  it('requires an explicit delivery format', () => {
+    expect(() => parseAccountDeliveryText('buyer@example.com----https://mail.example/code', '')).toThrow('请先选择发货格式')
   })
 })
 

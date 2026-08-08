@@ -22,6 +22,7 @@ export default defineEventHandler(async (event) => {
       accessToken: credentials.accessToken,
       refreshToken: credentials.refreshToken,
       emailCodeUrl: credentials.emailCodeUrl,
+      totpSecret: credentials.totpSecret,
       purchaseTime: item.purchaseDate || '',
       warrantyTime: item.warrantyDate || '',
       warrantyStatus: item.warrantyStatus,

@@ -447,6 +447,7 @@ export const accountVaultEntries = pgTable('account_vault_entries', {
   encryptedAccessToken: text('encrypted_access_token'),
   encryptedRefreshToken: text('encrypted_refresh_token'),
   encryptedEmailCodeUrl: text('encrypted_email_code_url'),
+  encryptedTotpSecret: text('encrypted_totp_secret'),
   smsVerifiedAt: timestamp('sms_verified_at', { withTimezone: true }),
   sub2apiAccountId: text('sub2api_account_id'),
   sub2apiPoolStatus: text('sub2api_pool_status').notNull().default('not_added'),

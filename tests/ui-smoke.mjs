@@ -28,12 +28,12 @@ function syntheticJwt(payload) {
   return `${encode({ alg: 'none', typ: 'JWT' })}.${encode(payload)}.synthetic`
 }
 
-function encryptedFixturePassword(id, value) {
+function encryptedFixtureSecret(id, value, field = 'password') {
   const key = Buffer.from(String(process.env.NUXT_ENCRYPTION_KEY || ''), 'base64')
   if (key.length !== 32) throw new Error('UI smoke bootstrap requires a 32-byte NUXT_ENCRYPTION_KEY')
   const iv = randomBytes(12)
   const cipher = createCipheriv('aes-256-gcm', key, iv)
-  cipher.setAAD(Buffer.from(`zephyr-context-secret:account-vault:${id}:password:v2`, 'utf8'))
+  cipher.setAAD(Buffer.from(`zephyr-context-secret:account-vault:${id}:${field}:v2`, 'utf8'))
   const encrypted = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()])
   return `v2.${iv.toString('base64url')}.${cipher.getAuthTag().toString('base64url')}.${encrypted.toString('base64url')}`
 }
@@ -54,7 +54,7 @@ if (bootstrap) {
   const [announcement] = await fixtureDb`insert into announcements (title, content, tone, status, published_at, created_by) values ('UI Smoke 公告', '用户首页公告可见性检查', 'info', 'published', now(), ${admin.id}) returning id`
   fixtureAnnouncementIds = [announcement.id]
   const accountId = randomUUID()
-  await fixtureDb`insert into account_vault_entries (id, email, display_name, status, encrypted_password, purchase_date, warranty_status, created_by, updated_by) values (${accountId}, ${`ui-account-${suffix}@example.com`}, 'UI Smoke Account', 'Codex', ${encryptedFixturePassword(accountId, 'UI-Smoke-Account-Password')}, ${new Date().toISOString().slice(0, 10)}, '无质保', ${admin.id}, ${admin.id})`
+  await fixtureDb`insert into account_vault_entries (id, email, display_name, status, encrypted_password, encrypted_totp_secret, purchase_date, warranty_status, remark, created_by, updated_by) values (${accountId}, ${`ui-account-${suffix}@example.com`}, 'UI Smoke Account', 'Codex', ${encryptedFixtureSecret(accountId, 'UI-Smoke-Account-Password')}, ${encryptedFixtureSecret(accountId, 'MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7', 'totp-secret')}, ${new Date().toISOString().slice(0, 10)}, '无质保', 'UI Smoke 账号备注', ${admin.id}, ${admin.id})`
   fixtureAccountIds = [accountId]
   let receivers = await fixtureDb`select id from sms_receivers where status = 'active' order by created_at`
   if (!receivers.length) {
@@ -72,6 +72,14 @@ if (bootstrap) {
     await fixtureDb`insert into sms_receiver_bindings (id, receiver_id, account_id, account_email, account_display_name, slot, created_by) values (${bindingId}, ${receiver.id}, ${accountId}, ${`ui-account-${suffix}@example.com`}, 'UI Smoke Account', ${slot}, ${admin.id})`
     fixtureBindingIds = [bindingId]
     break
+  }
+  if (!fixtureBindingIds.length) {
+    const receiverId = randomUUID()
+    const bindingId = randomUUID()
+    await fixtureDb`insert into sms_receivers (id, phone, phone_key, provider_host, encrypted_fetch_url, note, status, created_by, updated_by) values (${receiverId}, '+1(202)5550199', '12025550199', 'sms-ui.example.com', 'ui-test-not-for-decryption', 'UI Smoke Receiver', 'active', ${admin.id}, ${admin.id})`
+    await fixtureDb`insert into sms_receiver_bindings (id, receiver_id, account_id, account_email, account_display_name, slot, created_by) values (${bindingId}, ${receiverId}, ${accountId}, ${`ui-account-${suffix}@example.com`}, 'UI Smoke Account', 1, ${admin.id})`
+    fixtureReceiverIds = [receiverId]
+    fixtureBindingIds = [bindingId]
   }
 }
 
@@ -282,6 +290,13 @@ try {
           if (await page.getByRole('button', { name: '导入 Sub JSON', exact: true }).count()) throw new Error('standalone Sub2API JSON import action is still present')
           if (await page.getByRole('button', { name: '上传 CPA JSON', exact: true }).count()) throw new Error('standalone CPA JSON upload action is still present')
           if (await page.getByRole('button', { name: '导入 JSON', exact: true }).count()) throw new Error('legacy Vault backup import is still present')
+          await page.getByText('UI Smoke 账号备注', { exact: true }).waitFor()
+          if (await page.getByRole('columnheader', { name: '运行状态', exact: true }).count() || await page.getByRole('columnheader', { name: '号池 / 接码', exact: true }).count()) {
+            throw new Error('account table still exposes duplicated status columns')
+          }
+          const fixtureRow = page.locator('.account-workspace-table tbody tr', { hasText: 'UI Smoke Account' })
+          await fixtureRow.getByTitle('生成 2FA 动态验证码').click()
+          await fixtureRow.locator('.account-totp-inline code').filter({ hasText: /^\d{6}$/ }).waitFor()
 
           await page.getByTitle('编辑账号资料').first().click()
           const accountEditor = page.getByRole('dialog', { name: '编辑账号' })
@@ -346,13 +361,12 @@ try {
           await accountCreator.getByRole('tab', { name: '表单新增' }).click()
           await accountCreator.getByLabel('邮箱 *').waitFor()
           await accountCreator.getByRole('tab', { name: '发货文本' }).click()
-          await accountCreator.locator('textarea').fill([
-            'preview@icloud.com----https://mail.example/messages/preview',
-            'tokens@hotmail.com----secret-password----secret-at----secret-rt'
-          ].join('\n'))
-          await accountCreator.getByText('preview@icloud.com', { exact: true }).waitFor()
-          await accountCreator.getByText('密码 + AT / RT', { exact: true }).waitFor()
-          if (await accountCreator.locator('.vault-delivery-preview', { hasText: 'secret-password' }).count()) {
+          const deliveryFormat = accountCreator.getByLabel('发货格式 *')
+          await deliveryFormat.selectOption('password_totp')
+          await accountCreator.locator('textarea').fill('totp@example.com----secret-password----MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7')
+          await accountCreator.getByText('totp@example.com', { exact: true }).waitFor()
+          await accountCreator.locator('.vault-delivery-preview').getByText('邮箱 + 密码 + 2FA 密钥', { exact: true }).waitFor()
+          if (await accountCreator.locator('.vault-delivery-preview', { hasText: 'secret-password' }).count() || await accountCreator.locator('.vault-delivery-preview', { hasText: 'MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7' }).count()) {
             throw new Error('delivery preview exposes imported credentials')
           }
           await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-delivery-import.png`, fullPage: true })
@@ -384,10 +398,21 @@ try {
           await page.getByRole('button', { name: '新增接码', exact: true }).click()
           const receiverCreator = page.getByRole('dialog', { name: '新增接码' })
           await receiverCreator.waitFor()
+          if (!await receiverCreator.getByRole('tab', { name: '单个添加', exact: true }).count() || !await receiverCreator.getByRole('tab', { name: '批量导入', exact: true }).count()) {
+            throw new Error('receiver creator does not expose single and batch modes')
+          }
+          await receiverCreator.getByRole('tab', { name: '批量导入', exact: true }).click()
+          await receiverCreator.getByLabel('接码发货文本 *').fill('16232130689|https://sms.example.com/access?token=secret')
+          await receiverCreator.getByText('sms.example.com', { exact: true }).waitFor()
+          if (await receiverCreator.getByText('token=secret').count()) throw new Error('receiver import preview exposes URL credentials')
+          await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-receiver-import.png`, fullPage: true })
+          await receiverCreator.getByRole('tab', { name: '单个添加', exact: true }).click()
           await receiverCreator.getByTitle('关闭').click()
           if (await page.locator('.receiver-table tbody tr').count() < 1) throw new Error('receiver manager has no migrated receiver rows')
           if (await page.locator('.receiver-table').getByTitle('解除账号绑定').count()) throw new Error('receiver list exposes per-account binding removal controls')
-          if (!await page.locator('.receiver-table tbody tr').first().getByText(/^[1-3]\/3$/).count()) throw new Error('receiver list does not show binding count')
+          if (!await page.locator('.receiver-table tbody tr').getByText(/^[0-3]\/3$/).count()) throw new Error('receiver list does not show binding count')
+          const boundReceiverRow = page.locator('.receiver-table tbody tr').filter({ hasText: /[1-3]\/3/ }).first()
+          if (!await boundReceiverRow.count()) throw new Error('receiver manager fixture has no bound receiver')
           const refreshPattern = /\/api\/admin\/sms-receivers\/[^/]+\/refresh$/
           await page.route(refreshPattern, route => route.fulfill({
             status: 200,
@@ -398,7 +423,7 @@ try {
           await page.locator('.receiver-code code', { hasText: '864209' }).waitFor()
           await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-receivers.png`, fullPage: true })
           await page.unroute(refreshPattern)
-          await page.locator('.receiver-table tbody tr').first().getByTitle('编辑接码').click()
+          await boundReceiverRow.getByTitle('编辑接码').click()
           const receiverEditor = page.getByRole('dialog', { name: '编辑接码' })
           await receiverEditor.waitFor()
           if (!await receiverEditor.getByTitle('解除账号绑定').count()) throw new Error('receiver editor has no per-account binding removal control')

@@ -29,6 +29,7 @@
     "drizzle-orm": "^0.45.2",
     "ioredis": "^5.11.1",
     "nuxt": "^4.4.8",
+    "otpauth": "^9.5.1",
     "postgres": "^3.4.9",
     "vue": "^3.5.39",
     "vue-router": "^5.1.0"

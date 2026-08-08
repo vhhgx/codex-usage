@@ -13,6 +13,7 @@ export type WarrantyStatus = typeof WARRANTY_STATUSES[number]
 export type LedgerTransactionType = typeof LEDGER_TRANSACTION_TYPES[number]
 export type AccountCredentialKind = 'password' | 'email_code_url' | 'tokens'
 export type AccountSub2ApiPoolStatus = 'not_added' | 'active' | 'deleted'
+export type AccountDeliveryFormat = 'email_code_url' | 'tokens' | 'password_totp'
 
 export interface AccountSmsReceiverView {
   id: string
@@ -33,6 +34,7 @@ export interface AccountVaultView {
   status: AccountVaultStatus
   credentialKind: AccountCredentialKind
   hasEmailCodeUrl: boolean
+  hasTotpSecret: boolean
   smsVerifiedAt: number | null
   sub2apiAccountId: string | null
   sub2apiPoolStatus: AccountSub2ApiPoolStatus
@@ -71,6 +73,19 @@ export interface SmsCodeResult {
   code: string | null
   message: string
   fetchedAt: number
+}
+
+export interface SmsReceiverImportResult {
+  created: Array<{ line: number; id: string; phone: string; providerHost: string }>
+  skipped: Array<{ line: number; phone: string; reason: string }>
+  failed: Array<{ line: number; phone: string | null; error: string }>
+}
+
+export interface AccountTotpCodeResult {
+  accountId: string
+  code: string
+  generatedAt: number
+  expiresAt: number
 }
 
 export interface LedgerTransactionView {

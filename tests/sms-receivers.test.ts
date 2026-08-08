@@ -3,6 +3,7 @@ import {
   firstAvailableSmsSlot,
   leastLoadedSmsReceiver,
   normalizeSmsPhone,
+  parseSmsReceiverImportText,
   parseSmsProviderResponse
 } from '../server/services/sms-receivers'
 
@@ -47,6 +48,33 @@ describe('SMS receiver normalization', () => {
     ]))).toBe('newer-open')
     expect(leastLoadedSmsReceiver(receivers, new Map(receivers.map(item => [item.id, 3])))).toBeUndefined()
   })
+
+  it('parses one or many phone and URL delivery lines by the first separator', () => {
+    const parsed = parseSmsReceiverImportText([
+      '16232130689|https://eim388.top/api/sms/access?token=first|second',
+      '',
+      ' 14103012139 | https://eim388.top/api/sms/access?token=third '
+    ].join('\r\n'))
+    expect(parsed.failed).toEqual([])
+    expect(parsed.candidates).toHaveLength(2)
+    expect(parsed.candidates[0]).toMatchObject({ line: 1, phone: '+1(623)2130689', phoneKey: '16232130689' })
+    expect(parsed.candidates[0]?.url.searchParams.get('token')).toBe('first|second')
+    expect(parsed.candidates[1]).toMatchObject({ line: 3, phone: '+1(410)3012139', phoneKey: '14103012139' })
+  })
+
+  it('reports malformed delivery lines without exposing a different line as failed', () => {
+    const parsed = parseSmsReceiverImportText([
+      'missing-separator',
+      '1623213068x|https://eim388.top/api/sms/access?token=redacted',
+      '14103012139|ftp://eim388.top/code'
+    ].join('\n'))
+    expect(parsed.candidates).toEqual([])
+    expect(parsed.failed.map(item => ({ line: item.line, phone: item.phone }))).toEqual([
+      { line: 1, phone: null },
+      { line: 2, phone: '1623213068x' },
+      { line: 3, phone: '14103012139' }
+    ])
+  })
 })
 
 describe('SMS provider response parsing', () => {
@@ -73,5 +101,23 @@ describe('SMS provider response parsing', () => {
       code: null,
       message: '暂无短信|链接到期时间2026-08-30 11:59:59，续费请提前联系客服'
     })
+  })
+
+  it('supports the eim response format and accepts exactly six consecutive digits', () => {
+    expect(parseSmsProviderResponse('no sms-2026-09-05 11:00').code).toBeNull()
+    expect(parseSmsProviderResponse('839201-2026-09-05 11:00').code).toBe('839201')
+    expect(parseSmsProviderResponse('83920-2026-09-05 11:00').code).toBeNull()
+    expect(parseSmsProviderResponse('8392017-2026-09-05 11:00').code).toBeNull()
+    expect(parseSmsProviderResponse(JSON.stringify({ code: 624910 }), 'application/json').code).toBe('624910')
+  })
+
+  it('does not mistake phone numbers, timestamps, URLs, or ambiguous values for a code', () => {
+    expect(parseSmsProviderResponse('phone=16232130689').code).toBeNull()
+    expect(parseSmsProviderResponse('+1(623)2130689').code).toBeNull()
+    expect(parseSmsProviderResponse('fetched_at=1786152904').code).toBeNull()
+    expect(parseSmsProviderResponse('token=123456').code).toBeNull()
+    expect(parseSmsProviderResponse('https://eim388.top/api/sms/access?id=123456').code).toBeNull()
+    expect(parseSmsProviderResponse('候选 123456，历史 654321').code).toBeNull()
+    expect(parseSmsProviderResponse(JSON.stringify({ code: '123456', data: { otp: '654321' } }), 'application/json').code).toBeNull()
   })
 })

@@ -26,10 +26,13 @@ import {
 } from '@tabler/icons-vue'
 import {
   ACCOUNT_VAULT_STATUSES,
+  type AccountDeliveryFormat,
   type AccountSub2ApiPoolStatus,
+  type AccountTotpCodeResult,
   type AccountVaultStatus,
   type AccountVaultView,
   type SmsCodeResult,
+  type SmsReceiverImportResult,
   type SmsReceiverView
 } from '#shared/types/accounting'
 import type { Sub2ApiAccountQuotaResult, Sub2ApiAccountsResponse } from '#shared/types/sub2api-admin'
@@ -111,6 +114,9 @@ const search = ref('')
 const loadingAll = ref(false)
 const revealed = reactive<Record<string, string>>({})
 const revealTimers = new Map<string, number>()
+const accountTotpCodes = reactive<Record<string, AccountTotpCodeResult>>({})
+const totpTimers = new Map<string, number>()
+const generatingTotp = reactive<Record<string, boolean>>({})
 const refreshingAccountCodes = reactive<Record<string, boolean>>({})
 const accountSmsCodes = reactive<Record<string, SmsCodeResult>>({})
 const refreshingCodes = reactive<Record<string, boolean>>({})
@@ -133,7 +139,9 @@ const uploadPool = ref<'sub2api' | 'cpa'>('sub2api')
 const saving = ref(false)
 const formError = ref('')
 const emailCodeUrlTouched = ref(false)
+const totpSecretTouched = ref(false)
 const deliveryText = ref('')
+const deliveryFormat = ref<AccountDeliveryFormat | ''>('')
 const deliveryImporting = ref(false)
 const deliveryError = ref('')
 const form = reactive({
@@ -142,6 +150,7 @@ const form = reactive({
   status: 'Codex' as AccountVaultStatus,
   password: '',
   emailCodeUrl: '',
+  totpSecret: '',
   smsReceiverId: '' as string,
   remark: ''
 })
@@ -154,6 +163,8 @@ const showReceiverForm = ref(false)
 const editingReceiver = ref<SmsReceiverView | null>(null)
 const receiverSaving = ref(false)
 const receiverError = ref('')
+const receiverCreateMode = ref<'single' | 'batch'>('single')
+const receiverImportText = ref('')
 const receiverMutating = reactive<Record<string, boolean>>({})
 const bindingMutating = reactive<Record<string, boolean>>({})
 const receiverForm = reactive({ phone: '', fetchUrl: '', note: '', active: true })
@@ -326,15 +337,45 @@ const receiverOptions = computed(() => (receiverData.value?.items || []).filter(
   item.status === 'active' && (item.availableSlots > 0 || item.id === editing.value?.smsReceiver?.id)
 ))
 
-const deliveryPreview = computed(() => deliveryText.value.split(/\r?\n/)
-  .map(line => line.trim()).filter(Boolean).map((line, index) => {
+const receiverImportPreview = computed(() => receiverImportText.value.split(/\r?\n/)
+  .map((rawLine, index) => ({ rawLine: rawLine.trim(), line: index + 1 }))
+  .filter(item => item.rawLine)
+  .map(({ rawLine, line }) => {
+    const separator = rawLine.indexOf('|')
+    const phone = separator >= 0 ? rawLine.slice(0, separator).trim() : rawLine
+    const fetchUrl = separator >= 0 ? rawLine.slice(separator + 1).trim() : ''
+    const digits = phone.replace(/\D/g, '')
+    const phoneValid = /^\+?[\d\s()-]+$/.test(phone) && digits.length >= 6 && digits.length <= 15
+    let providerHost = ''
+    try {
+      const url = new URL(fetchUrl)
+      if (['http:', 'https:'].includes(url.protocol) && !url.username && !url.password) providerHost = url.hostname
+    } catch { /* The server returns the detailed validation error. */ }
+    return { line, phone: phone || '未填写手机号', providerHost, valid: separator >= 0 && phoneValid && Boolean(providerHost) }
+  }))
+
+const deliveryFormats: Record<AccountDeliveryFormat, { label: string; placeholder: string; fields: number }> = {
+  email_code_url: { label: '邮箱 + 邮箱验证码链接', placeholder: '邮箱----邮箱验证码链接', fields: 2 },
+  tokens: { label: '邮箱 + 密码 + AT + RT', placeholder: '邮箱----密码----AT----RT', fields: 4 },
+  password_totp: { label: '邮箱 + 密码 + 2FA 密钥', placeholder: '邮箱----密码----Base32密钥', fields: 3 }
+}
+const selectedDeliveryFormat = computed(() => deliveryFormat.value ? deliveryFormats[deliveryFormat.value] : null)
+const deliveryPreview = computed(() => {
+  if (!deliveryFormat.value) return []
+  const selected = deliveryFormats[deliveryFormat.value]
+  return deliveryText.value.split(/\r?\n/).map(line => line.trim()).filter(Boolean).map((line, index) => {
     const fields = line.split('----').map(field => field.trim())
     const validEmail = /^\S+@\S+\.\S+$/.test(fields[0] || '')
-    const kind = fields.length === 2 && /^https?:\/\//i.test(fields[1] || '')
-      ? '邮箱验证码链接'
-      : fields.length === 4 && fields.slice(1).every(Boolean) ? '密码 + AT / RT' : '格式错误'
-    return { index, email: validEmail ? fields[0]! : '邮箱格式错误', kind, valid: validEmail && kind !== '格式错误' }
-  }))
+    const validFields = fields.length === selected.fields && fields.slice(1).every(Boolean)
+    const detailValid = deliveryFormat.value === 'email_code_url'
+      ? /^https?:\/\//i.test(fields[1] || '')
+      : deliveryFormat.value === 'password_totp'
+        ? /^[A-Z2-7\s=]+$/i.test(fields[2] || '')
+        : true
+    const valid = validEmail && validFields && detailValid
+    return { index, email: validEmail ? fields[0]! : '邮箱格式错误', kind: valid ? selected.label : '格式错误', valid }
+  })
+})
 
 function failure(value: unknown, fallback: string) {
   const error = value as { data?: { message?: string; statusMessage?: string }; message?: string }
@@ -679,9 +720,10 @@ async function copyText(value: string, message: string) {
 
 function resetForm() {
   Object.assign(form, {
-    email: '', displayName: '', status: 'Codex', password: '', emailCodeUrl: '', smsReceiverId: '', remark: ''
+    email: '', displayName: '', status: 'Codex', password: '', emailCodeUrl: '', totpSecret: '', smsReceiverId: '', remark: ''
   })
   emailCodeUrlTouched.value = false
+  totpSecretTouched.value = false
   formError.value = ''
 }
 
@@ -694,6 +736,7 @@ function openCreate() {
   resetUploadForm()
   resetConversionForm()
   deliveryText.value = ''
+  deliveryFormat.value = ''
   deliveryError.value = ''
   showForm.value = true
 }
@@ -706,10 +749,12 @@ function openEdit(item: AccountVaultView) {
     status: item.status,
     password: '',
     emailCodeUrl: '',
+    totpSecret: '',
     smsReceiverId: item.smsReceiver?.id || '',
     remark: item.remark || ''
   })
   emailCodeUrlTouched.value = false
+  totpSecretTouched.value = false
   formError.value = ''
   createMode.value = 'manual'
   manualCreateMode.value = 'form'
@@ -734,6 +779,7 @@ async function saveVault() {
       remark: form.remark
     }
     if (!editing.value || emailCodeUrlTouched.value) body.emailCodeUrl = form.emailCodeUrl
+    if (!editing.value || totpSecretTouched.value) body.totpSecret = form.totpSecret
     if (editing.value) await $fetch(`/api/admin/account-vault/${editing.value.id}`, { method: 'PATCH', body })
     else await $fetch('/api/admin/account-vault', { method: 'POST', body })
     await refreshAllData(false)
@@ -748,6 +794,10 @@ async function saveVault() {
 
 async function importDelivery() {
   deliveryError.value = ''
+  if (!deliveryFormat.value) {
+    deliveryError.value = '请先选择发货格式'
+    return
+  }
   if (!deliveryPreview.value.length) {
     deliveryError.value = '请输入发货内容'
     return
@@ -755,7 +805,7 @@ async function importDelivery() {
   deliveryImporting.value = true
   try {
     const result = await $fetch<{ created: number; skipped: number; failed: Array<{ index: number; email: string; message: string }> }>('/api/admin/account-vault/delivery-import', {
-      method: 'POST', body: { text: deliveryText.value }
+      method: 'POST', body: { text: deliveryText.value, format: deliveryFormat.value }
     })
     await refreshAllData(false)
     if (result.failed.length) {
@@ -845,6 +895,25 @@ async function refreshAccountSmsCode(item: AccountVaultView) {
     showToast(failure(value, '刷新短信验证码失败'), 'error')
   } finally {
     refreshingAccountCodes[item.id] = false
+  }
+}
+
+async function generateAccountTotp(item: AccountVaultView) {
+  if (generatingTotp[item.id]) return
+  generatingTotp[item.id] = true
+  try {
+    const response = await $fetch<{ result: AccountTotpCodeResult }>(`/api/admin/account-vault/${item.id}/totp`, { method: 'POST' })
+    accountTotpCodes[item.id] = response.result
+    window.clearTimeout(totpTimers.get(item.id))
+    totpTimers.set(item.id, window.setTimeout(() => {
+      delete accountTotpCodes[item.id]
+      totpTimers.delete(item.id)
+    }, Math.max(0, response.result.expiresAt - Date.now())))
+    showToast('2FA 动态验证码已生成', 'success')
+  } catch (value) {
+    showToast(failure(value, '生成 2FA 动态验证码失败'), 'error')
+  } finally {
+    generatingTotp[item.id] = false
   }
 }
 
@@ -1117,6 +1186,8 @@ async function uploadSelectedPool() {
 function openReceiverCreate() {
   editingReceiver.value = null
   Object.assign(receiverForm, { phone: '', fetchUrl: '', note: '', active: true })
+  receiverCreateMode.value = 'single'
+  receiverImportText.value = ''
   receiverError.value = ''
   showReceiverForm.value = true
 }
@@ -1132,10 +1203,41 @@ function closeReceiverForm() {
   if (receiverSaving.value) return
   showReceiverForm.value = false
   editingReceiver.value = null
+  receiverImportText.value = ''
   receiverError.value = ''
 }
 
 async function saveReceiver() {
+  if (!editingReceiver.value && receiverCreateMode.value === 'batch') {
+    receiverSaving.value = true
+    receiverError.value = ''
+    const sourceLines = receiverImportText.value.split(/\r?\n/)
+    try {
+      const result = await $fetch<SmsReceiverImportResult>('/api/admin/sms-receivers/import', {
+        method: 'POST', body: { text: receiverImportText.value }
+      })
+      if (result.created.length) await Promise.all([refreshReceivers(), refreshVault()])
+      if (result.failed.length) {
+        const failedLines = new Set(result.failed.map(item => item.line))
+        receiverImportText.value = sourceLines.filter((_line, index) => failedLines.has(index + 1)).join('\n')
+        const messages = result.failed.slice(0, 20).map(item => `第 ${item.line} 行${item.phone ? `（${item.phone}）` : ''}：${item.error}`)
+        if (result.failed.length > messages.length) messages.push(`另有 ${result.failed.length - messages.length} 行导入失败`)
+        receiverError.value = messages.join('\n')
+        const summary = `成功 ${result.created.length} 个，跳过 ${result.skipped.length} 个，失败 ${result.failed.length} 个`
+        showToast(summary, result.created.length ? 'success' : 'error')
+      } else {
+        showReceiverForm.value = false
+        receiverImportText.value = ''
+        const skipped = result.skipped.length ? `，跳过 ${result.skipped.length} 个重复号码` : ''
+        showToast(`已导入 ${result.created.length} 个接码${skipped}`, 'success')
+      }
+    } catch (value) {
+      receiverError.value = failure(value, '批量导入接码失败')
+    } finally {
+      receiverSaving.value = false
+    }
+    return
+  }
   const wasEditing = Boolean(editingReceiver.value)
   receiverSaving.value = true
   receiverError.value = ''
@@ -1206,6 +1308,8 @@ async function confirmDelete() {
     if (target.kind === 'vault') {
       await $fetch(`/api/admin/account-vault/${target.item.id}`, { method: 'DELETE' })
       delete revealed[target.item.id]
+      delete accountTotpCodes[target.item.id]
+      window.clearTimeout(totpTimers.get(target.item.id))
       await Promise.all([refreshVault(), refreshReceivers()])
     } else if (target.kind === 'sub') {
       await $fetch(`/api/admin/upstreams/sub/accounts/${target.item.id}`, {
@@ -1240,7 +1344,10 @@ async function confirmDelete() {
   }
 }
 
-onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
+onBeforeUnmount(() => {
+  revealTimers.forEach(timer => window.clearTimeout(timer))
+  totpTimers.forEach(timer => window.clearTimeout(timer))
+})
 </script>
 
 <template>
@@ -1272,7 +1379,7 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
 
     <section v-if="activeTab === 'accounts'" class="admin-table-wrap account-workspace-table-wrap">
       <table class="admin-table account-workspace-table">
-        <thead><tr><th>账号</th><th>号池 / 接码</th><th>平台 / 类型</th><th>运行状态</th><th>容量 / 调度</th><th>用量窗口</th><th>短信接码</th><th aria-label="操作" /></tr></thead>
+        <thead><tr><th>账号 / 备注</th><th>号池 / 状态</th><th>账号类型</th><th>容量 / 调度</th><th>用量窗口</th><th>短信接码</th><th aria-label="操作" /></tr></thead>
         <tbody>
           <tr v-for="row in filteredRows" :key="row.key">
             <td>
@@ -1284,28 +1391,31 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
                     <code v-else>{{ row.vault.email }}</code>
                   </div>
                   <code v-if="revealed[row.vault.id]" class="revealed-password">{{ revealed[row.vault.id] }}</code>
+                  <div v-if="accountTotpCodes[row.vault.id]" class="account-totp-inline"><code>{{ accountTotpCodes[row.vault.id]?.code }}</code><button class="icon-button" type="button" title="复制 2FA 验证码" aria-label="复制 2FA 验证码" @click="copyText(accountTotpCodes[row.vault.id]!.code, '2FA 验证码已复制')"><IconCopy :size="13" /></button></div>
+                  <small v-if="row.vault.remark" class="account-remark" :title="row.vault.remark">{{ row.vault.remark }}</small>
                 </template>
                 <code v-else>{{ row.sub?.notes || row.sub?.name || row.cpaFiles.map(item => item.name).join('、') }}</code>
               </div>
             </td>
             <td>
-              <div class="badge-stack">
-                <span v-if="row.subPoolStatus" class="record-badge" :data-tone="row.subPoolStatus === 'active' ? 'sub' : row.subPoolStatus === 'deleted' ? 'error' : undefined">{{ row.subPoolStatus === 'active' ? 'Sub 已添加' : row.subPoolStatus === 'deleted' ? 'Sub 已删除' : 'Sub 未添加' }}</span>
-                <span v-if="row.cpaFiles.length" class="record-badge" data-tone="cpa">CPA</span>
-                <span v-if="row.vault" class="record-badge" :data-tone="row.vault.smsVerifiedAt ? 'active' : 'neutral'">{{ row.vault.smsVerifiedAt ? '已接码' : '未接码' }}</span>
+              <div class="pool-status">
+                <div class="badge-stack badge-stack--row">
+                  <span v-if="row.sub" class="record-badge" data-tone="sub">Sub2API</span>
+                  <span v-else-if="row.subPoolStatus === 'deleted'" class="record-badge" data-tone="error">Sub 已删除</span>
+                  <span v-else-if="row.vault" class="record-badge">待接入</span>
+                  <span v-if="row.cpaFiles.length" class="record-badge" data-tone="cpa">CPA</span>
+                </div>
+                <span v-if="row.sub" class="status-dot" :data-status="statusTone(row.sub.status, row.sub.schedulable)"><i />{{ row.sub.schedulable ? row.sub.status : '暂停调度' }}</span>
+                <span v-else-if="row.cpaFiles.length" class="status-dot" :data-status="row.cpaFiles.every(item => item.disabled) ? 'disabled' : statusTone(row.cpaFiles[0]?.status || 'unknown')"><i />{{ row.cpaFiles.every(item => item.disabled) ? '已停用' : row.cpaFiles[0]?.status }}</span>
+                <span v-else-if="row.vault" class="status-dot" :data-status="statusTone(row.vault.status)"><i />{{ row.vault.status }}</span>
+                <small v-if="row.sub?.errorMessage" class="table-sub account-error" :title="row.sub.errorMessage">{{ row.sub.errorMessage }}</small>
+                <small v-else-if="row.quota?.planType" class="table-sub">{{ row.quota.planType }}</small>
+                <small v-else-if="row.cpaFiles.length" class="table-sub">{{ row.cpaFiles.length }} 个认证文件 · {{ row.cpaFiles[0]?.planType || '未知套餐' }}</small>
               </div>
             </td>
             <td>
-              <strong class="table-value">{{ row.sub?.platform || row.cpaFiles[0]?.provider || '待接入' }}</strong>
-              <small class="table-sub">{{ row.sub?.type || (row.cpaFiles.length ? '认证文件' : row.vault?.credentialKind === 'tokens' ? 'AT / RT' : row.vault?.credentialKind === 'email_code_url' ? '邮箱链接' : '密码') }}</small>
-            </td>
-            <td>
-              <span v-if="row.sub" class="status-dot" :data-status="statusTone(row.sub.status, row.sub.schedulable)"><i />{{ row.sub.status }}</span>
-              <span v-else-if="row.cpaFiles.length" class="status-dot" :data-status="row.cpaFiles.every(item => item.disabled) ? 'disabled' : statusTone(row.cpaFiles[0]?.status || 'unknown')"><i />{{ row.cpaFiles.every(item => item.disabled) ? '已停用' : row.cpaFiles[0]?.status }}</span>
-              <span v-else-if="row.vault" class="status-dot" :data-status="statusTone(row.vault.status)"><i />{{ row.vault.status }}</span>
-              <small v-if="row.sub?.errorMessage" class="table-sub account-error" :title="row.sub.errorMessage">{{ row.sub.errorMessage }}</small>
-              <small v-else-if="row.quota?.planType" class="table-sub">{{ row.quota.planType }}</small>
-              <small v-else-if="row.cpaFiles.length" class="table-sub">{{ row.cpaFiles.length }} 个 CPA 文件 · {{ row.cpaFiles[0]?.planType || '未知套餐' }}</small>
+              <strong class="table-value">{{ row.sub ? `${row.sub.platform} / ${row.sub.type}` : row.cpaFiles.length ? `${row.cpaFiles[0]?.provider} / 认证文件` : row.vault?.credentialKind === 'tokens' ? 'AT / RT' : row.vault?.credentialKind === 'email_code_url' ? '邮箱链接' : row.vault?.hasTotpSecret ? '密码 + 2FA' : '密码' }}</strong>
+              <small v-if="row.sub?.groupNames.length" class="table-sub">{{ row.sub.groupNames.join('、') }}</small>
             </td>
             <td>
               <template v-if="row.sub">
@@ -1332,7 +1442,7 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
             <td>
               <div v-if="row.vault?.smsReceiver" class="account-sms">
                 <button class="phone-copy" type="button" :title="`复制 ${row.vault.smsReceiver.copyValue}`" @click="copyText(row.vault.smsReceiver.copyValue, '手机号已复制（不含 +1）')"><IconCopy :size="13" />{{ row.vault.smsReceiver.phone }}</button>
-                <span>{{ row.vault.smsReceiver.bindingCount }}/3</span>
+                <div class="account-sms-meta"><span class="record-badge" :data-tone="row.vault.smsVerifiedAt ? 'active' : 'neutral'">{{ row.vault.smsVerifiedAt ? '已接码' : '未接码' }}</span><span>{{ row.vault.smsReceiver.bindingCount }}/3</span></div>
                 <div>
                   <code v-if="accountSmsCodes[row.vault.id]?.code">{{ accountSmsCodes[row.vault.id]?.code }}</code>
                   <small v-else-if="accountSmsCodes[row.vault.id]" :title="accountSmsCodes[row.vault.id]?.message">{{ smsMessageSummary(accountSmsCodes[row.vault.id]!) }}</small>
@@ -1350,6 +1460,7 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
                 <button v-if="row.sub" class="icon-button" type="button" title="主动验活" aria-label="主动验活" :disabled="subMutating[row.sub.id]" @click="verifySub(row.sub)"><IconCircleCheck :size="16" /></button>
                 <button v-if="row.sub" class="icon-button" type="button" title="检测账号状态并刷新用量窗口" aria-label="检测账号状态并刷新用量窗口" :disabled="quotaRefreshing[row.sub.id]" @click="refreshQuota(row.sub)"><IconRefresh :size="16" :class="{ 'is-spinning': quotaRefreshing[row.sub.id] }" /></button>
                 <button v-if="row.sub" class="icon-button" type="button" title="编辑 Sub2API 配置" aria-label="编辑 Sub2API 配置" @click="openSubEdit(row.sub)"><IconEdit :size="16" /></button>
+                <button v-if="row.vault?.hasTotpSecret" class="icon-button" type="button" title="生成 2FA 动态验证码" aria-label="生成 2FA 动态验证码" :disabled="generatingTotp[row.vault.id]" @click="generateAccountTotp(row.vault)"><IconShieldCheck :size="16" /></button>
                 <button v-if="row.vault && row.vault.credentialKind !== 'email_code_url'" class="icon-button" type="button" :title="revealed[row.vault.id] ? '隐藏密码' : '显示密码'" :aria-label="revealed[row.vault.id] ? '隐藏密码' : '显示密码'" @click="reveal(row.vault)"><IconEyeOff v-if="revealed[row.vault.id]" :size="16" /><IconEye v-else :size="16" /></button>
                 <button v-if="row.vault && row.vault.credentialKind !== 'email_code_url'" class="icon-button" type="button" title="复制密码" aria-label="复制密码" @click="reveal(row.vault, true)"><IconCopy :size="16" /></button>
                 <button v-if="row.vault" class="icon-button" type="button" title="编辑账号资料" aria-label="编辑账号资料" @click="openEdit(row.vault)"><IconAddressBook :size="16" /></button>
@@ -1358,7 +1469,7 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
               </div>
             </td>
           </tr>
-          <tr v-if="!filteredRows.length"><td colspan="8"><div class="admin-empty account-empty"><IconAddressBook :size="24" /><span>{{ unifiedRows.length ? '没有匹配的账号' : '还没有账号' }}</span><button v-if="!unifiedRows.length" class="button button--primary" type="button" @click="openCreate">新增第一个账号</button></div></td></tr>
+          <tr v-if="!filteredRows.length"><td colspan="7"><div class="admin-empty account-empty"><IconAddressBook :size="24" /><span>{{ unifiedRows.length ? '没有匹配的账号' : '还没有账号' }}</span><button v-if="!unifiedRows.length" class="button button--primary" type="button" @click="openCreate">新增第一个账号</button></div></td></tr>
         </tbody>
       </table>
     </section>
@@ -1407,21 +1518,37 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
     <div v-if="showReceiverForm" class="admin-modal-backdrop" @click.self="closeReceiverForm">
       <section class="admin-modal admin-modal--wide receiver-editor-modal" role="dialog" aria-modal="true" :aria-label="editingReceiver ? '编辑接码' : '新增接码'">
         <header><div><span>SMS RECEIVER</span><h2 class="text-balance">{{ editingReceiver ? '编辑接码' : '新增接码' }}</h2></div><button class="icon-button" type="button" title="关闭" aria-label="关闭" :disabled="receiverSaving" @click="closeReceiverForm"><IconX :size="18" /></button></header>
+        <div v-if="!editingReceiver" class="admin-page-tabs vault-create-modes receiver-create-modes" role="tablist" aria-label="接码新增方式">
+          <button type="button" role="tab" :aria-selected="receiverCreateMode === 'single'" :class="{ active: receiverCreateMode === 'single' }" :disabled="receiverSaving" @click="receiverCreateMode = 'single'; receiverError = ''">单个添加</button>
+          <button type="button" role="tab" :aria-selected="receiverCreateMode === 'batch'" :class="{ active: receiverCreateMode === 'batch' }" :disabled="receiverSaving" @click="receiverCreateMode = 'batch'; receiverError = ''">批量导入</button>
+        </div>
         <form class="admin-form receiver-editor" @submit.prevent="saveReceiver">
-          <div class="form-grid"><label><span>接码手机号 *</span><input v-model="receiverForm.phone" required maxlength="40" inputmode="tel" placeholder="支持 10 位或前导 1"></label><label><span>{{ editingReceiver ? '接码接口 URL（留空不修改）' : '接码接口 URL *' }}</span><input v-model="receiverForm.fetchUrl" type="url" :required="!editingReceiver" maxlength="3000" placeholder="https://"></label></div>
-          <div class="receiver-editor__bottom"><label><span>备注</span><input v-model="receiverForm.note" maxlength="500"></label><label class="receiver-toggle"><input v-model="receiverForm.active" type="checkbox"><span><strong>启用接码</strong><small>停用后不能刷新验证码或绑定新账号</small></span></label></div>
-          <section v-if="editingReceiver" class="receiver-bindings" aria-labelledby="receiver-bindings-title">
-            <header><div><h3 id="receiver-bindings-title">绑定账号</h3><span class="tabular-nums">{{ editingReceiver.bindingCount }}/3</span></div><small>{{ editingReceiver.availableSlots }} 个空余名额</small></header>
-            <div v-if="editingReceiver.accounts.length" class="receiver-bindings__list">
-              <div v-for="account in editingReceiver.accounts" :key="account.bindingId" :data-deleted="account.deleted">
-                <span><strong>{{ account.displayName || account.email }}</strong><small>#{{ account.slot }} · {{ account.email }}{{ account.deleted ? ' · 已删除账号' : '' }}</small></span>
-                <button class="icon-button danger" type="button" title="解除账号绑定" aria-label="解除账号绑定" :disabled="bindingMutating[account.bindingId]" @click="deleting = { kind: 'binding', receiver: editingReceiver!, account }"><IconTrash :size="15" /></button>
+          <template v-if="editingReceiver || receiverCreateMode === 'single'">
+            <div class="form-grid"><label><span>接码手机号 *</span><input v-model="receiverForm.phone" required maxlength="40" inputmode="tel" placeholder="支持 10 位或前导 1"></label><label><span>{{ editingReceiver ? '接码接口 URL（留空不修改）' : '接码接口 URL *' }}</span><input v-model="receiverForm.fetchUrl" type="url" :required="!editingReceiver" maxlength="3000" placeholder="https://"></label></div>
+            <div class="receiver-editor__bottom"><label><span>备注</span><input v-model="receiverForm.note" maxlength="500"></label><label class="receiver-toggle"><input v-model="receiverForm.active" type="checkbox"><span><strong>启用接码</strong><small>停用后不能刷新验证码或绑定新账号</small></span></label></div>
+            <section v-if="editingReceiver" class="receiver-bindings" aria-labelledby="receiver-bindings-title">
+              <header><div><h3 id="receiver-bindings-title">绑定账号</h3><span class="tabular-nums">{{ editingReceiver.bindingCount }}/3</span></div><small>{{ editingReceiver.availableSlots }} 个空余名额</small></header>
+              <div v-if="editingReceiver.accounts.length" class="receiver-bindings__list">
+                <div v-for="account in editingReceiver.accounts" :key="account.bindingId" :data-deleted="account.deleted">
+                  <span><strong>{{ account.displayName || account.email }}</strong><small>#{{ account.slot }} · {{ account.email }}{{ account.deleted ? ' · 已删除账号' : '' }}</small></span>
+                  <button class="icon-button danger" type="button" title="解除账号绑定" aria-label="解除账号绑定" :disabled="bindingMutating[account.bindingId]" @click="deleting = { kind: 'binding', receiver: editingReceiver!, account }"><IconTrash :size="15" /></button>
+                </div>
               </div>
+              <div v-else class="receiver-bindings__empty"><IconUsers :size="19" /><span>尚未绑定账号</span></div>
+            </section>
+          </template>
+          <template v-else>
+            <label><span>接码发货文本 *</span><textarea v-model="receiverImportText" class="receiver-import-input" required rows="9" maxlength="2097152" autocomplete="off" spellcheck="false" placeholder="16232130689|https://eim388.top/api/sms/access?token=...&#10;14103012139|https://eim388.top/api/sms/access?token=..." /></label>
+            <div v-if="receiverImportPreview.length" class="sub-import-preview receiver-import-preview" aria-label="接码导入预览">
+              <div v-for="item in receiverImportPreview.slice(0, 20)" :key="item.line" :data-valid="item.valid">
+                <span><strong>第 {{ item.line }} 行 · {{ item.phone }}</strong><small>{{ item.valid ? item.providerHost : '格式错误' }}</small></span>
+                <code>{{ item.valid ? '待导入' : '请检查' }}</code>
+              </div>
+              <small v-if="receiverImportPreview.length > 20">另有 {{ receiverImportPreview.length - 20 }} 行</small>
             </div>
-            <div v-else class="receiver-bindings__empty"><IconUsers :size="19" /><span>尚未绑定账号</span></div>
-          </section>
+          </template>
           <p v-if="receiverError" class="form-error">{{ receiverError }}</p>
-          <footer><button class="button button--secondary" type="button" @click="closeReceiverForm">取消</button><button class="button button--primary" :disabled="receiverSaving">{{ receiverSaving ? '保存中' : '保存接码' }}</button></footer>
+          <footer><span v-if="!editingReceiver && receiverCreateMode === 'batch'">已识别 {{ receiverImportPreview.length }} 行</span><button class="button button--secondary" type="button" @click="closeReceiverForm">取消</button><button class="button button--primary" :disabled="receiverSaving || (!editingReceiver && receiverCreateMode === 'batch' && !receiverImportPreview.length)">{{ receiverSaving ? (receiverCreateMode === 'batch' ? '导入中' : '保存中') : (!editingReceiver && receiverCreateMode === 'batch' ? `导入 ${receiverImportPreview.length} 个接码` : '保存接码') }}</button></footer>
         </form>
       </section>
     </div>
@@ -1441,7 +1568,7 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
         <form v-if="editing || (createMode === 'manual' && manualCreateMode === 'form')" class="admin-form" @submit.prevent="saveVault">
           <div class="form-grid"><label><span>邮箱 *</span><input v-model="form.email" type="email" required autocomplete="off"></label><label><span>姓名</span><input v-model="form.displayName" maxlength="120"></label></div>
           <div class="form-grid"><label><span>账号状态</span><AppSelect v-model="form.status"><option v-for="status in ACCOUNT_VAULT_STATUSES" :key="status" :value="status">{{ status }}</option></AppSelect></label><label><span>{{ editing ? '新密码（留空不修改）' : '账号密码' }}</span><input v-model="form.password" type="password" :required="!editing && !form.emailCodeUrl" maxlength="2000" autocomplete="new-password"></label></div>
-          <label><span>邮箱验证码链接{{ editing && editing.hasEmailCodeUrl ? '（已保存；填写新链接可替换）' : '' }}</span><input v-model="form.emailCodeUrl" type="url" maxlength="4000" placeholder="https://" @input="emailCodeUrlTouched = true"></label>
+          <div class="form-grid"><label><span>邮箱验证码链接{{ editing && editing.hasEmailCodeUrl ? '（已保存；填写新链接可替换）' : '' }}</span><input v-model="form.emailCodeUrl" type="url" maxlength="4000" placeholder="https://" @input="emailCodeUrlTouched = true"></label><label><span>2FA 密钥{{ editing && editing.hasTotpSecret ? '（已保存；填写新密钥可替换）' : '' }}</span><input v-model="form.totpSecret" type="password" maxlength="512" autocomplete="off" placeholder="Base32" @input="totpSecretTouched = true"></label></div>
           <label><span>接码手机号</span><AppSelect v-model="form.smsReceiverId"><option value="">自动分配可用手机号</option><option v-for="receiver in receiverOptions" :key="receiver.id" :value="receiver.id">{{ receiver.phone }} · {{ receiver.bindingCount }}/3</option></AppSelect><small>没有可用号码时账号仍会创建，可在接码管理新增号码后再编辑绑定。</small></label>
           <label><span>备注</span><textarea v-model="form.remark" maxlength="2000" rows="3" /></label>
           <p v-if="formError" class="form-error">{{ formError }}</p>
@@ -1495,10 +1622,11 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
           <footer><span>{{ selectedConversionRows.length }} 个账号 · CPA {{ conversionCpaCount }} · Sub2API {{ conversionSub2ApiCount }}</span><button class="button button--secondary" type="button" :disabled="conversionSaving" @click="closeForm">取消</button><button v-if="conversionRows.length" class="button button--primary" :disabled="conversionSaving || !selectedConversionRows.length || (!conversionCpaCount && !conversionSub2ApiCount)"><IconCloudUpload :size="16" />{{ conversionSaving ? '导入中' : '转换并导入' }}</button></footer>
         </form>
         <form v-else class="admin-form vault-delivery-form" @submit.prevent="importDelivery">
-          <label><span>发货内容 *</span><textarea v-model="deliveryText" class="vault-delivery-input" required rows="8" autocomplete="off" spellcheck="false" placeholder="邮箱----邮箱链接&#10;或 邮箱----密码----AT----RT" /></label>
+          <label><span>发货格式 *</span><AppSelect v-model="deliveryFormat" :disabled="deliveryImporting" @change="deliveryError = ''"><option value="" disabled>请选择发货格式</option><option value="email_code_url">邮箱 + 邮箱验证码链接</option><option value="tokens">邮箱 + 密码 + AT + RT</option><option value="password_totp">邮箱 + 密码 + 2FA 密钥</option></AppSelect></label>
+          <label><span>发货内容 *</span><textarea v-model="deliveryText" class="vault-delivery-input" required rows="8" autocomplete="off" spellcheck="false" :placeholder="selectedDeliveryFormat?.placeholder || '请先选择上方发货格式'" /></label>
           <div v-if="deliveryPreview.length" class="vault-delivery-preview"><div v-for="item in deliveryPreview.slice(0, 50)" :key="item.index" :data-valid="item.valid"><code>{{ item.email }}</code><span>{{ item.kind }}</span></div><small v-if="deliveryPreview.length > 50">另有 {{ deliveryPreview.length - 50 }} 条待导入</small></div>
           <p v-if="deliveryError" class="form-error vault-delivery-error">{{ deliveryError }}</p>
-          <footer><span>{{ deliveryPreview.length }} 个账号</span><button class="button button--secondary" type="button" :disabled="deliveryImporting" @click="closeForm">取消</button><button class="button button--primary" :disabled="deliveryImporting || !deliveryPreview.length">{{ deliveryImporting ? '导入中' : '确认导入' }}</button></footer>
+          <footer><span>{{ deliveryPreview.length }} 个账号</span><button class="button button--secondary" type="button" :disabled="deliveryImporting" @click="closeForm">取消</button><button class="button button--primary" :disabled="deliveryImporting || !deliveryFormat || !deliveryPreview.length">{{ deliveryImporting ? '导入中' : '确认导入' }}</button></footer>
         </form>
       </section>
     </div>
@@ -1513,10 +1641,12 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
             <span><strong>{{ oauthForm.concurrency }}</strong><small>并发</small></span>
             <span><strong>{{ oauthForm.schedulable ? '开启' : '关闭' }}</strong><small>调度</small></span>
           </div>
-          <div v-if="oauthAccount.smsReceiver" class="oauth-sms-tools">
-            <button class="button button--secondary button--small" type="button" @click="copyText(oauthAccount.smsReceiver.copyValue, '手机号已复制（不含 +1）')"><IconCopy :size="15" />复制手机号</button>
-            <button class="button button--secondary button--small" type="button" :disabled="refreshingAccountCodes[oauthAccount.id]" @click="refreshAccountSmsCode(oauthAccount)"><IconRefresh :size="15" :class="{ 'is-spinning': refreshingAccountCodes[oauthAccount.id] }" />获取验证码</button>
+          <div v-if="oauthAccount.smsReceiver || oauthAccount.hasTotpSecret" class="oauth-login-tools">
+            <button v-if="oauthAccount.smsReceiver" class="button button--secondary button--small" type="button" @click="copyText(oauthAccount.smsReceiver.copyValue, '手机号已复制（不含 +1）')"><IconCopy :size="15" />复制手机号</button>
+            <button v-if="oauthAccount.smsReceiver" class="button button--secondary button--small" type="button" :disabled="refreshingAccountCodes[oauthAccount.id]" @click="refreshAccountSmsCode(oauthAccount)"><IconRefresh :size="15" :class="{ 'is-spinning': refreshingAccountCodes[oauthAccount.id] }" />获取短信验证码</button>
             <button v-if="accountSmsCodes[oauthAccount.id]?.code" class="button button--primary button--small" type="button" @click="copyText(accountSmsCodes[oauthAccount.id]!.code!, '验证码已复制')"><IconCopy :size="15" />{{ accountSmsCodes[oauthAccount.id]?.code }}</button>
+            <button v-if="oauthAccount.hasTotpSecret" class="button button--secondary button--small" type="button" :disabled="generatingTotp[oauthAccount.id]" @click="generateAccountTotp(oauthAccount)"><IconShieldCheck :size="15" />获取 2FA 验证码</button>
+            <button v-if="accountTotpCodes[oauthAccount.id]" class="button button--primary button--small" type="button" @click="copyText(accountTotpCodes[oauthAccount.id]!.code, '2FA 验证码已复制')"><IconCopy :size="15" />{{ accountTotpCodes[oauthAccount.id]?.code }}</button>
           </div>
           <template v-if="!oauthForm.flowId">
             <div class="form-grid"><label><span>账号名称</span><input v-model="oauthForm.name" maxlength="160"></label><label><span>账号代理</span><AppSelect v-model="oauthForm.proxyId"><option :value="null">不使用代理（直连）</option><option v-for="item in activeProxies()" :key="item.id" :value="item.id">{{ item.name }} · {{ item.protocol }}://{{ item.host }}:{{ item.port }}</option></AppSelect></label></div>
@@ -1555,7 +1685,7 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
     <div v-if="showExport" class="admin-modal-backdrop" @click.self="showExport = false">
       <section class="admin-modal vault-security-modal" role="dialog" aria-modal="true" aria-label="导出完整账号">
         <header><div><span>SECURITY CHECK</span><h2 class="text-balance">导出完整账号</h2></div><button class="icon-button" type="button" title="关闭" aria-label="关闭" @click="showExport = false"><IconX :size="18" /></button></header>
-        <form class="admin-form" @submit.prevent="exportAccounts"><div class="vault-security-note"><IconLock :size="18" /><p class="text-pretty">导出文件包含账号密码、Token、邮箱验证码链接和完整接码链接。操作会写入审计日志。</p></div><label><span>当前管理员密码</span><input v-model="exportPassword" type="password" required autocomplete="current-password"></label><p v-if="exportError" class="form-error">{{ exportError }}</p><footer><button class="button button--secondary" type="button" @click="showExport = false">取消</button><button class="button button--primary">确认导出</button></footer></form>
+        <form class="admin-form" @submit.prevent="exportAccounts"><div class="vault-security-note"><IconLock :size="18" /><p class="text-pretty">导出文件包含账号密码、Token、2FA 密钥、邮箱验证码链接和完整接码链接。操作会写入审计日志。</p></div><label><span>当前管理员密码</span><input v-model="exportPassword" type="password" required autocomplete="current-password"></label><p v-if="exportError" class="form-error">{{ exportError }}</p><footer><button class="button button--secondary" type="button" @click="showExport = false">取消</button><button class="button button--primary">确认导出</button></footer></form>
       </section>
     </div>
 
@@ -1566,15 +1696,14 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
 <style scoped>
 .account-toolbar { margin-bottom: 12px; }
 .account-toolbar > span { margin-left: auto; color: #737b74; font-size: 12px; font-variant-numeric: tabular-nums; }
-.account-workspace-table { min-width: 1540px; table-layout: fixed; }
-.account-workspace-table th:nth-child(1) { width: 260px; }
-.account-workspace-table th:nth-child(2) { width: 135px; }
-.account-workspace-table th:nth-child(3) { width: 130px; }
-.account-workspace-table th:nth-child(4) { width: 140px; }
-.account-workspace-table th:nth-child(5) { width: 145px; }
-.account-workspace-table th:nth-child(6) { width: 300px; }
-.account-workspace-table th:nth-child(7) { width: 245px; }
-.account-workspace-table th:nth-child(8) { width: 185px; }
+.account-workspace-table { min-width: 1410px; table-layout: fixed; }
+.account-workspace-table th:nth-child(1) { width: 285px; }
+.account-workspace-table th:nth-child(2) { width: 175px; }
+.account-workspace-table th:nth-child(3) { width: 150px; }
+.account-workspace-table th:nth-child(4) { width: 145px; }
+.account-workspace-table th:nth-child(5) { width: 260px; }
+.account-workspace-table th:nth-child(6) { width: 220px; }
+.account-workspace-table th:nth-child(7) { width: 175px; }
 .account-identity { min-width: 0; display: grid; gap: 5px; }
 .account-identity > strong, .account-identity > code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-email-line { min-width: 0; }
@@ -1582,7 +1711,13 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
 .account-email-link { min-width: 0; max-width: 100%; display: inline-flex; align-items: center; gap: 5px; overflow: hidden; color: #176144; font-family: var(--font-mono); font-size: 12px; text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
 .account-email-link:hover { text-decoration: underline; }
 .revealed-password { color: #176144; }
+.account-remark { overflow: hidden; color: #747d75; font-size: 11px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.account-totp-inline { display: flex; align-items: center; gap: 5px; }
+.account-totp-inline code { color: #176144; font-size: 13px; font-weight: 850; }
+.account-totp-inline .icon-button { width: 25px; height: 25px; }
 .badge-stack { display: grid; justify-items: start; gap: 5px; }
+.badge-stack--row { display: flex; flex-wrap: wrap; }
+.pool-status { min-width: 0; display: grid; justify-items: start; gap: 6px; }
 .record-badge { min-height: 22px; padding: 2px 7px; border: 1px solid #cfd4cf; border-radius: 4px; display: inline-flex; align-items: center; color: #6f7770; background: #f2f3f1; font-size: 11px; font-weight: 800; white-space: nowrap; }
 .record-badge[data-tone='active'] { border-color: #a9cdbb; color: #176144; background: #e9f4ee; }
 .record-badge[data-tone='sub'] { border-color: #b7c7d8; color: #345d7e; background: #edf3f8; }
@@ -1610,6 +1745,8 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
 .account-sms { min-width: 0; display: grid; gap: 5px; }
 .account-sms > span { color: #7e867f; font-size: 11px; }
 .account-sms > div { display: flex; align-items: center; gap: 5px; }
+.account-sms-meta { color: #7e867f; font-size: 11px; }
+.account-sms-meta .record-badge { min-height: 20px; padding-block: 1px; }
 .account-sms code { color: #176144; font-size: 13px; font-weight: 800; }
 .account-sms small { max-width: 130px; overflow: hidden; color: #858d86; text-overflow: ellipsis; white-space: nowrap; }
 .phone-copy { max-width: 100%; padding: 0; border: 0; display: inline-flex; align-items: center; gap: 5px; overflow: hidden; color: #245f49; background: transparent; font: inherit; font-size: 12px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
@@ -1620,7 +1757,12 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
 .receiver-table-wrap--page { max-height: none; }
 .receiver-count { display: grid; grid-template-columns: 18px auto; align-items: center; justify-content: start; gap: 2px 6px; color: #287858; }
 .receiver-count small { grid-column: 2; color: #7e867f; font-size: 11px; }
+.receiver-create-modes { margin-bottom: 0; }
 .receiver-editor-modal .receiver-editor { border-bottom: 0; }
+.receiver-import-input { min-height: 190px; font-family: var(--font-mono); font-size: 11px !important; line-height: 1.65 !important; }
+.receiver-import-preview [data-valid='false'] :is(strong, small, code) { color: #b93930; }
+.receiver-editor > .form-error { white-space: pre-line; }
+.receiver-editor > footer > span { margin-right: auto; color: #737c74; font-size: 11px; }
 .receiver-bindings { border-block: 1px solid #d9ddd7; }
 .receiver-bindings > header { min-height: 54px; padding: 9px 2px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .receiver-bindings > header > div { display: flex; align-items: center; gap: 8px; }
@@ -1644,7 +1786,7 @@ onBeforeUnmount(() => revealTimers.forEach(timer => window.clearTimeout(timer)))
 .cpa-file-list small, .cpa-file-list time { color: #737c74; font-size: 11px; }
 .cpa-file-manager > footer { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
 .cpa-file-manager > footer > span { margin-right: auto; color: #737b74; font-size: 11px; font-variant-numeric: tabular-nums; }
-.oauth-sms-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.oauth-login-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .credential-import-head { display: flex; align-items: center; gap: 12px; }
 .credential-import-head label { position: relative; }
 .credential-import-head input { position: absolute; width: 1px; height: 1px; opacity: 0; clip-path: inset(50%); }
