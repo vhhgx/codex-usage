@@ -12,7 +12,19 @@ let userPassword = process.env.UI_SMOKE_USER_PASSWORD || ''
 const output = process.env.UI_SMOKE_OUTPUT || '/tmp/zephyr-ui-smoke'
 const pages = process.env.UI_SMOKE_PAGES?.split(',').filter(Boolean) || ['/admin/users', '/admin/channels', '/admin/keys', '/admin/models', '/admin/settings', '/admin/audits', '/admin/account-vault', '/admin/upstreams']
 const userPages = process.env.UI_SMOKE_USER_PAGES?.split(',').filter(Boolean) || ['/console', '/console/keys', '/console/groups', '/console/models', '/console/announcements', '/console/logs']
-const viewports = [{ name: 'desktop', width: 1440, height: 1000 }, { name: 'mobile', width: 390, height: 844 }]
+const baseViewports = process.env.UI_SMOKE_VIEWPORTS
+  ? process.env.UI_SMOKE_VIEWPORTS.split(',').filter(Boolean).map((value) => {
+      const match = value.trim().match(/^(\d+)x(\d+)$/)
+      if (!match) throw new Error(`Invalid UI_SMOKE_VIEWPORTS entry: ${value}`)
+      return { name: match[1], width: Number(match[1]), height: Number(match[2]) }
+    })
+  : [{ name: 'desktop', width: 1440, height: 1000 }, { name: 'mobile', width: 390, height: 844 }]
+const themes = process.env.UI_SMOKE_THEMES?.split(',').filter(theme => ['light', 'dark'].includes(theme)) || ['light']
+const viewports = baseViewports.flatMap(viewport => themes.map(theme => ({
+  ...viewport,
+  theme,
+  name: themes.length === 1 && theme === 'light' ? viewport.name : `${viewport.name}-${theme}`
+})))
 const bootstrap = process.env.UI_SMOKE_BOOTSTRAP === '1'
 const skipFormLogin = process.env.UI_SMOKE_SKIP_FORM_LOGIN === '1'
 const skipUser = process.env.UI_SMOKE_SKIP_USER === '1'
@@ -95,9 +107,15 @@ try {
       ...(!skipUser && userUsername && userPassword ? [{ name: 'user', username: userUsername, password: userPassword, login: '/api/auth/login', logout: '/api/auth/logout', pages: userPages }] : [])
     ]
     for (const target of targets) {
-      const context = await browser.newContext({ viewport })
+      const context = await browser.newContext({
+        viewport: { width: viewport.width, height: viewport.height },
+        colorScheme: viewport.theme
+      })
+      await context.addCookies([{ name: 'zephyr_theme', value: viewport.theme, url: baseUrl }])
       const page = await context.newPage()
       const pageErrors = []
+      let themeChecked = false
+      let drawerChecked = false
       page.on('pageerror', error => pageErrors.push(error.message))
       if (target.name === 'user' && !skipFormLogin) {
         await page.goto(baseUrl)
@@ -140,14 +158,57 @@ try {
         const response = await page.goto(`${baseUrl}${path}`)
         if (!response?.ok()) throw new Error(`${path} returned HTTP ${response?.status()}`)
         await page.waitForLoadState('networkidle')
+        if (!themeChecked && target.name === 'admin') {
+          const expectedTheme = viewport.theme
+          if (!await page.locator('html').evaluate((element, theme) => element.classList.contains(theme), expectedTheme)) {
+            throw new Error(`${path} did not resolve the explicit ${expectedTheme} theme before interaction`)
+          }
+          const targetTheme = expectedTheme === 'dark' ? 'light' : 'dark'
+          await page.getByRole('button', { name: expectedTheme === 'dark' ? '切换到亮色主题' : '切换到暗色主题' }).click()
+          await page.waitForFunction(theme => document.documentElement.classList.contains(theme), targetTheme)
+          await page.getByRole('button', { name: targetTheme === 'dark' ? '切换到亮色主题' : '切换到暗色主题' }).click()
+          await page.waitForFunction(theme => document.documentElement.classList.contains(theme), expectedTheme)
+          const cookie = (await context.cookies(baseUrl)).find(item => item.name === 'zephyr_theme')
+          if (cookie?.value !== expectedTheme) throw new Error(`theme preference was not restored: ${cookie?.value}`)
+          themeChecked = true
+        }
+        if (!drawerChecked && target.name === 'admin' && viewport.width <= 960) {
+          const menu = page.getByRole('button', { name: '打开导航' })
+          await menu.click()
+          const sidebar = page.locator('.workspace-sidebar')
+          const brand = sidebar.locator('.workspace-brand')
+          const logout = sidebar.getByRole('button', { name: '退出登录' })
+          await brand.focus()
+          await page.keyboard.press('Shift+Tab')
+          if (!await logout.evaluate(element => element === document.activeElement)) throw new Error('mobile drawer did not wrap focus backward')
+          await page.keyboard.press('Tab')
+          if (!await brand.evaluate(element => element === document.activeElement)) throw new Error('mobile drawer did not wrap focus forward')
+          await page.keyboard.press('Escape')
+          if (await menu.getAttribute('aria-expanded') !== 'false' || !await menu.evaluate(element => element === document.activeElement)) {
+            throw new Error('mobile drawer did not close with Escape and restore focus')
+          }
+          drawerChecked = true
+        }
         if (target.name === 'admin' && path === '/admin') {
-          const labels = await page.locator('.admin-nav a span').allTextContents()
+          const labels = await page.locator('.workspace-nav a span').allTextContents()
           if (!labels.includes('运行总览') || !labels.includes('用户管理') || labels.includes('个人首页')) {
             throw new Error(`administrator received incorrect navigation: ${JSON.stringify(labels)}`)
           }
+          const spotlight = page.locator('.spotlight-panel').first()
+          if (viewport.width > 960) {
+            await spotlight.hover({ position: { x: 24, y: 24 } })
+            const position = await spotlight.evaluate(element => ({
+              x: element.style.getPropertyValue('--spot-x'),
+              y: element.style.getPropertyValue('--spot-y')
+            }))
+            if (!position.x || !position.y) throw new Error(`desktop spotlight did not track the pointer: ${JSON.stringify(position)}`)
+          } else {
+            const content = await spotlight.evaluate(element => getComputedStyle(element, '::before').content)
+            if (content !== 'none') throw new Error(`mobile spotlight is still rendered: ${content}`)
+          }
         }
         if (target.name === 'user' && path === '/console') {
-          const labels = await page.locator('.admin-nav a span').allTextContents()
+          const labels = await page.locator('.workspace-nav a span').allTextContents()
           if (!labels.includes('个人首页') || !labels.includes('我的 Keys') || !labels.includes('公告') || labels.includes('用户管理')) {
             throw new Error(`ordinary user received incorrect navigation: ${JSON.stringify(labels)}`)
           }
@@ -180,18 +241,32 @@ try {
           viewportWidth: window.innerWidth,
           fixedOverflow: [...document.querySelectorAll('button, select, input')].filter((element) => {
             const rect = element.getBoundingClientRect()
+            const style = getComputedStyle(element)
             const insideHorizontalScroller = [...function * parents(node) {
               for (let parent = node.parentElement; parent; parent = parent.parentElement) yield parent
             }(element)].some(parent => {
               const overflow = getComputedStyle(parent).overflowX
               return (overflow === 'auto' || overflow === 'scroll') && parent.scrollWidth > parent.clientWidth
             })
-            return rect.width > 0 && !insideHorizontalScroller && (rect.left < -1 || rect.right > window.innerWidth + 1)
-          }).length
+            return style.visibility !== 'hidden' && rect.width > 0 && !insideHorizontalScroller && (rect.left < -1 || rect.right > window.innerWidth + 1)
+          }).map((element) => {
+            const rect = element.getBoundingClientRect()
+            return { className: element.className, label: element.getAttribute('aria-label') || element.getAttribute('title') || element.textContent?.trim().slice(0, 40), left: Math.round(rect.left), right: Math.round(rect.right) }
+          }),
+          inaccessibleIconButtons: [...document.querySelectorAll('button')].filter((element) => {
+            const style = getComputedStyle(element)
+            const iconOnly = Boolean(element.querySelector('svg')) && !element.textContent?.trim()
+            return iconOnly && style.display !== 'none' && style.visibility !== 'hidden'
+              && (!element.getAttribute('aria-label') || !element.getAttribute('title'))
+          }).map(element => ({
+            className: element.className,
+            ariaLabel: element.getAttribute('aria-label'),
+            title: element.getAttribute('title')
+          }))
         }))
         const name = path === '/console' ? 'overview' : path.split('/').filter(Boolean).at(-1)
         await page.screenshot({ path: `${output}/${viewport.name}-${target.name}-${name}.png`, fullPage: true })
-        results.push({ viewport: viewport.name, target: target.name, path, pageErrors: [...pageErrors], ...layout })
+        results.push({ viewport: viewport.name, theme: viewport.theme, target: target.name, path, pageErrors: [...pageErrors], ...layout })
         if (target.name === 'admin') {
           const legacyTablists = await page.locator('[role="tablist"].admin-segment').count()
           if (legacyTablists) throw new Error(`${path} still uses ${legacyTablists} legacy segmented tablist(s)`)
@@ -224,7 +299,7 @@ try {
           await page.getByText('还没有 Hub Key', { exact: true }).waitFor()
         }
         if (target.name === 'admin' && path === '/admin/channels') {
-          if (!await page.locator('.admin-nav').getByText('资源管理', { exact: true }).count()) throw new Error('combined resource navigation label is missing')
+          if (!await page.locator('.workspace-nav').getByText('资源管理', { exact: true }).count()) throw new Error('combined resource navigation label is missing')
           await page.getByRole('heading', { name: '资源管理', exact: true }).waitFor()
           if (await page.locator('.resource-section-heading').count()) throw new Error('resource tabs still render duplicated section headings')
           const resourceHeader = page.locator('.admin-page__header')
@@ -249,7 +324,7 @@ try {
         }
         if (target.name === 'admin' && path === '/admin/upstreams') {
           await page.getByRole('heading', { name: '号池配置', exact: true }).waitFor()
-          if (!await page.locator('.admin-nav').getByText('号池配置', { exact: true }).count()) throw new Error('pool settings navigation label was not updated')
+          if (!await page.locator('.workspace-nav').getByText('号池配置', { exact: true }).count()) throw new Error('pool settings navigation label was not updated')
           if (await page.getByRole('tab', { name: 'CPA 认证', exact: true }).count()) throw new Error('CPA auth tab should be managed from account management')
           if (await page.getByRole('tab', { name: 'Sub2API 账号', exact: true }).count()) throw new Error('duplicated Sub2API account tab should remain hidden from pool settings')
           await page.getByRole('tab', { name: 'Sub2API 分组', exact: true }).waitFor()
@@ -276,7 +351,7 @@ try {
           await page.unroute(operationsPattern)
         }
         if (target.name === 'admin' && path === '/admin/account-vault') {
-          if (!await page.locator('.admin-shell > .admin-sidebar').count()) throw new Error('account management is not using the admin layout')
+          if (!await page.locator('.workspace-shell > .workspace-sidebar').count()) throw new Error('account management is not using the admin layout')
           if (await page.locator('.site-header, .site-header__inner, .page-width.account-vault-page').count()) throw new Error('account management is incorrectly using the public site layout')
           const accountTypography = await page.evaluate(() => ({
             table: Number.parseFloat(getComputedStyle(document.querySelector('.account-workspace-table')).fontSize),
@@ -302,11 +377,27 @@ try {
           if ((await fixtureIdentity.innerText()).includes('UI Smoke 账号备注')) throw new Error('account identity still renders remarks')
           const passwordButton = fixtureIdentity.locator('.password-copy', { hasText: 'UI-Smoke-Account-Password' })
           await passwordButton.waitFor()
+          const email = fixtureIdentity.locator('.account-email')
+          const emailLayout = await email.evaluate((element) => {
+            const style = getComputedStyle(element)
+            return { maxWidth: style.maxWidth, overflow: style.overflow, textOverflow: style.textOverflow, whiteSpace: style.whiteSpace }
+          })
+          if (emailLayout.maxWidth !== 'none' || emailLayout.textOverflow === 'ellipsis' || emailLayout.whiteSpace !== 'nowrap') {
+            throw new Error(`account email is constrained or truncated: ${JSON.stringify(emailLayout)}`)
+          }
           await passwordButton.click()
           await page.getByText('账号密码已复制', { exact: true }).waitFor()
 
-          await page.getByTitle('编辑账号资料').first().click()
-          const accountEditor = page.getByRole('dialog', { name: '编辑账号' })
+          const accountEditTrigger = page.getByTitle('编辑账号资料').first()
+          await accountEditTrigger.click()
+          let accountEditor = page.getByRole('dialog', { name: '编辑账号' })
+          await accountEditor.waitFor()
+          await page.waitForFunction(() => document.querySelector('[role="dialog"][aria-label="编辑账号"]')?.contains(document.activeElement))
+          await page.keyboard.press('Escape')
+          await accountEditor.waitFor({ state: 'detached' })
+          await page.waitForFunction(() => document.activeElement?.getAttribute('title') === '编辑账号资料')
+          await accountEditTrigger.click()
+          accountEditor = page.getByRole('dialog', { name: '编辑账号' })
           await accountEditor.waitFor()
           for (const removedField of ['购买日期', '质保日期', '质保状态']) {
             if (await accountEditor.getByText(removedField, { exact: true }).count()) {
@@ -454,7 +545,7 @@ try {
   }
 }
 
-if (results.some(result => result.documentWidth > result.viewportWidth + 1 || result.fixedOverflow > 0 || result.pageErrors.length)) {
+if (results.some(result => result.documentWidth > result.viewportWidth + 1 || result.fixedOverflow.length > 0 || result.inaccessibleIconButtons.length > 0 || result.pageErrors.length)) {
   throw new Error(`UI overflow detected: ${JSON.stringify(results)}`)
 }
 console.log(JSON.stringify({ passed: true, results, output }))
