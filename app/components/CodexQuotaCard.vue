@@ -79,18 +79,13 @@ function refreshedText(value: number | undefined) {
     <header class="quota-ticket__header">
       <div class="quota-ticket__identity">
         <h2>{{ account.email || account.name }}</h2>
-      </div>
-      <div class="quota-ticket__meta">
-        <div class="quota-ticket__plan">
-          {{ quota?.planType || account.planType || 'Codex' }}
-        </div>
-        <div v-if="quotaUnavailable || scheduleStatus" class="quota-ticket__states">
+        <div class="quota-ticket__meta">
+          <span class="quota-ticket__plan">{{ quota?.planType || account.planType || 'Codex' }}</span>
           <span v-if="quotaUnavailable" class="quota-ticket__state" data-tone="neutral">额度不可用</span>
-          <span v-if="scheduleStatus" class="quota-ticket__state" :data-tone="scheduleStatus === 'available' ? 'healthy' : 'warning'">
-            <strong>{{ scheduleStatus === 'available' ? '可调度' : '不可调度' }}</strong>
-          </span>
+          <span v-if="scheduleStatus" class="quota-ticket__state" :data-tone="scheduleStatus === 'available' ? 'healthy' : 'warning'">{{ scheduleStatus === 'available' ? '可调度' : '暂停调度' }}</span>
         </div>
       </div>
+      <button type="button" class="icon-button quota-ticket__refresh" :disabled="loading" title="刷新此账号" aria-label="刷新此账号" @click="$emit('refresh', account.id)"><IconRefresh :size="14" :stroke-width="1.8" :class="{ 'is-spinning': loading }" /></button>
     </header>
 
     <div v-if="loading" class="quota-ticket__loading" aria-label="正在读取额度">
@@ -145,17 +140,45 @@ function refreshedText(value: number | undefined) {
       </div>
     </div>
 
-    <footer class="quota-ticket__footer">
-      <span>{{ refreshedText(quota?.refreshedAt) }}</span>
-      <button
-        type="button"
-        class="button button--quiet button--small"
-        :disabled="loading"
-        @click="$emit('refresh', account.id)"
-      >
-        <IconRefresh :size="16" :stroke-width="1.8" :class="{ 'is-spinning': loading }" />
-        刷新此账号
-      </button>
-    </footer>
+    <footer class="quota-ticket__footer"><span>{{ refreshedText(quota?.refreshedAt) }}</span></footer>
   </article>
 </template>
+
+<style scoped>
+.quota-ticket { width: auto; min-width: 0; min-height: 0; border: 1px solid var(--hub-line); border-radius: var(--hub-radius-md); display: grid; grid-template-rows: auto auto auto auto; color: var(--hub-text); background: var(--hub-solid-surface-strong); box-shadow: none; }
+.quota-ticket[data-tone='healthy'] { border-left: 2px solid var(--hub-success); border-top: 1px solid var(--hub-line); }
+.quota-ticket[data-tone='warning'] { border-left: 2px solid var(--hub-warning); border-top: 1px solid var(--hub-line); }
+.quota-ticket[data-tone='danger'] { border-left: 2px solid var(--hub-danger); border-top: 1px solid var(--hub-line); }
+.quota-ticket[data-tone='neutral'] { border-left: 2px solid var(--hub-line-strong); border-top: 1px solid var(--hub-line); }
+.quota-ticket__header { min-height: 50px; padding: var(--hub-space-2) var(--hub-space-3); border-bottom: 1px solid var(--hub-line-row); display: grid; grid-template-columns: minmax(0, 1fr) 28px; align-items: center; gap: var(--hub-space-2); }
+.quota-ticket__identity { min-width: 0; }
+.quota-ticket__identity h2 { overflow: hidden; color: var(--hub-text); font-family: var(--hub-font-mono); font-size: var(--hub-text-xs); font-weight: var(--hub-weight-semibold); text-overflow: ellipsis; white-space: nowrap; }
+.quota-ticket__meta { margin-top: 3px; display: flex; align-items: center; gap: var(--hub-space-2); }
+.quota-ticket__plan, .quota-ticket__state { color: var(--hub-text-faint); font-size: var(--hub-text-micro); text-transform: none; }
+.quota-ticket__state[data-tone='healthy'] { color: var(--hub-success); }
+.quota-ticket__state[data-tone='warning'] { color: var(--hub-warning); }
+.quota-ticket__refresh { width: 28px; height: 28px; border-radius: var(--hub-radius-sm); }
+.quota-ticket__content { min-width: 0; margin: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.quota-ticket__primary, .quota-ticket__secondary { width: auto; }
+.quota-ticket__primary { border-right: 1px solid var(--hub-line-row); }
+.quota-ticket__window { min-height: 82px; padding: var(--hub-space-2) var(--hub-space-3); display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: var(--hub-space-2); }
+.quota-ticket__window::before { content: none; }
+.quota-ticket__window > div:first-child { min-width: 0; }
+.quota-ticket__window-label { overflow: hidden; display: block; color: var(--hub-text-faint); font-size: var(--hub-text-micro); text-overflow: ellipsis; white-space: nowrap; }
+.quota-ticket__window-number { margin-top: 4px; align-items: baseline; }
+.quota-ticket__window-number strong { color: var(--hub-text); font-size: var(--hub-text-quota); font-weight: var(--hub-weight-semibold); letter-spacing: 0; line-height: 1; }
+.quota-ticket__window-number span { margin: 0 0 0 3px; color: var(--hub-text-faint); font-size: var(--hub-text-xs); }
+.quota-ticket__window-reset { padding: 0; border: 0; text-align: right; }
+.quota-ticket__window-reset strong { color: var(--hub-text-faint); font-size: var(--hub-text-micro); font-weight: var(--hub-weight-regular); white-space: nowrap; }
+.quota-ticket__extras { padding: var(--hub-space-2) var(--hub-space-3); border-top: 1px solid var(--hub-line-row); gap: var(--hub-space-2); }
+.quota-ticket__extras div { color: var(--hub-text-faint); font-size: var(--hub-text-micro); }
+.quota-ticket__footer { min-height: 30px; padding: 5px var(--hub-space-3); border-top: 1px solid var(--hub-line-row); justify-content: flex-start; }
+.quota-ticket__footer > span { color: var(--hub-text-faint); font-size: var(--hub-text-micro); }
+.quota-ticket__loading { min-height: 82px; padding: var(--hub-space-3); }
+.quota-ticket__loading span { border-radius: var(--hub-radius-sm); background: var(--hub-skeleton); }
+.quota-ticket__error { min-height: 82px; padding: var(--hub-space-3); justify-content: flex-start; }
+.quota-ticket__error svg { width: 18px; }
+.quota-ticket__error strong { color: var(--hub-danger); font-size: var(--hub-text-xs); }
+.quota-ticket__error p { margin-top: 3px; color: var(--hub-text-muted); font-size: var(--hub-text-micro); }
+@media (max-width: 480px) { .quota-ticket__content { grid-template-columns: 1fr; } .quota-ticket__primary { border-right: 0; border-bottom: 1px solid var(--hub-line-row); } }
+</style>

@@ -172,9 +172,9 @@ const subCards = computed(() => subResults.value.map((item) => ({
   scheduleStatus: subScheduleStatus(item)
 })))
 
-function radarModelLabel(model: string) {
-  return model.replace(/^gpt-/i, '')
-}
+const RADAR_EFFORT_ORDER = ['ultra', 'max', 'xhigh', 'high', 'medium', 'low']
+
+function radarModelLabel(model: string) { return model }
 
 const radarGroups = computed(() => {
   const groups = new Map<string, CodexRadarModel[]>()
@@ -185,9 +185,11 @@ const radarGroups = computed(() => {
 
   return [...groups.entries()].map(([model, models]) => ({
     model,
-    models: [...models].sort((left, right) =>
-      right.costUsd - left.costUsd || left.reasoningEffort.localeCompare(right.reasoningEffort)
-    )
+    models: [...models].sort((left, right) => {
+      const leftIndex = RADAR_EFFORT_ORDER.indexOf(left.reasoningEffort.toLowerCase())
+      const rightIndex = RADAR_EFFORT_ORDER.indexOf(right.reasoningEffort.toLowerCase())
+      return (leftIndex < 0 ? RADAR_EFFORT_ORDER.length : leftIndex) - (rightIndex < 0 ? RADAR_EFFORT_ORDER.length : rightIndex)
+    })
   }))
 })
 
@@ -308,15 +310,16 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="codex-page" :class="{ 'page-width': !embedded, 'upstream-capacity--embedded': embedded }">
-    <section v-if="!embedded" class="page-heading">
+  <div class="codex-page" :class="{ 'admin-page': !embedded, 'upstream-capacity--embedded': embedded }">
+    <header v-if="!embedded" class="admin-page__header">
       <div>
+        <span class="admin-kicker">ACCOUNT CAPACITY</span>
         <h1>账号余量</h1>
         <p>分别查看 CPA 与 Sub2API 的账号额度，并按数据源独立刷新。</p>
       </div>
-    </section>
-    <section v-else class="resource-section-heading upstream-capacity-heading">
-      <div><span>UPSTREAM CAPACITY</span><h2>上游账号余量</h2><p>CPA 与 Sub2API 账号额度及模型效率。</p></div>
+    </header>
+    <section v-else class="upstream-capacity-heading">
+      <div><h2>上游账号余量</h2><p>CPA 与 Sub2API 账号额度及模型效率。</p></div>
     </section>
 
     <section class="quota-source radar-source" aria-labelledby="radar-title">
@@ -346,7 +349,7 @@ onMounted(() => {
       </div>
 
       <div v-else-if="radarGroups.length" class="radar-groups">
-        <section v-for="group in radarGroups" :key="group.model" class="radar-group">
+        <section v-for="group in radarGroups" :key="group.model" class="radar-group" :class="{ 'radar-group--compact': group.models.length <= 2 }">
           <header class="radar-group__header">
             <h3>{{ radarModelLabel(group.model) }}</h3>
             <span>{{ group.models.length }} 种推理强度</span>
@@ -434,3 +437,37 @@ onMounted(() => {
     </section>
   </div>
 </template>
+
+<style scoped>
+.upstream-capacity--embedded { margin-top: var(--hub-space-6); }
+.upstream-capacity-heading { margin-bottom: var(--hub-space-3); }
+.upstream-capacity-heading h2 { color: var(--hub-text); font-size: var(--hub-text-md); font-weight: var(--hub-weight-semibold); }
+.upstream-capacity-heading p { margin-top: var(--hub-space-1); color: var(--hub-text-muted); font-size: var(--hub-text-xs); }
+.quota-source { margin: 0 0 var(--hub-grid-gap); padding: 0; overflow: hidden; }
+.quota-source + .quota-source { margin-top: 0; }
+.quota-source__header { min-height: 62px; padding: var(--hub-space-3) var(--hub-space-4); border-bottom: 1px solid var(--hub-line-row); }
+.quota-source__header h2 { color: var(--hub-text); font-size: var(--hub-text-md); font-weight: var(--hub-weight-semibold); }
+.quota-source__header p { margin-top: 3px; color: var(--hub-text-faint); font-size: var(--hub-text-micro); }
+.quota-source__actions { gap: var(--hub-space-2); }
+.radar-source__link { color: var(--hub-accent-text); }
+.radar-updated, .account-count { color: var(--hub-text-faint); font-size: var(--hub-text-micro); }
+.radar-groups { margin: 0; padding: var(--hub-space-3); display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--hub-grid-gap); }
+.radar-group { min-width: 0; padding: var(--hub-space-3); border: 1px solid var(--hub-line-row); border-radius: var(--hub-radius-md); background: var(--hub-solid-surface-strong); }
+.radar-group:not(.radar-group--compact) { grid-row: span 2; }
+.radar-group__header { min-height: 30px; }
+.radar-group__header h3 { overflow: hidden; color: var(--hub-text); font-family: var(--hub-font-mono); font-size: var(--hub-text-sm); font-weight: var(--hub-weight-semibold); text-overflow: ellipsis; white-space: nowrap; }
+.radar-group__header span { color: var(--hub-text-faint); font-size: var(--hub-text-micro); }
+.radar-list { margin-top: var(--hub-space-2); border: 0; }
+.radar-list > li { min-height: 48px; padding: var(--hub-space-2) 0; border-bottom: 1px solid var(--hub-line-row); grid-template-columns: minmax(62px, .72fr) minmax(112px, 1.28fr); gap: var(--hub-space-2); }
+.radar-list__primary { grid-template-columns: 48px minmax(0, 1fr); align-items: baseline; gap: var(--hub-space-2); }
+.radar-list__primary strong { color: var(--hub-text); font-size: var(--hub-text-md); font-weight: var(--hub-weight-semibold); }
+.radar-list__primary span { color: var(--hub-accent-text); font-size: var(--hub-text-micro); text-transform: none; }
+.radar-list__stats { grid-template-columns: repeat(2, minmax(48px, 1fr)); gap: var(--hub-space-2); }
+.radar-list__stats dt { color: var(--hub-text-faint); font-size: var(--hub-text-micro); }
+.radar-list__stats dd { margin-top: 2px; color: var(--hub-text); font-size: var(--hub-text-micro); }
+.radar-loading-grid { margin: 0; padding: var(--hub-space-3); grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--hub-grid-gap); }
+.radar-loading-grid span { min-height: 220px; border-radius: var(--hub-radius-md); background: var(--hub-skeleton); }
+.quota-board { margin: 0; padding: var(--hub-space-3); display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: var(--hub-grid-gap); }
+@media (max-width: 1180px) { .radar-groups, .radar-loading-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .radar-group:not(.radar-group--compact) { grid-row: auto; } }
+@media (max-width: 720px) { .quota-source__header { align-items: stretch; } .radar-source__actions { align-items: flex-end; flex-direction: column; } .radar-groups, .radar-loading-grid, .quota-board { grid-template-columns: 1fr; } }
+</style>
