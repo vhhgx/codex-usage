@@ -150,13 +150,13 @@ watch(source, (nextSource) => {
 </script>
 
 <template>
-  <div class="usage-page page-width">
-    <section class="page-heading">
+  <div class="usage-page admin-page">
+    <header class="admin-page__header">
       <div>
-        <span class="eyebrow">SELF SERVICE</span>
+        <span class="admin-kicker">SELF SERVICE</span>
         <h1>查询我的 API 用量</h1>
       </div>
-    </section>
+    </header>
 
     <form class="usage-query" @submit.prevent="submit">
       <fieldset class="source-picker range-picker">

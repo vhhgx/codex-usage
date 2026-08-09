@@ -30,6 +30,7 @@ const links = [
           <component :is="link.icon" :size="17" :stroke-width="1.8" />
           <span>{{ link.label }}</span>
         </NuxtLink>
+        <AppThemeButton />
       </nav>
     </div>
   </header>

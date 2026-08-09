@@ -94,6 +94,7 @@ async function login() {
 
 <template>
   <main class="admin-login">
+    <AppThemeButton class="admin-login__theme" />
     <section class="admin-login__intro">
       <NuxtLink to="/" class="admin-login__brand">
         <IconActivityHeartbeat :size="24" />
