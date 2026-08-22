@@ -2,10 +2,13 @@ import { createHash, randomUUID } from 'node:crypto'
 import { and, desc, eq, gte, ilike, inArray, isNotNull, lte, or } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import {
+  ACCOUNT_DELIVERY_FIELDS,
   ACCOUNT_VAULT_STATUSES,
+  ACCOUNT_VAULT_SOURCES,
   LEDGER_TRANSACTION_TYPES,
   WARRANTY_STATUSES,
-  type AccountDeliveryFormat,
+  type AccountDeliveryField,
+  type AccountVaultSource,
   type AccountVaultStatus,
   type AccountCredentialKind,
   type AccountSub2ApiPoolStatus,
@@ -31,6 +34,8 @@ import {
 type UnknownRecord = Record<string, unknown>
 
 const accountStatuses = new Set<string>(ACCOUNT_VAULT_STATUSES)
+const accountSources = new Set<string>(ACCOUNT_VAULT_SOURCES)
+const accountDeliveryFields = new Set<string>(ACCOUNT_DELIVERY_FIELDS)
 const warrantyStatuses = new Set<string>(WARRANTY_STATUSES)
 const transactionTypes = new Set<string>(LEDGER_TRANSACTION_TYPES)
 
@@ -119,6 +124,7 @@ function accountView(
     id: row.id,
     email: row.email,
     displayName: row.displayName,
+    source: row.source as AccountVaultSource,
     status: row.status as AccountVaultStatus,
     credentialKind: credentialKind(row),
     hasEmailCodeUrl: Boolean(row.encryptedEmailCodeUrl),
@@ -143,6 +149,7 @@ function accountValues(body: UnknownRecord) {
   return {
     email: emailText(body.email),
     displayName: optionalText(body.displayName ?? body.name, '姓名', 120),
+    source: enumText(body.source, accountSources, 'unknown' as AccountVaultSource, '账号来源'),
     status: enumText(body.status, accountStatuses, 'Codex' as AccountVaultStatus, '账号状态'),
     purchaseDate: dateText(body.purchaseDate ?? body.purchaseTime, '购买日期'),
     warrantyDate: dateText(body.warrantyDate ?? body.warrantyTime, '质保日期'),
@@ -163,7 +170,7 @@ export async function listAccountVaultEntries(event: H3Event, query: Record<stri
   const views = rows.map(row => accountView(row, receivers.get(row.id) || null))
   if (!search) return views
   const needle = search.toLowerCase()
-  return views.filter(item => `${item.email} ${item.displayName || ''} ${item.smsReceiver?.phone || ''} ${item.remark || ''}`.toLowerCase().includes(needle))
+  return views.filter(item => `${item.email} ${item.displayName || ''} ${item.source} ${item.smsReceiver?.phone || ''} ${item.remark || ''}`.toLowerCase().includes(needle))
 }
 
 export async function getAccountVaultEntry(event: H3Event, id: string) {
@@ -186,15 +193,14 @@ export async function createAccountVaultEntry(event: H3Event, body: UnknownRecor
     const codeUrl = emailCodeUrl(body.emailCodeUrl)
     const totpSecret = normalizeTotpSecret(body.totpSecret)
     if (Boolean(accessToken) !== Boolean(refreshToken)) throw createError({ statusCode: 400, message: 'Access Token 和 Refresh Token 必须同时提供' })
-    if (codeUrl && (accessToken || refreshToken)) throw createError({ statusCode: 400, message: '邮箱验证码链接与 Token 凭据不能同时提供' })
-    if (codeUrl && totpSecret) throw createError({ statusCode: 400, message: '邮箱验证码链接与 2FA 密钥不能同时提供' })
-    const password = accountPassword(body.password, !codeUrl)
+    const password = accountPassword(body.password, false)
     const values = {
       ...accountValues(body),
       purchaseDate: zonedDateKey(new Date(), 'Asia/Shanghai'),
       warrantyDate: null,
       warrantyStatus: '无质保'
     }
+    if (values.source === 'unknown') throw createError({ statusCode: 400, message: '请选择账号来源' })
     let receiverId = typeof body.smsReceiverId === 'string' && body.smsReceiverId ? body.smsReceiverId : null
     if (!receiverId && body.phone && body.smsUrl) receiverId = await ensureLegacySmsReceiver(event, body.phone, body.smsUrl, actorId)
     if (receiverId) await assertSmsReceiverAvailable(event, receiverId)
@@ -225,6 +231,7 @@ export async function updateAccountVaultEntry(event: H3Event, id: string, body: 
   const values = accountValues({
     email: body.email ?? current.email,
     displayName: body.displayName === undefined ? current.displayName : body.displayName,
+    source: body.source === undefined ? current.source : body.source,
     status: body.status ?? current.status,
     purchaseDate: body.purchaseDate === undefined ? current.purchaseDate : body.purchaseDate,
     warrantyDate: body.warrantyDate === undefined ? current.warrantyDate : body.warrantyDate,
@@ -357,14 +364,14 @@ export async function revealAccountVaultPasswords(event: H3Event) {
     id: accountVaultEntries.id,
     encryptedPassword: accountVaultEntries.encryptedPassword
   }).from(accountVaultEntries).orderBy(desc(accountVaultEntries.updatedAt))
-  try {
-    return rows.flatMap((row) => {
+  return rows.flatMap((row) => {
+    try {
       const password = decryptContextSecret(row.encryptedPassword, accountContext(row.id), event)
       return password ? [{ id: row.id, password }] : []
-    })
-  } catch {
-    throw createError({ statusCode: 500, message: '账号密码密文无法解密，请检查加密密钥配置' })
-  }
+    } catch {
+      return []
+    }
+  })
 }
 
 export async function revealAccountVaultCredentials(event: H3Event, id: string) {
@@ -397,54 +404,63 @@ export async function generateAccountVaultTotp(event: H3Event, id: string) {
 export interface AccountDeliveryLine {
   index: number
   email: string
-  kind: AccountDeliveryFormat | 'invalid'
+  kind: 'custom' | 'invalid'
   record: UnknownRecord | null
   message: string | null
   fingerprint: string
 }
 
-export function parseAccountDeliveryText(value: unknown, format: unknown): AccountDeliveryLine[] {
-  if (typeof value !== 'string') throw createError({ statusCode: 400, message: '发货内容必须是文本' })
-  if (!['email_code_url', 'tokens', 'password_totp'].includes(String(format))) {
-    throw createError({ statusCode: 400, message: '请先选择发货格式' })
+function deliveryFieldList(value: unknown): AccountDeliveryField[] {
+  if (!Array.isArray(value)) throw createError({ statusCode: 400, message: '请先配置发货字段' })
+  const fields = value.map(field => String(field))
+  if (!fields.length || fields.length > ACCOUNT_DELIVERY_FIELDS.length) throw createError({ statusCode: 400, message: '请先配置发货字段' })
+  if (new Set(fields).size !== fields.length || fields.some(field => !accountDeliveryFields.has(field))) {
+    throw createError({ statusCode: 400, message: '发货字段包含重复或无效项' })
   }
-  const selectedFormat = format as AccountDeliveryFormat
+  if (!fields.includes('email')) throw createError({ statusCode: 400, message: '发货字段必须包含账号' })
+  if (fields.includes('accessToken') !== fields.includes('refreshToken')) {
+    throw createError({ statusCode: 400, message: 'AT 和 RT 必须同时选择' })
+  }
+  return fields as AccountDeliveryField[]
+}
+
+export function parseAccountDeliveryText(value: unknown, configuredFields: unknown): AccountDeliveryLine[] {
+  if (typeof value !== 'string') throw createError({ statusCode: 400, message: '发货内容必须是文本' })
+  const selectedFields = deliveryFieldList(configuredFields)
   if (Buffer.byteLength(value, 'utf8') > 2 * 1024 * 1024) throw createError({ statusCode: 413, message: '发货内容不能超过 2 MiB' })
   const lines = value.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
   if (!lines.length) throw createError({ statusCode: 400, message: '发货内容不能为空' })
   if (lines.length > 1000) throw createError({ statusCode: 400, message: '单次最多导入 1000 个账号' })
   return lines.map((line, index) => {
-    const fingerprint = createHash('sha256').update(selectedFormat).update('\0').update(line).digest('hex')
+    const fingerprint = createHash('sha256').update(JSON.stringify(selectedFields)).update('\0').update(line).digest('hex')
     if (Buffer.byteLength(line, 'utf8') > 64 * 1024) {
       return { index, email: '', kind: 'invalid', record: null, message: '单行内容不能超过 64 KiB', fingerprint }
     }
     const fields = line.split('----').map(field => field.trim())
-    const email = fields[0] || ''
+    const values = Object.fromEntries(selectedFields.map((field, fieldIndex) => [field, fields[fieldIndex] || ''])) as Record<AccountDeliveryField, string>
+    const email = values.email || ''
     try {
+      if (fields.length !== selectedFields.length) {
+        throw createError({ statusCode: 400, message: `每行应包含 ${selectedFields.length} 个字段` })
+      }
       emailText(email)
-      if (selectedFormat === 'email_code_url' && fields.length === 2) {
-        const codeUrl = emailCodeUrl(fields[1])
-        if (!codeUrl) throw createError({ statusCode: 400, message: '邮箱验证码链接不能为空' })
-        return { index, email, kind: 'email_code_url', record: { email, password: '', emailCodeUrl: codeUrl }, message: null, fingerprint }
-      }
-      if (selectedFormat === 'tokens' && fields.length === 4) {
-        const password = accountPassword(fields[1], true)
-        const accessToken = accountSecret(fields[2], 'Access Token', 16_000)
-        const refreshToken = accountSecret(fields[3], 'Refresh Token', 16_000)
+      const password = selectedFields.includes('password') ? accountPassword(values.password, true) : ''
+      const emailLink = selectedFields.includes('emailCodeUrl') ? emailCodeUrl(values.emailCodeUrl) : ''
+      if (selectedFields.includes('emailCodeUrl') && !emailLink) throw createError({ statusCode: 400, message: '邮箱验证码地址不能为空' })
+      const totpSecret = selectedFields.includes('totpSecret') ? normalizeTotpSecret(values.totpSecret, true) : ''
+      const accessToken = selectedFields.includes('accessToken') ? accountSecret(values.accessToken, 'Access Token', 16_000) : ''
+      const refreshToken = selectedFields.includes('refreshToken') ? accountSecret(values.refreshToken, 'Refresh Token', 16_000) : ''
+      if (selectedFields.includes('accessToken')) {
         if (!accessToken || !refreshToken) throw createError({ statusCode: 400, message: 'Access Token 和 Refresh Token 不能为空' })
-        return { index, email, kind: 'tokens', record: { email, password, accessToken, refreshToken }, message: null, fingerprint }
       }
-      if (selectedFormat === 'password_totp' && fields.length === 3) {
-        const password = accountPassword(fields[1], true)
-        const totpSecret = normalizeTotpSecret(fields[2], true)
-        return { index, email, kind: 'password_totp', record: { email, password, totpSecret }, message: null, fingerprint }
+      return {
+        index,
+        email,
+        kind: 'custom',
+        record: { email, password, emailCodeUrl: emailLink, totpSecret, accessToken, refreshToken },
+        message: null,
+        fingerprint
       }
-      const formatMessage = selectedFormat === 'email_code_url'
-        ? '格式应为“邮箱----邮箱验证码链接”'
-        : selectedFormat === 'tokens'
-          ? '格式应为“邮箱----密码----AT----RT”'
-          : '格式应为“邮箱----密码----2FA密钥”'
-      throw createError({ statusCode: 400, message: formatMessage })
     } catch (error) {
       const message = error instanceof Error ? error.message : '发货格式不正确'
       return { index, email, kind: 'invalid', record: null, message, fingerprint }
@@ -459,8 +475,10 @@ function safeAccountImportError(error: unknown) {
     : '账号创建失败'
 }
 
-export async function importAccountDeliveryText(event: H3Event, value: unknown, format: unknown, actorId: string) {
-  const lines = parseAccountDeliveryText(value, format)
+export async function importAccountDeliveryText(event: H3Event, value: unknown, fields: unknown, source: unknown, actorId: string) {
+  const normalizedSource = enumText(source, accountSources, 'unknown' as AccountVaultSource, '账号来源')
+  if (normalizedSource === 'unknown') throw createError({ statusCode: 400, message: '请选择账号来源' })
+  const lines = parseAccountDeliveryText(value, fields)
   let created = 0
   let skipped = 0
   const failed: Array<{ index: number; email: string; message: string }> = []
@@ -477,7 +495,7 @@ export async function importAccountDeliveryText(event: H3Event, value: unknown, 
       continue
     }
     try {
-      await createAccountVaultEntry(event, line.record, actorId, sourceRef)
+      await createAccountVaultEntry(event, { ...line.record, source: normalizedSource }, actorId, sourceRef)
       created++
     } catch (error) {
       failed.push({ index: line.index, email: line.email, message: safeAccountImportError(error) })

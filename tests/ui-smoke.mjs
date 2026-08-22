@@ -152,7 +152,7 @@ try {
       if (target.name === 'admin') {
         const loginResult = await login.json()
         const selfReset = await context.request.post(`${baseUrl}/api/admin/users/${loginResult.user.id}/reset-password`, { data: { password: `Blocked-${randomUUID()}-password` } })
-        if (selfReset.status() !== 409) throw new Error(`self password reset must be rejected with HTTP 409, received ${selfReset.status()}`)
+        if (!selfReset.ok()) throw new Error(`self password reset should be accepted from user management, received ${selfReset.status()}`)
       }
       for (const path of target.pages) {
         const response = await page.goto(`${baseUrl}${path}`)
@@ -399,6 +399,10 @@ try {
           await accountEditTrigger.click()
           accountEditor = page.getByRole('dialog', { name: '编辑账号' })
           await accountEditor.waitFor()
+          if (await accountEditor.getByRole('tab').count()) throw new Error('account editor exposes creation-mode tabs')
+          if (!await accountEditor.locator('.account-editor-main').count() || !await accountEditor.locator('.account-editor-aside').count()) {
+            throw new Error('account editor does not preserve the split form layout')
+          }
           for (const removedField of ['购买日期', '质保日期', '质保状态']) {
             if (await accountEditor.getByText(removedField, { exact: true }).count()) {
               throw new Error(`account editor still exposes removed field: ${removedField}`)
@@ -413,16 +417,40 @@ try {
           await page.getByRole('button', { name: '新增账号', exact: true }).click()
           const accountCreator = page.getByRole('dialog', { name: '新增账号' })
           await accountCreator.waitFor()
-          if (!await accountCreator.getByRole('tab', { name: '手动新增' }).count() || !await accountCreator.getByRole('tab', { name: '发货文本' }).count()) {
-            throw new Error('account creator does not expose both mutually exclusive creation modes')
+          for (const mode of ['手动', '上传', '批量导入', '凭据转换']) {
+            if (!await accountCreator.getByRole('tab', { name: mode, exact: true }).count()) {
+              throw new Error(`account creator is missing the ${mode} creation mode`)
+            }
           }
-          if (!await accountCreator.getByRole('tab', { name: '表单新增' }).count() || !await accountCreator.getByRole('tab', { name: '上传新增' }).count()) {
-            throw new Error('manual account creator does not expose form and upload modes')
+          for (const removedMode of ['手动新增', '发货文本', '表单新增', '上传新增']) {
+            if (await accountCreator.getByRole('tab', { name: removedMode, exact: true }).count()) {
+              throw new Error(`account creator still exposes the removed ${removedMode} mode`)
+            }
           }
-          await accountCreator.getByRole('tab', { name: '上传新增' }).click()
+          if (await accountCreator.locator('.account-editor-main > .account-editor-tabs').count() !== 1) {
+            throw new Error('account creator tabs are not contained in the main form region')
+          }
+          const accountCreatorLayout = await accountCreator.locator('.account-editor-layout').evaluate((element) => ({
+            display: getComputedStyle(element).display,
+            overflow: element.closest('[role="dialog"]').scrollWidth - element.closest('[role="dialog"]').clientWidth
+          }))
+          const expectedAccountCreatorDisplay = viewport.width > 820 ? 'grid' : 'block'
+          if (accountCreatorLayout.display !== expectedAccountCreatorDisplay || accountCreatorLayout.overflow > 1) {
+            throw new Error(`account creator layout is invalid: ${JSON.stringify(accountCreatorLayout)}`)
+          }
+          await accountCreator.getByRole('tab', { name: '上传', exact: true }).click()
+          const subUploadDrop = accountCreator.locator('.credential-drop', { hasText: '选择 Sub2API 账号 JSON' })
+          const fileInputLayout = await subUploadDrop.locator('input[type="file"]').evaluate((element) => {
+            const style = getComputedStyle(element)
+            const rect = element.getBoundingClientRect()
+            return { position: style.position, opacity: style.opacity, width: rect.width, height: rect.height }
+          })
+          if (fileInputLayout.position !== 'absolute' || fileInputLayout.opacity !== '0' || fileInputLayout.width > 1.1 || fileInputLayout.height > 1.1) {
+            throw new Error(`account upload exposes the native file input: ${JSON.stringify(fileInputLayout)}`)
+          }
           const poolSelect = accountCreator.getByLabel('号池平台 *')
           await poolSelect.selectOption('cpa')
-          await accountCreator.getByText('选择认证文件（每个最大 2 MiB，最多 20 个）', { exact: true }).waitFor()
+          await accountCreator.getByText('选择 CPA 认证文件', { exact: true }).waitFor()
           if (await accountCreator.getByRole('button', { name: '导入 Sub2API', exact: true }).count()) throw new Error('Sub2API submit action is visible for the CPA pool')
           await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-cpa-upload.png`, fullPage: true })
           await poolSelect.selectOption('sub2api')
@@ -456,14 +484,14 @@ try {
             throw new Error('credential conversion preview exposes credentials')
           }
           await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-credential-converter.png`, fullPage: true })
-          await accountCreator.getByRole('tab', { name: '表单新增' }).click()
+          await accountCreator.getByRole('tab', { name: '手动', exact: true }).click()
           await accountCreator.getByLabel('邮箱 *').waitFor()
-          await accountCreator.getByRole('tab', { name: '发货文本' }).click()
-          const deliveryFormat = accountCreator.getByLabel('发货格式 *')
-          await deliveryFormat.selectOption('password_totp')
+          await accountCreator.getByRole('tab', { name: '批量导入', exact: true }).click()
+          await accountCreator.getByLabel('来源 *').selectOption('ldxp')
+          await accountCreator.getByText('2FA 密钥', { exact: true }).click()
           await accountCreator.locator('textarea').fill('totp@example.com----secret-password----MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7')
           await accountCreator.getByText('totp@example.com', { exact: true }).waitFor()
-          await accountCreator.locator('.vault-delivery-preview').getByText('邮箱 + 密码 + 2FA 密钥', { exact: true }).waitFor()
+          await accountCreator.locator('.vault-delivery-preview').getByText('账号 + 密码 + 2FA 密钥', { exact: true }).waitFor()
           if (await accountCreator.locator('.vault-delivery-preview', { hasText: 'secret-password' }).count() || await accountCreator.locator('.vault-delivery-preview', { hasText: 'MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7' }).count()) {
             throw new Error('delivery preview exposes imported credentials')
           }

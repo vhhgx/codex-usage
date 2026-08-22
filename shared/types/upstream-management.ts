@@ -24,6 +24,7 @@ export interface CpaAuthFileView {
 export interface SubAccountManagementView {
   id: string
   name: string
+  email?: string | null
   notes: string | null
   platform: string
   type: string

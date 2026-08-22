@@ -17,6 +17,7 @@ export default defineEventHandler(async (event) => {
       id: item.id,
       email: item.email,
       name: item.displayName || '',
+      source: item.source,
       status: item.status,
       password: credentials.password,
       accessToken: credentials.accessToken,
@@ -28,7 +29,8 @@ export default defineEventHandler(async (event) => {
       warrantyStatus: item.warrantyStatus,
       smsUrl,
       phone: item.smsReceiver?.phone || '',
-      remark: item.remark || ''
+      remark: item.remark || '',
+      createdAt: new Date(item.createdAt).toISOString()
     }
   }))
   await writeAudit(event, admin.userId, 'account_vault.export', 'account_vault_entry', null, { count: records.length, securityEvent: true })

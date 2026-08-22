@@ -1,8 +1,9 @@
 import { eq } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { useDatabase } from '../db'
-import { channelModels, channels, modelPools } from '../db/schema'
-import { decryptSecret } from '../utils/hub-crypto'
+import { channelModelBindings, channelModels, channelProtocolBindings, channels, modelPools } from '../db/schema'
+import { decryptChannelSecret } from '../utils/hub-crypto'
+import { pinnedUpstreamFetch } from '../utils/upstream-url'
 import type { ChannelModelView } from '#shared/types/hub'
 
 const MAX_DISCOVERED_MODELS = 2000
@@ -35,18 +36,30 @@ function upstreamBaseUrl(baseUrl: string) {
   return baseUrl.replace(/\/+$/, '').replace(/\/v1$/i, '')
 }
 
-export async function discoverUpstreamModelIds(baseUrl: string, apiKey: string, timeoutMs = 15000) {
+export async function discoverUpstreamModelIds(baseUrl: string, apiKey: string, timeoutMs = 15000, options: { authScheme?: 'bearer' | 'x_api_key'; apiVersion?: string | null; privateUrl?: boolean } = {}) {
   let response: Response
+  let close: (() => Promise<void>) | null = null
   try {
-    response = await fetch(`${upstreamBaseUrl(baseUrl)}/v1/models`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(Math.min(Math.max(timeoutMs, 1000), 15000))
-    })
+    const headers: Record<string, string> = options.authScheme === 'x_api_key'
+      ? { 'x-api-key': apiKey, 'anthropic-version': options.apiVersion || '2023-06-01' }
+      : { Authorization: `Bearer ${apiKey}` }
+    if (options.privateUrl) {
+      const result = await pinnedUpstreamFetch(baseUrl, '/v1/models', { headers, signal: AbortSignal.timeout(Math.min(Math.max(timeoutMs, 1000), 15000)) })
+      response = result.response as unknown as Response
+      close = result.close
+    } else {
+      response = await fetch(`${upstreamBaseUrl(baseUrl)}/v1/models`, {
+        headers,
+        redirect: 'manual',
+        signal: AbortSignal.timeout(Math.min(Math.max(timeoutMs, 1000), 15000))
+      })
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : '无法连接上游'
     throw createError({ statusCode: 502, message: `读取上游模型失败：${message}` })
   }
   const body = await response.text()
+  if (close) await close().catch(() => {})
   if (!response.ok) {
     throw createError({ statusCode: 502, message: `读取上游模型失败：HTTP ${response.status} ${body.slice(0, 300)}`.trim() })
   }
@@ -71,6 +84,18 @@ export async function persistDiscoveredModels(event: H3Event | undefined, channe
     endpoints: []
   }))).onConflictDoNothing().returning({ id: channelModels.id })
   await db.insert(modelPools).values(uniqueIds.map(publicModel => ({ publicModel }))).onConflictDoNothing()
+  const [models, protocols] = await Promise.all([
+    db.select().from(channelModels).where(eq(channelModels.channelId, channelId)),
+    db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, channelId))
+  ])
+  const bindings = models.flatMap(model => protocols.map(protocol => ({
+    channelModelId: model.id,
+    protocolBindingId: protocol.id,
+    upstreamModel: model.upstreamModel,
+    capabilities: { streaming: true, tools: true },
+    enabled: model.enabled && protocol.enabled
+  })))
+  if (bindings.length) await db.insert(channelModelBindings).values(bindings).onConflictDoNothing()
   return { discovered: uniqueIds.length, added: added.length }
 }
 
@@ -78,6 +103,12 @@ export async function syncChannelModelsFromUpstream(event: H3Event, channelId: s
   const db = useDatabase(event)
   const [channel] = await db.select().from(channels).where(eq(channels.id, channelId)).limit(1)
   if (!channel) throw createError({ statusCode: 404, message: '渠道不存在' })
-  const ids = await discoverUpstreamModelIds(channel.baseUrl, decryptSecret(channel.encryptedApiKey, event), channel.timeoutMs)
+  const [protocol] = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, channelId)).limit(1)
+  const ids = await discoverUpstreamModelIds(
+    protocol?.baseUrlOverride || channel.baseUrl,
+    decryptChannelSecret(channel.encryptedApiKey, channel.id, channel.ownerKind, event),
+    channel.timeoutMs,
+    { authScheme: protocol?.authScheme, apiVersion: protocol?.apiVersion, privateUrl: channel.ownerKind === 'user' }
+  )
   return { ...(await persistDiscoveredModels(event, channel.id, ids)), models: ids }
 }

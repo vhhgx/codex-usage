@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { IconChartHistogram, IconDatabase, IconGauge, IconKey, IconRoute, IconSpeakerphone, IconUsersGroup } from '@tabler/icons-vue'
+import { IconChartHistogram, IconDatabase, IconGauge, IconKey, IconRoute, IconServerBolt, IconSpeakerphone, IconUsersGroup, IconUserShield } from '@tabler/icons-vue'
 import type { AdminSessionView } from '#shared/types/hub'
 const session = useState<AdminSessionView | null>('auth-session', () => null)
 const loggingOut = ref(false)
@@ -8,6 +8,8 @@ const navigation = [
   { to: '/console/keys', label: '我的 Keys', icon: IconKey },
   { to: '/console/usage', label: '我的用量', icon: IconChartHistogram },
   { to: '/console/groups', label: '权限与额度', icon: IconUsersGroup },
+  { to: '/console/pool', label: '专属号池', icon: IconUserShield },
+  { to: '/console/relays', label: '我的中转', icon: IconServerBolt },
   { to: '/console/models', label: '可用模型', icon: IconRoute },
   { to: '/console/announcements', label: '公告', icon: IconSpeakerphone },
   { to: '/console/logs', label: '请求记录', icon: IconDatabase }

@@ -54,6 +54,13 @@ export function smsPhonePresentation(value: string) {
   }
 }
 
+export function isSmsReceiverReadyForDeletion(
+  bindings: Array<{ accountId: string | null; deletedAt: Date | null }>
+) {
+  return bindings.length === MAX_SMS_RECEIVER_BINDINGS
+    && bindings.every(binding => Boolean(binding.deletedAt))
+}
+
 function smsContext(id: string) {
   return `sms-receiver:${id}:fetch-url`
 }
@@ -363,13 +370,15 @@ export async function listSmsReceivers(event: H3Event): Promise<SmsReceiverView[
   ])
   return receivers.map(receiver => {
     const presentedPhone = smsPhonePresentation(receiver.phone)
-    const accounts = bindings.filter(item => item.receiverId === receiver.id).map(item => ({
+    const receiverBindings = bindings.filter(item => item.receiverId === receiver.id)
+    const accounts = receiverBindings.map(item => ({
       bindingId: item.bindingId,
       id: item.accountId || `deleted:${item.bindingId}`,
       email: item.email,
       displayName: item.displayName,
       slot: item.slot,
-      deleted: Boolean(item.deletedAt || !item.accountId)
+      deleted: Boolean(item.deletedAt),
+      manual: Boolean(!item.accountId && !item.deletedAt)
     })).sort((left, right) => left.slot - right.slot)
     return {
       id: receiver.id,
@@ -380,6 +389,7 @@ export async function listSmsReceivers(event: H3Event): Promise<SmsReceiverView[
       status: receiver.status as 'active' | 'disabled',
       bindingCount: accounts.length,
       availableSlots: MAX_SMS_RECEIVER_BINDINGS - accounts.length,
+      readyForDeletion: isSmsReceiverReadyForDeletion(receiverBindings),
       accounts,
       lastFetchedAt: receiver.lastFetchedAt?.getTime() || null,
       lastFetchStatus: receiver.lastFetchStatus,
@@ -541,9 +551,13 @@ export async function updateSmsReceiver(event: H3Event, id: string, body: Unknow
 
 export async function deleteSmsReceiver(event: H3Event, id: string) {
   const receiver = await receiverRow(event, id)
-  const [binding] = await useDatabase(event).select({ id: smsReceiverBindings.id }).from(smsReceiverBindings)
-    .where(eq(smsReceiverBindings.receiverId, id)).limit(1)
-  if (binding) throw createError({ statusCode: 409, message: '接码资源仍绑定账号，请先解除全部绑定' })
+  const bindings = await useDatabase(event).select({
+    accountId: smsReceiverBindings.accountId,
+    deletedAt: smsReceiverBindings.deletedAt
+  }).from(smsReceiverBindings).where(eq(smsReceiverBindings.receiverId, id))
+  if (bindings.length && !isSmsReceiverReadyForDeletion(bindings)) {
+    throw createError({ statusCode: 409, message: '接码资源仍绑定有效账号，请先解除全部绑定' })
+  }
   await useDatabase(event).delete(smsReceivers).where(eq(smsReceivers.id, id))
   return { id, phone: receiver.phone }
 }
@@ -562,7 +576,37 @@ export async function deleteSmsReceiverBinding(event: H3Event, receiverId: strin
     receiverId: binding.receiverId,
     accountId: binding.accountId,
     email: binding.accountEmail,
-    deletedAccount: Boolean(binding.deletedAt || !binding.accountId)
+    deletedAccount: Boolean(binding.deletedAt)
+  }
+}
+
+export async function addManualSmsReceiverBinding(event: H3Event, receiverId: string, body: UnknownRecord, actorId: string) {
+  const db = useDatabase(event)
+  await db.execute(sql`select pg_advisory_xact_lock(hashtext('zephyr_sms_receiver_allocation'))`)
+  const receiver = await receiverRow(event, receiverId)
+  if (receiver.status !== 'active') throw createError({ statusCode: 409, message: '停用的接码资源不能添加占用' })
+  const used = await db.select({ slot: smsReceiverBindings.slot }).from(smsReceiverBindings)
+    .where(eq(smsReceiverBindings.receiverId, receiverId))
+  const slot = firstAvailableSmsSlot(used.map(item => item.slot))
+  if (!slot) throw createError({ statusCode: 409, message: '这个手机号已经绑定 3 个账号，请先解除一个占用' })
+  const email = text(body.email, '绑定账号标识', 320, true)
+  const displayName = text(body.displayName, '账号名称', 200) || null
+  try {
+    const [created] = await db.insert(smsReceiverBindings).values({
+      receiverId,
+      accountId: null,
+      accountEmail: email,
+      accountDisplayName: displayName,
+      slot,
+      createdBy: actorId
+    }).returning()
+    if (!created) throw createError({ statusCode: 500, message: '添加手动占用失败' })
+    return created
+  } catch (error) {
+    if ((error as { code?: string }).code === '23505') {
+      throw createError({ statusCode: 409, message: '接码资源的名额刚刚已被占用，请刷新后重试' })
+    }
+    throw error
   }
 }
 

@@ -1,0 +1,2 @@
+ALTER TABLE "usage_rollups" DROP CONSTRAINT "usage_rollups_dimensions_unique";--> statement-breakpoint
+ALTER TABLE "usage_rollups" ADD CONSTRAINT "usage_rollups_dimensions_unique" UNIQUE NULLS NOT DISTINCT("bucket_start","granularity","key_id","user_id","group_id","model","endpoint","status","channel_id","supply_source","pool_group_id","subscription_id","plan_version_id");

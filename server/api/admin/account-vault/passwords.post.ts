@@ -8,7 +8,9 @@ export default defineEventHandler(async (event) => {
   setResponseHeaders(event, { 'cache-control': 'no-store, private', pragma: 'no-cache' })
   try {
     const items = await revealAccountVaultPasswords(event)
-    await writeAudit(event, admin.userId, 'account_vault.passwords_view', 'account_vault_entry', null, { count: items.length })
+    await writeAudit(event, admin.userId, 'account_vault.passwords_view', 'account_vault_entry', null, {
+      count: items.length
+    })
     return { items }
   } catch (error) {
     await writeAudit(event, admin.userId, 'account_vault.passwords_view_failed', 'account_vault_entry', null, { securityEvent: true })

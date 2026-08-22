@@ -158,7 +158,7 @@ body.workspace-drawer-open { overflow: hidden; }
 .workspace-menu { display: none; }
 
 .workspace-nav {
-  margin-top: var(--hub-space-5);
+  margin-top: calc(var(--hub-space-8) + var(--hub-space-3));
   display: grid;
   gap: var(--hub-space-4);
 }
@@ -288,6 +288,18 @@ body.workspace-drawer-open { overflow: hidden; }
 }
 .workspace-main.admin-main { padding-bottom: 0; }
 
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
 .workspace-overlay { display: none; }
 
 .button {
@@ -363,7 +375,7 @@ body.workspace-drawer-open { overflow: hidden; }
 .admin-page {
   width: min(100% - calc(var(--hub-page-gutter) * 2), var(--hub-content-max));
   margin-inline: auto;
-  padding: var(--hub-space-8) 0 4rem;
+  padding: calc(var(--hub-space-8) + var(--hub-space-2)) 0 4rem;
 }
 
 .admin-page__header {
@@ -570,6 +582,49 @@ body.workspace-drawer-open { overflow: hidden; }
 .log-drawer-backdrop { background: var(--hub-overlay-scrim); backdrop-filter: var(--hub-blur-overlay); }
 .admin-modal { color: var(--hub-text); border: 1px solid var(--hub-line-strong); background: var(--hub-solid-surface); box-shadow: var(--hub-panel-highlight), var(--hub-panel-shadow); }
 .admin-modal > header { border-color: var(--hub-line); background: var(--hub-solid-surface); }
+
+/* Shared Kimi layer motion: page dialogs and drawers use the same enter/leave rhythm. */
+.admin-modal-backdrop,
+.log-drawer-backdrop {
+  transition: opacity var(--hub-motion-overlay-duration) var(--hub-motion-ease), visibility 0s linear var(--hub-motion-overlay-duration);
+}
+.admin-modal,
+.log-drawer {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  transition: opacity var(--hub-motion-panel-duration) var(--hub-motion-ease), transform var(--hub-motion-panel-duration) var(--hub-motion-ease);
+}
+.log-drawer { transform: translateX(0); }
+.hub-layer-enter-active,
+.hub-layer-leave-active { transition: opacity var(--hub-motion-overlay-duration) var(--hub-motion-ease); }
+.hub-layer-enter-from,
+.hub-layer-leave-to { opacity: 0; }
+.hub-layer-enter-active .hub-layer-panel,
+.hub-layer-leave-active .hub-layer-panel { transition: opacity var(--hub-motion-panel-duration) var(--hub-motion-ease), transform var(--hub-motion-panel-duration) var(--hub-motion-ease); }
+.hub-layer-enter-from .hub-layer-panel,
+.hub-layer-leave-to .hub-layer-panel { opacity: 0; transform: translateY(var(--hub-motion-distance)) scale(.985); }
+.hub-layer-enter-from .hub-drawer-panel,
+.hub-layer-leave-to .hub-drawer-panel { transform: translateX(var(--hub-motion-drawer-distance)); }
+@starting-style {
+  .admin-modal-backdrop,
+  .log-drawer-backdrop { opacity: 0; }
+  .admin-modal-backdrop .admin-modal { opacity: 0; transform: translateY(var(--hub-motion-distance)) scale(.985); }
+  .log-drawer-backdrop .log-drawer { opacity: 0; transform: translateX(var(--hub-motion-drawer-distance)); }
+}
+.confirm-dialog {
+  opacity: 0;
+  transform: translateY(var(--hub-motion-distance)) scale(.985);
+  transition: opacity var(--hub-motion-panel-duration) var(--hub-motion-ease), transform var(--hub-motion-panel-duration) var(--hub-motion-ease), display var(--hub-motion-panel-duration) allow-discrete, overlay var(--hub-motion-panel-duration) allow-discrete;
+}
+.confirm-dialog[open] { opacity: 1; transform: translateY(0) scale(1); }
+.confirm-dialog::backdrop { opacity: 0; background: transparent; transition: opacity var(--hub-motion-overlay-duration) var(--hub-motion-ease), background-color var(--hub-motion-overlay-duration) var(--hub-motion-ease); }
+.confirm-dialog[open]::backdrop { opacity: 1; background: var(--hub-overlay-scrim); }
+@starting-style {
+  .confirm-dialog[open] { opacity: 0; transform: translateY(var(--hub-motion-distance)) scale(.985); }
+  .confirm-dialog[open]::backdrop { opacity: 0; background: transparent; }
+}
+.app-toast { animation: hub-toast-in var(--hub-motion-panel-duration) var(--hub-motion-ease) both; }
+@keyframes hub-toast-in { from { opacity: 0; transform: translateY(var(--hub-motion-distance)); } to { opacity: 1; transform: translateY(0); } }
 .expiry-presets button,
 .endpoint-picker span,
 .group-picker span { color: var(--hub-text-muted); border-color: var(--hub-line-strong); background: var(--hub-input-bg); }

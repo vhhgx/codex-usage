@@ -1,0 +1,2 @@
+ALTER TABLE "account_vault_entries" ADD COLUMN "source" text DEFAULT 'unknown' NOT NULL;--> statement-breakpoint
+CREATE INDEX "account_vault_source_idx" ON "account_vault_entries" USING btree ("source");

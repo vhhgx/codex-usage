@@ -5,7 +5,7 @@ export default defineEventHandler(async (event) => {
   const admin = await requireAdmin(event)
   const body = await readBody<Record<string, unknown>>(event)
   return auditedMutation(event, async () => {
-    const channel = await createChannelRecord(event, body || {})
+    const channel = await createChannelRecord(event, body || {}, admin.userId)
     await writeAudit(event, admin.userId, 'channel.create', 'channel', channel.id, { name: channel.name, type: channel.type })
     return channel
   })

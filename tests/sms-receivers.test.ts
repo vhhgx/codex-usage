@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   firstAvailableSmsSlot,
+  isSmsReceiverReadyForDeletion,
   leastLoadedSmsReceiver,
   normalizeSmsPhone,
   parseSmsReceiverImportText,
@@ -33,6 +34,17 @@ describe('SMS receiver normalization', () => {
     expect(firstAvailableSmsSlot([])).toBe(1)
     expect(firstAvailableSmsSlot([1, 3])).toBe(2)
     expect(firstAvailableSmsSlot([1, 2, 3])).toBeUndefined()
+  })
+
+  it('marks a fully used receiver for deletion only after all three accounts are deleted', () => {
+    const deletedBinding = { accountId: null, deletedAt: new Date('2026-08-13T00:00:00Z') }
+    expect(isSmsReceiverReadyForDeletion([deletedBinding, deletedBinding, deletedBinding])).toBe(true)
+    expect(isSmsReceiverReadyForDeletion([deletedBinding, deletedBinding])).toBe(false)
+    expect(isSmsReceiverReadyForDeletion([
+      deletedBinding,
+      deletedBinding,
+      { accountId: 'active-account', deletedAt: null }
+    ])).toBe(false)
   })
 
   it('assigns the least-loaded active receiver and excludes full receivers', () => {

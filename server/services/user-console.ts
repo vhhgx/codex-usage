@@ -9,6 +9,7 @@ import { startOfZoned } from '../utils/time-zone'
 import { beginHubKeyDeletion, cancelHubKeyDeletion } from './hub-limits'
 import { deleteHubKeyPreservingRollups } from './hub-deletion'
 import { assignDefaultGroup, DEFAULT_GROUP_ID, ensureDefaultSubscription, getUserPlan, listAnnouncements } from './customer-management'
+import { assertUserChannelAccess, visibleChannels } from './channel-access'
 
 function number(value: unknown) { return Number(value || 0) }
 
@@ -17,12 +18,15 @@ export async function listUserKeys(event: H3Event, userId: string) {
 }
 
 export async function createUserKey(event: H3Event, userId: string, body: Record<string, unknown>) {
-  const allowed = new Set(['name', 'note', 'key'])
+  const allowed = new Set(['name', 'note', 'key', 'routeMode', 'channelIds'])
   const invalid = Object.keys(body).filter(key => !allowed.has(key))
   if (invalid.length) throw createError({ statusCode: 400, message: `用户不能设置字段：${invalid.join(', ')}` })
   await assignDefaultGroup(event, userId)
   await ensureDefaultSubscription(event, userId)
-  return createHubKeyRecord(event, { name: body.name, note: body.note, key: body.key, ownerUserId: userId, groupId: DEFAULT_GROUP_ID }, userId)
+  const channelIds = Array.isArray(body.channelIds) ? [...new Set(body.channelIds.filter((id): id is string => typeof id === 'string'))] : []
+  await assertUserChannelAccess(event, userId, channelIds)
+  const routeMode = body.routeMode === 'private_only' ? 'private_only' : 'platform_only'
+  return createHubKeyRecord(event, { name: body.name, note: body.note, key: body.key, routeMode, channelIds, ownerUserId: userId, groupId: DEFAULT_GROUP_ID }, userId)
 }
 
 export async function getUserKey(event: H3Event, userId: string, id: string) {
@@ -35,11 +39,24 @@ export async function getUserKey(event: H3Event, userId: string, id: string) {
 
 export async function updateUserKey(event: H3Event, userId: string, id: string, body: Record<string, unknown>) {
   await getUserKey(event, userId, id)
-  const allowed = new Set(['name', 'note', 'status'])
+  const allowed = new Set(['name', 'note', 'status', 'routeMode', 'channelIds'])
   const invalid = Object.keys(body).filter(key => !allowed.has(key))
   if (invalid.length) throw createError({ statusCode: 400, message: `用户不能修改字段：${invalid.join(', ')}` })
   if ('status' in body && body.status !== 'active' && body.status !== 'disabled') throw createError({ statusCode: 400, message: 'Key 状态不正确' })
+  if ('routeMode' in body && body.routeMode !== 'platform_only' && body.routeMode !== 'private_only') throw createError({ statusCode: 400, message: '用户只能选择平台或私有中转路由' })
+  if ('channelIds' in body) {
+    const channelIds = Array.isArray(body.channelIds) ? [...new Set(body.channelIds.filter((channelId): channelId is string => typeof channelId === 'string'))] : []
+    await assertUserChannelAccess(event, userId, channelIds)
+    body = { ...body, channelIds }
+  }
   return updateHubKeyRecord(event, id, body)
+}
+
+export async function updateUserKeyChannels(event: H3Event, userId: string, id: string, channelIds: string[], routeMode: 'platform_only' | 'private_only') {
+  await getUserKey(event, userId, id)
+  const uniqueIds = [...new Set(channelIds)]
+  await assertUserChannelAccess(event, userId, uniqueIds)
+  return updateHubKeyRecord(event, id, { channelIds: uniqueIds, routeMode })
 }
 
 export async function revealUserKey(event: H3Event, userId: string, id: string) {
@@ -147,6 +164,9 @@ export async function getUserUsage(event: H3Event, userId: string) {
 
 export async function getUserModels(event: H3Event, userId: string) {
   const db = useDatabase(event)
+  const visible = await visibleChannels(event, userId)
+  const visibleIds = visible.map(channel => channel.id)
+  if (!visibleIds.length) return []
   const memberships = await db.select({ groupId: groups.id, groupEndpoints: groups.allowedEndpoints }).from(groupMemberships)
     .innerJoin(groups, and(eq(groupMemberships.groupId, groups.id), eq(groups.status, 'active')))
     .where(eq(groupMemberships.userId, userId))
@@ -155,11 +175,11 @@ export async function getUserModels(event: H3Event, userId: string) {
   const [modelRules, channelRules, modelRows, priceRows] = await Promise.all([
     db.select().from(groupModelRules).where(inArray(groupModelRules.groupId, groupIds)),
     db.select().from(groupChannelRules).where(inArray(groupChannelRules.groupId, groupIds)),
-    db.select({ publicModel: channelModels.publicModel, endpoints: channelModels.endpoints, channelId: channels.id }).from(channelModels).innerJoin(channels, eq(channelModels.channelId, channels.id)).where(and(eq(channelModels.enabled, true), eq(channels.enabled, true), eq(channels.healthStatus, 'healthy'))),
+    db.select({ publicModel: channelModels.publicModel, endpoints: channelModels.endpoints, channelId: channels.id }).from(channelModels).innerJoin(channels, eq(channelModels.channelId, channels.id)).where(and(eq(channelModels.enabled, true), eq(channels.enabled, true), eq(channels.healthStatus, 'healthy'), inArray(channels.id, visibleIds))),
     db.select().from(modelPrices).where(lte(modelPrices.effectiveAt, new Date())).orderBy(desc(modelPrices.effectiveAt))
   ])
   const result = new Map<string, Set<string>>()
-  const endpointUniverse = ['/v1/models', '/v1/chat/completions', '/v1/responses', '/v1/embeddings', '/v1/images/generations', '/v1/images/edits']
+  const endpointUniverse = ['/v1/models', '/v1/messages', '/v1/chat/completions', '/v1/responses', '/v1/embeddings', '/v1/images/generations', '/v1/images/edits']
   for (const membership of memberships) {
     const groupId = membership.groupId
     const allowedModels = new Set(modelRules.filter(rule => rule.groupId === groupId).map(rule => rule.publicModel))

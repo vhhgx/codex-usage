@@ -29,10 +29,11 @@ export function encryptSecret(value: string, event?: H3Event) {
 
 export function decryptSecret(value: string, event?: H3Event) {
   const [version, ivRaw, tagRaw, bodyRaw] = value.split('.')
-  if (version !== 'v1' || !ivRaw || !tagRaw || !bodyRaw) throw new Error('不支持的加密数据格式')
+  if (version !== 'v1' || !ivRaw || !tagRaw || bodyRaw === undefined) throw new Error('不支持的加密数据格式')
   const decipher = createDecipheriv('aes-256-gcm', secretEncryptionKey(event), decodeCanonicalBase64Url(ivRaw, 12))
   decipher.setAuthTag(decodeCanonicalBase64Url(tagRaw, 16))
-  return Buffer.concat([decipher.update(decodeCanonicalBase64Url(bodyRaw)), decipher.final()]).toString('utf8')
+  const body = bodyRaw ? decodeCanonicalBase64Url(bodyRaw) : Buffer.alloc(0)
+  return Buffer.concat([decipher.update(body), decipher.final()]).toString('utf8')
 }
 
 function secretContextAad(context: string) {
@@ -51,11 +52,20 @@ export function encryptContextSecret(value: string, context: string, event?: H3E
 
 export function decryptContextSecret(value: string, context: string, event?: H3Event) {
   const [version, ivRaw, tagRaw, bodyRaw] = value.split('.')
-  if (version !== 'v2' || !ivRaw || !tagRaw || !bodyRaw) throw new Error('不支持的上下文加密数据格式')
+  if (version !== 'v2' || !ivRaw || !tagRaw || bodyRaw === undefined) throw new Error('不支持的上下文加密数据格式')
   const decipher = createDecipheriv('aes-256-gcm', secretEncryptionKey(event), decodeCanonicalBase64Url(ivRaw, 12))
   decipher.setAAD(secretContextAad(context))
   decipher.setAuthTag(decodeCanonicalBase64Url(tagRaw, 16))
-  return Buffer.concat([decipher.update(decodeCanonicalBase64Url(bodyRaw)), decipher.final()]).toString('utf8')
+  const body = bodyRaw ? decodeCanonicalBase64Url(bodyRaw) : Buffer.alloc(0)
+  return Buffer.concat([decipher.update(body), decipher.final()]).toString('utf8')
+}
+
+export function encryptChannelSecret(value: string, channelId: string, ownerKind: 'platform' | 'user', event?: H3Event) {
+  return ownerKind === 'user' ? encryptContextSecret(value, `user-relay:${channelId}`, event) : encryptSecret(value, event)
+}
+
+export function decryptChannelSecret(value: string, channelId: string, ownerKind: 'platform' | 'user', event?: H3Event) {
+  return ownerKind === 'user' ? decryptContextSecret(value, `user-relay:${channelId}`, event) : decryptSecret(value, event)
 }
 
 function hubPepper(event?: H3Event) {
@@ -153,4 +163,21 @@ export function hashClientIp(value: string, event?: H3Event) {
 
 export function contentHash(value: Buffer | string) {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  return `{${Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`
+}
+
+export function hashCacheAffinity(event: H3Event, input: { scope: string; protocol: string; model: string; system?: unknown; tools?: unknown; sessionId?: string | null }) {
+  return createHmac('sha256', hubPepper(event)).update(stableJson({
+    scope: input.scope,
+    protocol: input.protocol,
+    model: input.model,
+    system: input.system || null,
+    tools: input.tools || null,
+    sessionId: input.sessionId || null
+  })).digest('hex')
 }

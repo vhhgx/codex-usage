@@ -1,4 +1,6 @@
 export const ACCOUNT_VAULT_STATUSES = ['Codex', '已登录', '仅Web', '已过期', '已封禁', '接码失效'] as const
+export const ACCOUNT_VAULT_SOURCES = ['ldxp', 'nvtoken', 'other', 'unknown'] as const
+export const ACCOUNT_DELIVERY_FIELDS = ['email', 'password', 'totpSecret', 'emailCodeUrl', 'accessToken', 'refreshToken'] as const
 export const WARRANTY_STATUSES = ['有质保', '无质保'] as const
 export const LEDGER_TRANSACTION_TYPES = [
   'personal_expense',
@@ -9,11 +11,12 @@ export const LEDGER_TRANSACTION_TYPES = [
 ] as const
 
 export type AccountVaultStatus = typeof ACCOUNT_VAULT_STATUSES[number]
+export type AccountVaultSource = typeof ACCOUNT_VAULT_SOURCES[number]
+export type AccountDeliveryField = typeof ACCOUNT_DELIVERY_FIELDS[number]
 export type WarrantyStatus = typeof WARRANTY_STATUSES[number]
 export type LedgerTransactionType = typeof LEDGER_TRANSACTION_TYPES[number]
 export type AccountCredentialKind = 'password' | 'email_code_url' | 'tokens'
 export type AccountSub2ApiPoolStatus = 'not_added' | 'active' | 'deleted'
-export type AccountDeliveryFormat = 'email_code_url' | 'tokens' | 'password_totp'
 
 export interface AccountSmsReceiverView {
   id: string
@@ -31,6 +34,7 @@ export interface AccountVaultView {
   id: string
   email: string
   displayName: string | null
+  source: AccountVaultSource
   status: AccountVaultStatus
   credentialKind: AccountCredentialKind
   hasEmailCodeUrl: boolean
@@ -59,7 +63,8 @@ export interface SmsReceiverView {
   status: 'active' | 'disabled'
   bindingCount: number
   availableSlots: number
-  accounts: Array<{ bindingId: string; id: string; email: string; displayName: string | null; slot: number; deleted: boolean }>
+  readyForDeletion: boolean
+  accounts: Array<{ bindingId: string; id: string; email: string; displayName: string | null; slot: number; deleted: boolean; manual: boolean }>
   lastFetchedAt: number | null
   lastFetchStatus: string | null
   lastFetchError: string | null

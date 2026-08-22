@@ -87,6 +87,14 @@ export async function overview(event: H3Event, query: Record<string, string | un
     successes: sql<number>`count(*) filter (where ${requestLogs.status} = 'success')`,
     failures: sql<number>`count(*) filter (where ${requestLogs.status} != 'success')`,
     totalTokens: sql<number>`coalesce(sum(${requestLogs.totalTokens}), 0)`,
+    inputTokens: sql<number>`coalesce(sum(${requestLogs.inputTokens}), 0)`,
+    cacheReadTokens: sql<number>`coalesce(sum(${requestLogs.cachedTokens}), 0)`,
+    cacheCreationTokens: sql<number>`coalesce(sum(${requestLogs.cacheCreationTokens}), 0)`,
+    cacheHitRequests: sql<number>`count(*) filter (where ${requestLogs.cachedTokens} > 0)`,
+    cacheEligibleRequests: sql<number>`count(*) filter (where ${requestLogs.inputTokens} > 0)`,
+    affinityReuses: sql<number>`count(*) filter (where ${requestLogs.cacheAffinityReused} = true)`,
+    affinityEligibleRequests: sql<number>`count(*) filter (where ${requestLogs.requestedModel} is not null)`,
+    affinityFailovers: sql<number>`count(*) filter (where ${requestLogs.cacheAffinityReused} = true and ${requestLogs.failoverCount} > 0)`,
     cost: sql<string>`coalesce(sum(${requestLogs.cost}), 0)`,
     duration: sql<number>`coalesce(avg(${requestLogs.durationMs}), 0)`,
     p95: sql<number>`percentile_cont(0.95) within group (order by ${requestLogs.durationMs}) filter (where ${requestLogs.durationMs} is not null)`,
@@ -164,6 +172,9 @@ export async function overview(event: H3Event, query: Record<string, string | un
   const requests = number(totals?.requests)
   const successes = number(totals?.successes)
   const streamingRequests = number(totals?.streamingRequests)
+  const inputTokens = number(totals?.inputTokens)
+  const cacheEligibleRequests = number(totals?.cacheEligibleRequests)
+  const affinityEligibleRequests = number(totals?.affinityEligibleRequests)
   return {
     range: { from: range.from.getTime(), to: range.to.getTime(), preset: range.preset },
     totals: {
@@ -177,7 +188,13 @@ export async function overview(event: H3Event, query: Record<string, string | un
       p95FirstByteMs: number(totals?.p95FirstByte) || null,
       streamAbortRate: streamingRequests ? number(totals?.streamAborts) / streamingRequests * 100 : null,
       successRate: requests ? successes / requests * 100 : null,
-      failovers: number(totals?.failovers)
+      failovers: number(totals?.failovers),
+      cacheReadTokens: number(totals?.cacheReadTokens),
+      cacheCreationTokens: number(totals?.cacheCreationTokens),
+      tokenCacheHitRate: inputTokens ? number(totals?.cacheReadTokens) / inputTokens * 100 : null,
+      requestCacheHitRate: cacheEligibleRequests ? number(totals?.cacheHitRequests) / cacheEligibleRequests * 100 : null,
+      affinityReuseRate: affinityEligibleRequests ? number(totals?.affinityReuses) / affinityEligibleRequests * 100 : null,
+      affinityFailovers: number(totals?.affinityFailovers)
     },
     timeline: timelineRows.map(row => ({ timestamp: number(row.bucket), requests: number(row.requests), tokens: number(row.tokens), cost: number(row.cost), failures: number(row.failures) })),
     models: modelRows.map(row => ({ model: row.model || 'unknown', requests: number(row.requests), tokens: number(row.tokens), cost: number(row.cost) })),
@@ -222,6 +239,14 @@ async function overviewRollupRange(
     successes: sql<number>`coalesce(sum(${usageRollups.successes}), 0)`,
     failures: sql<number>`coalesce(sum(${usageRollups.failures}), 0)`,
     totalTokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}), 0)`,
+    inputTokens: sql<number>`coalesce(sum(${usageRollups.inputTokens}), 0)`,
+    cacheReadTokens: sql<number>`coalesce(sum(${usageRollups.cachedTokens}), 0)`,
+    cacheCreationTokens: sql<number>`coalesce(sum(${usageRollups.cacheCreationTokens}), 0)`,
+    cacheHitRequests: sql<number>`coalesce(sum(${usageRollups.cacheHitRequests}), 0)`,
+    cacheEligibleRequests: sql<number>`coalesce(sum(${usageRollups.cacheEligibleRequests}), 0)`,
+    affinityReuses: sql<number>`coalesce(sum(${usageRollups.affinityReuses}), 0)`,
+    affinityEligibleRequests: sql<number>`coalesce(sum(${usageRollups.requests}), 0)`,
+    affinityFailovers: sql<number>`coalesce(sum(${usageRollups.affinityFailovers}), 0)`,
     cost: sql<string>`coalesce(sum(${usageRollups.cost}), 0)`,
     duration: sql<number>`coalesce(sum(${usageRollups.durationMs}), 0)`,
     latencyCount: sql<number>`coalesce(sum(${usageRollups.latencyCount}), 0)`,
@@ -298,11 +323,14 @@ async function overviewRollupRange(
   ))).filter(Boolean).length
   const requests = number(totals?.requests)
   const successes = number(totals?.successes)
+  const inputTokens = number(totals?.inputTokens)
+  const cacheEligibleRequests = number(totals?.cacheEligibleRequests)
+  const affinityEligibleRequests = number(totals?.affinityEligibleRequests)
   const from = requestedRange?.from.getTime() ?? timelineRows[0]?.bucket?.getTime() ?? Date.now()
   const to = requestedRange?.to.getTime() ?? Date.now()
   return {
     range: { from, to, preset: requestedRange?.preset || 'all' },
-    totals: { requests, successes, failures: number(totals?.failures), totalTokens: number(totals?.totalTokens), cost: number(totals?.cost), averageLatencyMs: requests ? number(totals?.duration) / requests : null, p95LatencyMs: rollupP95(totals), p95FirstByteMs: null, streamAbortRate: null, successRate: requests ? successes / requests * 100 : null, failovers: number(totals?.failovers) },
+    totals: { requests, successes, failures: number(totals?.failures), totalTokens: number(totals?.totalTokens), cost: number(totals?.cost), averageLatencyMs: requests ? number(totals?.duration) / requests : null, p95LatencyMs: rollupP95(totals), p95FirstByteMs: null, streamAbortRate: null, successRate: requests ? successes / requests * 100 : null, failovers: number(totals?.failovers), cacheReadTokens: number(totals?.cacheReadTokens), cacheCreationTokens: number(totals?.cacheCreationTokens), tokenCacheHitRate: inputTokens ? number(totals?.cacheReadTokens) / inputTokens * 100 : null, requestCacheHitRate: cacheEligibleRequests ? number(totals?.cacheHitRequests) / cacheEligibleRequests * 100 : null, affinityReuseRate: affinityEligibleRequests ? number(totals?.affinityReuses) / affinityEligibleRequests * 100 : null, affinityFailovers: number(totals?.affinityFailovers) },
     timeline: timelineRows.map(row => ({ timestamp: row.bucket.getTime(), requests: number(row.requests), tokens: number(row.tokens), cost: number(row.cost), failures: number(row.failures) })),
     models: modelRows.map(row => ({ model: row.model || 'unknown', requests: number(row.requests), tokens: number(row.tokens), cost: number(row.cost) })),
     endpoints: endpointRows.map(row => ({ endpoint: row.endpoint, requests: number(row.requests), failures: number(row.failures), cost: number(row.cost) })),
