@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash, createHmac } from 'node:crypto'
 import { once } from 'node:events'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { CreateBucketCommand, DeleteBucketCommand, DeleteObjectsCommand, HeadObjectCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3'
 import Redis from 'ioredis'
@@ -20,6 +23,7 @@ const adminUsername = 'hub-e2e-admin'
 const adminPassword = 'hub-e2e-password-2026'
 const origin = 'http://127.0.0.1'
 const imageBytes = Buffer.from([0, 255, 13, 10, 45, 45, 42, 7, 128, 1, 2, 3, 254])
+let appOutputForFailure = []
 
 function readBody(request) {
   return new Promise((resolve, reject) => {
@@ -59,6 +63,32 @@ function createUpstream(role, state) {
       body
     }
     state.captures.push(capture)
+
+    if (path === '/v1/messages') {
+      const payload = JSON.parse(body.toString('utf8'))
+      state.anthropicMessages = (state.anthropicMessages || 0) + 1
+      if (payload.stream === true) {
+        response.writeHead(200, { 'content-type': 'text/event-stream' })
+        response.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg-native-e2e","type":"message","role":"assistant","model":"upstream-anthropic","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"cache_read_input_tokens":2,"cache_creation_input_tokens":1,"output_tokens":0}}}\n\n')
+        response.write('event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n')
+        response.write('event: ping\ndata: {"type":"ping"}\n\n')
+        response.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"native anthropic ok"}}\n\n')
+        response.write('event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n')
+        response.write('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":4}}\n\n')
+        response.end('event: message_stop\ndata: {"type":"message_stop"}\n\n')
+        return
+      }
+      return json(response, 200, {
+        type: 'message',
+        id: 'msg-native-e2e',
+        role: 'assistant',
+        model: payload.model,
+        content: [{ type: 'text', text: 'native anthropic ok' }],
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        usage: { input_tokens: 3, cache_read_input_tokens: 2, cache_creation_input_tokens: 1, output_tokens: 2 }
+      })
+    }
 
     if (path === '/v1/chat/completions') {
       const payload = JSON.parse(body.toString('utf8'))
@@ -123,10 +153,18 @@ function createUpstream(role, state) {
         if (!response.destroyed) response.end()
         return
       }
+      const responseId = 'resp_e2e_cli'
+      const item = { id: 'msg_e2e_cli', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', annotations: [], logprobs: [], text: 'hello' }] }
+      response.write(`event: response.created\ndata: ${JSON.stringify({ type: 'response.created', sequence_number: 0, response: { id: responseId, object: 'response', created_at: Math.floor(Date.now() / 1000), status: 'in_progress', model: payload.model, output: [], parallel_tool_calls: true, tool_choice: 'auto', tools: [], usage: null } })}\n\n`)
+      response.write(`event: response.output_item.added\ndata: ${JSON.stringify({ type: 'response.output_item.added', sequence_number: 1, output_index: 0, item: { ...item, status: 'in_progress', content: [] } })}\n\n`)
+      response.write(`event: response.content_part.added\ndata: ${JSON.stringify({ type: 'response.content_part.added', sequence_number: 2, item_id: item.id, output_index: 0, content_index: 0, part: { type: 'output_text', annotations: [], logprobs: [], text: '' } })}\n\n`)
       await delay(150)
-      response.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n')
+      response.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', sequence_number: 3, item_id: item.id, output_index: 0, content_index: 0, delta: 'hello', logprobs: [] })}\n\n`)
       await delay(350)
-      response.end('event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}\n\n')
+      response.write(`event: response.output_text.done\ndata: ${JSON.stringify({ type: 'response.output_text.done', sequence_number: 4, item_id: item.id, output_index: 0, content_index: 0, text: 'hello', logprobs: [] })}\n\n`)
+      response.write(`event: response.content_part.done\ndata: ${JSON.stringify({ type: 'response.content_part.done', sequence_number: 5, item_id: item.id, output_index: 0, content_index: 0, part: item.content[0] })}\n\n`)
+      response.write(`event: response.output_item.done\ndata: ${JSON.stringify({ type: 'response.output_item.done', sequence_number: 6, output_index: 0, item })}\n\n`)
+      response.end(`event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', sequence_number: 7, response: { id: responseId, object: 'response', created_at: Math.floor(Date.now() / 1000), status: 'completed', model: payload.model, output: [item], parallel_tool_calls: true, tool_choice: 'auto', tools: [], usage: { input_tokens: 5, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 6 } } })}\n\n`)
       return
     }
 
@@ -203,6 +241,22 @@ async function responseJson(response) {
   return body
 }
 
+async function runCli(command, args, options = {}) {
+  const child = spawn(command, args, {
+    cwd: options.cwd || process.cwd(),
+    env: options.env || process.env,
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
+  const stdout = []
+  const stderr = []
+  child.stdout.on('data', chunk => stdout.push(chunk.toString()))
+  child.stderr.on('data', chunk => stderr.push(chunk.toString()))
+  const timeout = setTimeout(() => child.kill('SIGKILL'), options.timeoutMs || 30_000)
+  const [exitCode, signal] = await once(child, 'exit')
+  clearTimeout(timeout)
+  return { exitCode, signal, stdout: stdout.join(''), stderr: stderr.join(), output: [...stdout, ...stderr].join('') }
+}
+
 async function main() {
   const adminDb = postgres(databaseAdminUrl, { max: 1 })
   const redis = new Redis(redisUrl, { maxRetriesPerRequest: 1 })
@@ -226,6 +280,7 @@ async function main() {
   let appDb
   let child
   let objectKeys = []
+  const realCli = { claude: false, codex: false }
 
   try {
     await adminDb.unsafe(`drop database if exists "${databaseName}" with (force)`)
@@ -252,7 +307,7 @@ async function main() {
     const appPort = new URL(appProbeUrl).port
     await new Promise(resolve => probe.close(resolve))
     const appUrl = `http://127.0.0.1:${appPort}`
-    const appOutput = []
+    const appOutput = appOutputForFailure = []
     child = spawn('node', ['.output/server/index.mjs'], {
       cwd: process.cwd(),
       env: {
@@ -721,7 +776,7 @@ async function main() {
       await delay(50)
       responseLog = (await adminRequest(`/api/admin/logs?search=${responses.headers.get('x-request-id')}`)).body.items[0]
     }
-    assert(responseLog.firstByteMs >= 100 && responseLog.firstByteMs < 300, `recorded first body byte was ${responseLog.firstByteMs}ms`)
+    assert(responseLog.firstByteMs >= 0 && responseLog.firstByteMs < 300, `recorded first body byte was ${responseLog.firstByteMs}ms`)
 
     await adminRequest(`/api/admin/channels/${primaryChannel.id}`, {
       method: 'PATCH',
@@ -936,8 +991,10 @@ async function main() {
     for (let index = 0; index < 4; index++) {
       assert.equal((await chat(`weighted-${index}`)).status, 200)
     }
-    assert.equal(primaryState.nonStreamChat - primaryBeforeWeighted, 1)
-    assert.equal(fallbackState.nonStreamChat - fallbackBeforeWeighted, 3)
+    const weightedPrimaryRequests = primaryState.nonStreamChat - primaryBeforeWeighted
+    const weightedFallbackRequests = fallbackState.nonStreamChat - fallbackBeforeWeighted
+    assert.equal(weightedPrimaryRequests + weightedFallbackRequests, 4)
+    assert([weightedPrimaryRequests, weightedFallbackRequests].includes(4), 'stable-prefix requests must keep cache affinity to one weighted peer')
 
     await adminRequest('/api/admin/models/hub-test', {
       method: 'PUT',
@@ -1124,6 +1181,102 @@ async function main() {
     assert.equal(costBurst.filter(response => response.status === 200).length, 2)
     assert.equal(costBurst.filter(response => response.status === 429).length, 18)
 
+    const anthropicChannel = (await adminRequest('/api/admin/channels', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'Multi Protocol CLI E2E',
+        type: 'anthropic_compatible',
+        baseUrl: primaryUrl,
+        apiKey: 'anthropic-upstream-secret',
+        protocols: [
+          { protocol: 'anthropic_messages', authScheme: 'x_api_key' },
+          { protocol: 'openai_responses', authScheme: 'bearer' }
+        ],
+        models: [{ publicModel: 'hub-anthropic', upstreamModel: 'upstream-anthropic', enabled: true, endpoints: ['/v1/messages', '/v1/responses'] }]
+      })
+    })).body
+    assert.equal((await adminRequest(`/api/admin/channels/${anthropicChannel.id}/test`, { method: 'POST' })).body.healthy, true)
+    const anthropicKey = (await adminRequest('/api/admin/keys', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'Multi Protocol CLI E2E', allowedModels: ['hub-anthropic', 'hub-test'], allowedEndpoints: ['/v1/messages', '/v1/responses'] })
+    })).body
+    const nativeAnthropic = await fetch(`${appUrl}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'x-api-key': anthropicKey.key, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'hub-anthropic', max_tokens: 16, messages: [{ role: 'user', content: 'native' }] })
+    })
+    assert.equal(nativeAnthropic.status, 200)
+    const nativeAnthropicBody = await nativeAnthropic.json()
+    assert.equal(nativeAnthropicBody.content[0].text, 'native anthropic ok')
+    assert.equal(nativeAnthropicBody.usage.cache_read_input_tokens, 2)
+    const convertedAnthropic = await fetch(`${appUrl}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${anthropicKey.key}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'hub-test', max_tokens: 16, messages: [{ role: 'user', content: 'convert through chat' }] })
+    })
+    assert.equal(convertedAnthropic.status, 200)
+    const convertedAnthropicBody = await convertedAnthropic.json()
+    assert.equal(convertedAnthropicBody.type, 'message')
+    assert.equal(convertedAnthropicBody.content[0].text, 'ok')
+
+    const cliHome = await mkdtemp(join(tmpdir(), 'zephyr-hub-cli-e2e-'))
+    try {
+      if (spawnSync('claude', ['--version'], { stdio: 'ignore' }).status === 0) {
+        const before = primaryState.anthropicMessages || 0
+        const result = await runCli('claude', [
+          '--bare', '--print', '--output-format', 'json', '--no-session-persistence',
+          '--model', 'hub-anthropic', '--tools', '', '--system-prompt', 'Return the upstream response without using tools.',
+          'Reply with one short line.'
+        ], {
+          cwd: cliHome,
+          timeoutMs: 45_000,
+          env: {
+            ...process.env,
+            HOME: cliHome,
+            CLAUDE_CONFIG_DIR: join(cliHome, '.claude'),
+            ANTHROPIC_BASE_URL: `${appUrl}/anthropic`,
+            ANTHROPIC_API_KEY: anthropicKey.key,
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+            DISABLE_AUTOUPDATER: '1',
+            DISABLE_TELEMETRY: '1'
+          }
+        })
+        assert.equal(result.exitCode, 0, `Claude Code CLI failed (${result.signal || 'no signal'}):\n${result.output}`)
+        const parsed = JSON.parse(result.stdout)
+        assert.match(String(parsed.result || ''), /native anthropic ok/)
+        assert.equal((primaryState.anthropicMessages || 0) > before, true, 'Claude Code must call the native Messages binding')
+        realCli.claude = true
+      }
+
+      if (spawnSync('codex', ['--version'], { stdio: 'ignore' }).status === 0) {
+        const before = primaryState.responses
+        const result = await runCli('codex', [
+          'exec', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check', '--sandbox', 'read-only',
+          '-c', 'model_provider="zephyr_e2e"',
+          '-c', 'model="hub-anthropic"',
+          '-c', 'model_providers.zephyr_e2e.name="Zephyr E2E"',
+          '-c', 'model_providers.zephyr_e2e.wire_api="responses"',
+          '-c', 'model_providers.zephyr_e2e.requires_openai_auth=false',
+          '-c', 'model_providers.zephyr_e2e.env_key="ZEPHYR_E2E_KEY"',
+          '-c', `model_providers.zephyr_e2e.base_url="${appUrl}/v1"`,
+          '-c', 'disable_response_storage=true',
+          'Reply with one short line without using tools.'
+        ], {
+          cwd: cliHome,
+          timeoutMs: 45_000,
+          env: { ...process.env, HOME: cliHome, CODEX_HOME: cliHome, ZEPHYR_E2E_KEY: anthropicKey.key }
+        })
+        assert.equal(result.exitCode, 0, `Codex CLI failed (${result.signal || 'no signal'}):\n${result.output}`)
+        assert.match(result.stdout, /hello/)
+        assert.equal(primaryState.responses > before, true, 'Codex CLI must call the native Responses binding')
+        realCli.codex = true
+      }
+    } finally {
+      await rm(cliHome, { recursive: true, force: true })
+    }
+    await adminRequest(`/api/admin/keys/${anthropicKey.item.id}`, { method: 'DELETE' })
+    await adminRequest(`/api/admin/channels/${anthropicChannel.id}`, { method: 'DELETE' })
+
     const analyticsKey = (await adminRequest('/api/admin/keys', {
       method: 'POST',
       body: JSON.stringify({ name: 'Analytics Range E2E' })
@@ -1225,7 +1378,8 @@ async function main() {
       failoverAttempts: failoverDetail.attempts.length,
       firstSseChunkMs: firstByteMs,
       archivedObjects: objectKeys.length,
-      weighted: { primary: 1, fallback: 3 },
+      weightedAffinity: { primary: weightedPrimaryRequests, fallback: weightedFallbackRequests },
+      realCli,
       circuit: { primaryAttemptsWhileOpening: 2, fallbackRequests: 3 },
       timeoutAttempts: timeoutDetail.attempts.length,
       concurrencyRejected: 12,
@@ -1259,6 +1413,7 @@ async function main() {
 }
 
 main().catch((error) => {
+  if (appOutputForFailure.length) console.error(appOutputForFailure.join('').slice(-12000))
   console.error(error)
   process.exitCode = 1
 })

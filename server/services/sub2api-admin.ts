@@ -2,6 +2,7 @@ import type { H3Event } from 'h3'
 import type {
   Sub2ApiAccountQuotaResult,
   Sub2ApiAccountQuotaWindow,
+  Sub2ApiAccountWindowStats,
   Sub2ApiAccountView
 } from '#shared/types/sub2api-admin'
 import type { SubAccountManagementView, SubGroupView, SubProxyProtocol, SubProxyView } from '#shared/types/upstream-management'
@@ -39,6 +40,12 @@ function record(value: unknown): UnknownRecord | null {
 
 function text(value: unknown) {
   return typeof value === 'string' ? value.trim() : ''
+}
+
+function accountEmail(raw: UnknownRecord) {
+  const nested = [record(raw.credentials), record(raw.extra), record(raw.user), record(raw.metadata)]
+  return text(raw.email) || text(raw.account_email) || text(raw.accountEmail)
+    || nested.map(item => text(item?.email)).find(Boolean) || null
 }
 
 function numberValue(value: unknown): number | null {
@@ -185,6 +192,7 @@ function accountView(event: H3Event, raw: UnknownRecord): InternalAccount | null
     view: {
       id: opaqueSub2ApiAccountId(event, upstreamId),
       name: text(raw.name) || `账号 ${upstreamId}`,
+      email: accountEmail(raw),
       notes: text(raw.notes) || null,
       platform: text(raw.platform) || 'unknown',
       accountType: text(raw.type) || 'unknown',
@@ -229,10 +237,11 @@ function percentWindow(
   utilization: unknown,
   resetAt: unknown = null,
   used: number | null = null,
-  limit: number | null = null
+  limit: number | null = null,
+  stats: Sub2ApiAccountWindowStats | null = null
 ): Sub2ApiAccountQuotaWindow | null {
   const parsed = numberValue(utilization)
-  if (parsed === null && (limit === null || limit <= 0)) return null
+  if (parsed === null && (limit === null || limit <= 0) && !stats) return null
   const usedPercent = parsed === null
     ? Math.min(100, Math.max(0, (used || 0) / (limit || 1) * 100))
     : Math.min(100, Math.max(0, parsed))
@@ -243,7 +252,26 @@ function percentWindow(
     remainingPercent: Math.max(0, 100 - usedPercent),
     used,
     limit,
-    resetAt: timestampValue(resetAt)
+    resetAt: timestampValue(resetAt),
+    stats
+  }
+}
+
+function windowStats(value: unknown): Sub2ApiAccountWindowStats | null {
+  const stats = record(value)
+  if (!stats) return null
+  const requests = numberValue(stats.requests)
+  const tokens = numberValue(stats.tokens)
+  const cost = numberValue(stats.cost)
+  const standardCost = numberValue(stats.standard_cost)
+  const userCost = numberValue(stats.user_cost)
+  if ([requests, tokens, cost, standardCost, userCost].every(item => item === null)) return null
+  return {
+    requests: Math.max(0, requests || 0),
+    tokens: Math.max(0, tokens || 0),
+    cost: Math.max(0, cost || 0),
+    standardCost: standardCost === null ? null : Math.max(0, standardCost),
+    userCost: userCost === null ? null : Math.max(0, userCost)
   }
 }
 
@@ -294,7 +322,7 @@ export function parseSub2ApiAccountWindows(
   ] as const
   progressWindows.forEach(([key, label]) => {
     const progress = record(usage[key])
-    if (progress) add(percentWindow(key, label, progress.utilization, progress.resets_at))
+    if (progress) add(percentWindow(key, label, progress.utilization, progress.resets_at, null, null, windowStats(progress.window_stats)))
   })
 
   if (!seen.has('five_hour')) {
@@ -758,6 +786,7 @@ export function managedAccountView(event: H3Event, account: InternalAccount, pro
   return {
     id: account.view.id,
     name: account.view.name,
+    email: account.view.email,
     notes: account.view.notes,
     platform: account.view.platform,
     type: account.view.accountType,

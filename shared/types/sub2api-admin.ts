@@ -1,6 +1,7 @@
 export interface Sub2ApiAccountView {
   id: string
   name: string
+  email?: string | null
   notes: string | null
   platform: string
   accountType: string
@@ -20,6 +21,15 @@ export interface Sub2ApiAccountQuotaWindow {
   used: number | null
   limit: number | null
   resetAt: number | null
+  stats: Sub2ApiAccountWindowStats | null
+}
+
+export interface Sub2ApiAccountWindowStats {
+  requests: number
+  tokens: number
+  cost: number
+  standardCost: number | null
+  userCost: number | null
 }
 
 export interface Sub2ApiAccountProbeError {

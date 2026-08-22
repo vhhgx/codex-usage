@@ -12,7 +12,19 @@ let userPassword = process.env.UI_SMOKE_USER_PASSWORD || ''
 const output = process.env.UI_SMOKE_OUTPUT || '/tmp/zephyr-ui-smoke'
 const pages = process.env.UI_SMOKE_PAGES?.split(',').filter(Boolean) || ['/admin/users', '/admin/channels', '/admin/keys', '/admin/models', '/admin/settings', '/admin/audits', '/admin/account-vault', '/admin/upstreams']
 const userPages = process.env.UI_SMOKE_USER_PAGES?.split(',').filter(Boolean) || ['/console', '/console/keys', '/console/groups', '/console/models', '/console/announcements', '/console/logs']
-const viewports = [{ name: 'desktop', width: 1440, height: 1000 }, { name: 'mobile', width: 390, height: 844 }]
+const baseViewports = process.env.UI_SMOKE_VIEWPORTS
+  ? process.env.UI_SMOKE_VIEWPORTS.split(',').filter(Boolean).map((value) => {
+      const match = value.trim().match(/^(\d+)x(\d+)$/)
+      if (!match) throw new Error(`Invalid UI_SMOKE_VIEWPORTS entry: ${value}`)
+      return { name: match[1], width: Number(match[1]), height: Number(match[2]) }
+    })
+  : [{ name: 'desktop', width: 1440, height: 1000 }, { name: 'mobile', width: 390, height: 844 }]
+const themes = process.env.UI_SMOKE_THEMES?.split(',').filter(theme => ['light', 'dark'].includes(theme)) || ['light']
+const viewports = baseViewports.flatMap(viewport => themes.map(theme => ({
+  ...viewport,
+  theme,
+  name: themes.length === 1 && theme === 'light' ? viewport.name : `${viewport.name}-${theme}`
+})))
 const bootstrap = process.env.UI_SMOKE_BOOTSTRAP === '1'
 const skipFormLogin = process.env.UI_SMOKE_SKIP_FORM_LOGIN === '1'
 const skipUser = process.env.UI_SMOKE_SKIP_USER === '1'
@@ -95,9 +107,15 @@ try {
       ...(!skipUser && userUsername && userPassword ? [{ name: 'user', username: userUsername, password: userPassword, login: '/api/auth/login', logout: '/api/auth/logout', pages: userPages }] : [])
     ]
     for (const target of targets) {
-      const context = await browser.newContext({ viewport })
+      const context = await browser.newContext({
+        viewport: { width: viewport.width, height: viewport.height },
+        colorScheme: viewport.theme
+      })
+      await context.addCookies([{ name: 'zephyr_theme', value: viewport.theme, url: baseUrl }])
       const page = await context.newPage()
       const pageErrors = []
+      let themeChecked = false
+      let drawerChecked = false
       page.on('pageerror', error => pageErrors.push(error.message))
       if (target.name === 'user' && !skipFormLogin) {
         await page.goto(baseUrl)
@@ -134,20 +152,63 @@ try {
       if (target.name === 'admin') {
         const loginResult = await login.json()
         const selfReset = await context.request.post(`${baseUrl}/api/admin/users/${loginResult.user.id}/reset-password`, { data: { password: `Blocked-${randomUUID()}-password` } })
-        if (selfReset.status() !== 409) throw new Error(`self password reset must be rejected with HTTP 409, received ${selfReset.status()}`)
+        if (!selfReset.ok()) throw new Error(`self password reset should be accepted from user management, received ${selfReset.status()}`)
       }
       for (const path of target.pages) {
         const response = await page.goto(`${baseUrl}${path}`)
         if (!response?.ok()) throw new Error(`${path} returned HTTP ${response?.status()}`)
         await page.waitForLoadState('networkidle')
+        if (!themeChecked && target.name === 'admin') {
+          const expectedTheme = viewport.theme
+          if (!await page.locator('html').evaluate((element, theme) => element.classList.contains(theme), expectedTheme)) {
+            throw new Error(`${path} did not resolve the explicit ${expectedTheme} theme before interaction`)
+          }
+          const targetTheme = expectedTheme === 'dark' ? 'light' : 'dark'
+          await page.getByRole('button', { name: expectedTheme === 'dark' ? '切换到亮色主题' : '切换到暗色主题' }).click()
+          await page.waitForFunction(theme => document.documentElement.classList.contains(theme), targetTheme)
+          await page.getByRole('button', { name: targetTheme === 'dark' ? '切换到亮色主题' : '切换到暗色主题' }).click()
+          await page.waitForFunction(theme => document.documentElement.classList.contains(theme), expectedTheme)
+          const cookie = (await context.cookies(baseUrl)).find(item => item.name === 'zephyr_theme')
+          if (cookie?.value !== expectedTheme) throw new Error(`theme preference was not restored: ${cookie?.value}`)
+          themeChecked = true
+        }
+        if (!drawerChecked && target.name === 'admin' && viewport.width <= 960) {
+          const menu = page.getByRole('button', { name: '打开导航' })
+          await menu.click()
+          const sidebar = page.locator('.workspace-sidebar')
+          const brand = sidebar.locator('.workspace-brand')
+          const logout = sidebar.getByRole('button', { name: '退出登录' })
+          await brand.focus()
+          await page.keyboard.press('Shift+Tab')
+          if (!await logout.evaluate(element => element === document.activeElement)) throw new Error('mobile drawer did not wrap focus backward')
+          await page.keyboard.press('Tab')
+          if (!await brand.evaluate(element => element === document.activeElement)) throw new Error('mobile drawer did not wrap focus forward')
+          await page.keyboard.press('Escape')
+          if (await menu.getAttribute('aria-expanded') !== 'false' || !await menu.evaluate(element => element === document.activeElement)) {
+            throw new Error('mobile drawer did not close with Escape and restore focus')
+          }
+          drawerChecked = true
+        }
         if (target.name === 'admin' && path === '/admin') {
-          const labels = await page.locator('.admin-nav a span').allTextContents()
+          const labels = await page.locator('.workspace-nav a span').allTextContents()
           if (!labels.includes('运行总览') || !labels.includes('用户管理') || labels.includes('个人首页')) {
             throw new Error(`administrator received incorrect navigation: ${JSON.stringify(labels)}`)
           }
+          const spotlight = page.locator('.spotlight-panel').first()
+          if (viewport.width > 960) {
+            await spotlight.hover({ position: { x: 24, y: 24 } })
+            const position = await spotlight.evaluate(element => ({
+              x: element.style.getPropertyValue('--spot-x'),
+              y: element.style.getPropertyValue('--spot-y')
+            }))
+            if (!position.x || !position.y) throw new Error(`desktop spotlight did not track the pointer: ${JSON.stringify(position)}`)
+          } else {
+            const content = await spotlight.evaluate(element => getComputedStyle(element, '::before').content)
+            if (content !== 'none') throw new Error(`mobile spotlight is still rendered: ${content}`)
+          }
         }
         if (target.name === 'user' && path === '/console') {
-          const labels = await page.locator('.admin-nav a span').allTextContents()
+          const labels = await page.locator('.workspace-nav a span').allTextContents()
           if (!labels.includes('个人首页') || !labels.includes('我的 Keys') || !labels.includes('公告') || labels.includes('用户管理')) {
             throw new Error(`ordinary user received incorrect navigation: ${JSON.stringify(labels)}`)
           }
@@ -180,18 +241,32 @@ try {
           viewportWidth: window.innerWidth,
           fixedOverflow: [...document.querySelectorAll('button, select, input')].filter((element) => {
             const rect = element.getBoundingClientRect()
+            const style = getComputedStyle(element)
             const insideHorizontalScroller = [...function * parents(node) {
               for (let parent = node.parentElement; parent; parent = parent.parentElement) yield parent
             }(element)].some(parent => {
               const overflow = getComputedStyle(parent).overflowX
               return (overflow === 'auto' || overflow === 'scroll') && parent.scrollWidth > parent.clientWidth
             })
-            return rect.width > 0 && !insideHorizontalScroller && (rect.left < -1 || rect.right > window.innerWidth + 1)
-          }).length
+            return style.visibility !== 'hidden' && rect.width > 0 && !insideHorizontalScroller && (rect.left < -1 || rect.right > window.innerWidth + 1)
+          }).map((element) => {
+            const rect = element.getBoundingClientRect()
+            return { className: element.className, label: element.getAttribute('aria-label') || element.getAttribute('title') || element.textContent?.trim().slice(0, 40), left: Math.round(rect.left), right: Math.round(rect.right) }
+          }),
+          inaccessibleIconButtons: [...document.querySelectorAll('button')].filter((element) => {
+            const style = getComputedStyle(element)
+            const iconOnly = Boolean(element.querySelector('svg')) && !element.textContent?.trim()
+            return iconOnly && style.display !== 'none' && style.visibility !== 'hidden'
+              && (!element.getAttribute('aria-label') || !element.getAttribute('title'))
+          }).map(element => ({
+            className: element.className,
+            ariaLabel: element.getAttribute('aria-label'),
+            title: element.getAttribute('title')
+          }))
         }))
         const name = path === '/console' ? 'overview' : path.split('/').filter(Boolean).at(-1)
         await page.screenshot({ path: `${output}/${viewport.name}-${target.name}-${name}.png`, fullPage: true })
-        results.push({ viewport: viewport.name, target: target.name, path, pageErrors: [...pageErrors], ...layout })
+        results.push({ viewport: viewport.name, theme: viewport.theme, target: target.name, path, pageErrors: [...pageErrors], ...layout })
         if (target.name === 'admin') {
           const legacyTablists = await page.locator('[role="tablist"].admin-segment').count()
           if (legacyTablists) throw new Error(`${path} still uses ${legacyTablists} legacy segmented tablist(s)`)
@@ -224,7 +299,7 @@ try {
           await page.getByText('还没有 Hub Key', { exact: true }).waitFor()
         }
         if (target.name === 'admin' && path === '/admin/channels') {
-          if (!await page.locator('.admin-nav').getByText('资源管理', { exact: true }).count()) throw new Error('combined resource navigation label is missing')
+          if (!await page.locator('.workspace-nav').getByText('资源管理', { exact: true }).count()) throw new Error('combined resource navigation label is missing')
           await page.getByRole('heading', { name: '资源管理', exact: true }).waitFor()
           if (await page.locator('.resource-section-heading').count()) throw new Error('resource tabs still render duplicated section headings')
           const resourceHeader = page.locator('.admin-page__header')
@@ -249,7 +324,7 @@ try {
         }
         if (target.name === 'admin' && path === '/admin/upstreams') {
           await page.getByRole('heading', { name: '号池配置', exact: true }).waitFor()
-          if (!await page.locator('.admin-nav').getByText('号池配置', { exact: true }).count()) throw new Error('pool settings navigation label was not updated')
+          if (!await page.locator('.workspace-nav').getByText('号池配置', { exact: true }).count()) throw new Error('pool settings navigation label was not updated')
           if (await page.getByRole('tab', { name: 'CPA 认证', exact: true }).count()) throw new Error('CPA auth tab should be managed from account management')
           if (await page.getByRole('tab', { name: 'Sub2API 账号', exact: true }).count()) throw new Error('duplicated Sub2API account tab should remain hidden from pool settings')
           await page.getByRole('tab', { name: 'Sub2API 分组', exact: true }).waitFor()
@@ -276,7 +351,7 @@ try {
           await page.unroute(operationsPattern)
         }
         if (target.name === 'admin' && path === '/admin/account-vault') {
-          if (!await page.locator('.admin-shell > .admin-sidebar').count()) throw new Error('account management is not using the admin layout')
+          if (!await page.locator('.workspace-shell > .workspace-sidebar').count()) throw new Error('account management is not using the admin layout')
           if (await page.locator('.site-header, .site-header__inner, .page-width.account-vault-page').count()) throw new Error('account management is incorrectly using the public site layout')
           const accountTypography = await page.evaluate(() => ({
             table: Number.parseFloat(getComputedStyle(document.querySelector('.account-workspace-table')).fontSize),
@@ -302,12 +377,32 @@ try {
           if ((await fixtureIdentity.innerText()).includes('UI Smoke 账号备注')) throw new Error('account identity still renders remarks')
           const passwordButton = fixtureIdentity.locator('.password-copy', { hasText: 'UI-Smoke-Account-Password' })
           await passwordButton.waitFor()
+          const email = fixtureIdentity.locator('.account-email')
+          const emailLayout = await email.evaluate((element) => {
+            const style = getComputedStyle(element)
+            return { maxWidth: style.maxWidth, overflow: style.overflow, textOverflow: style.textOverflow, whiteSpace: style.whiteSpace }
+          })
+          if (emailLayout.maxWidth !== 'none' || emailLayout.textOverflow === 'ellipsis' || emailLayout.whiteSpace !== 'nowrap') {
+            throw new Error(`account email is constrained or truncated: ${JSON.stringify(emailLayout)}`)
+          }
           await passwordButton.click()
           await page.getByText('账号密码已复制', { exact: true }).waitFor()
 
-          await page.getByTitle('编辑账号资料').first().click()
-          const accountEditor = page.getByRole('dialog', { name: '编辑账号' })
+          const accountEditTrigger = page.getByTitle('编辑账号资料').first()
+          await accountEditTrigger.click()
+          let accountEditor = page.getByRole('dialog', { name: '编辑账号' })
           await accountEditor.waitFor()
+          await page.waitForFunction(() => document.querySelector('[role="dialog"][aria-label="编辑账号"]')?.contains(document.activeElement))
+          await page.keyboard.press('Escape')
+          await accountEditor.waitFor({ state: 'detached' })
+          await page.waitForFunction(() => document.activeElement?.getAttribute('title') === '编辑账号资料')
+          await accountEditTrigger.click()
+          accountEditor = page.getByRole('dialog', { name: '编辑账号' })
+          await accountEditor.waitFor()
+          if (await accountEditor.getByRole('tab').count()) throw new Error('account editor exposes creation-mode tabs')
+          if (!await accountEditor.locator('.account-editor-main').count() || !await accountEditor.locator('.account-editor-aside').count()) {
+            throw new Error('account editor does not preserve the split form layout')
+          }
           for (const removedField of ['购买日期', '质保日期', '质保状态']) {
             if (await accountEditor.getByText(removedField, { exact: true }).count()) {
               throw new Error(`account editor still exposes removed field: ${removedField}`)
@@ -322,16 +417,40 @@ try {
           await page.getByRole('button', { name: '新增账号', exact: true }).click()
           const accountCreator = page.getByRole('dialog', { name: '新增账号' })
           await accountCreator.waitFor()
-          if (!await accountCreator.getByRole('tab', { name: '手动新增' }).count() || !await accountCreator.getByRole('tab', { name: '发货文本' }).count()) {
-            throw new Error('account creator does not expose both mutually exclusive creation modes')
+          for (const mode of ['手动', '上传', '批量导入', '凭据转换']) {
+            if (!await accountCreator.getByRole('tab', { name: mode, exact: true }).count()) {
+              throw new Error(`account creator is missing the ${mode} creation mode`)
+            }
           }
-          if (!await accountCreator.getByRole('tab', { name: '表单新增' }).count() || !await accountCreator.getByRole('tab', { name: '上传新增' }).count()) {
-            throw new Error('manual account creator does not expose form and upload modes')
+          for (const removedMode of ['手动新增', '发货文本', '表单新增', '上传新增']) {
+            if (await accountCreator.getByRole('tab', { name: removedMode, exact: true }).count()) {
+              throw new Error(`account creator still exposes the removed ${removedMode} mode`)
+            }
           }
-          await accountCreator.getByRole('tab', { name: '上传新增' }).click()
+          if (await accountCreator.locator('.account-editor-main > .account-editor-tabs').count() !== 1) {
+            throw new Error('account creator tabs are not contained in the main form region')
+          }
+          const accountCreatorLayout = await accountCreator.locator('.account-editor-layout').evaluate((element) => ({
+            display: getComputedStyle(element).display,
+            overflow: element.closest('[role="dialog"]').scrollWidth - element.closest('[role="dialog"]').clientWidth
+          }))
+          const expectedAccountCreatorDisplay = viewport.width > 820 ? 'grid' : 'block'
+          if (accountCreatorLayout.display !== expectedAccountCreatorDisplay || accountCreatorLayout.overflow > 1) {
+            throw new Error(`account creator layout is invalid: ${JSON.stringify(accountCreatorLayout)}`)
+          }
+          await accountCreator.getByRole('tab', { name: '上传', exact: true }).click()
+          const subUploadDrop = accountCreator.locator('.credential-drop', { hasText: '选择 Sub2API 账号 JSON' })
+          const fileInputLayout = await subUploadDrop.locator('input[type="file"]').evaluate((element) => {
+            const style = getComputedStyle(element)
+            const rect = element.getBoundingClientRect()
+            return { position: style.position, opacity: style.opacity, width: rect.width, height: rect.height }
+          })
+          if (fileInputLayout.position !== 'absolute' || fileInputLayout.opacity !== '0' || fileInputLayout.width > 1.1 || fileInputLayout.height > 1.1) {
+            throw new Error(`account upload exposes the native file input: ${JSON.stringify(fileInputLayout)}`)
+          }
           const poolSelect = accountCreator.getByLabel('号池平台 *')
           await poolSelect.selectOption('cpa')
-          await accountCreator.getByText('选择认证文件（每个最大 2 MiB，最多 20 个）', { exact: true }).waitFor()
+          await accountCreator.getByText('选择 CPA 认证文件', { exact: true }).waitFor()
           if (await accountCreator.getByRole('button', { name: '导入 Sub2API', exact: true }).count()) throw new Error('Sub2API submit action is visible for the CPA pool')
           await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-cpa-upload.png`, fullPage: true })
           await poolSelect.selectOption('sub2api')
@@ -365,14 +484,14 @@ try {
             throw new Error('credential conversion preview exposes credentials')
           }
           await page.screenshot({ path: `${output}/${viewport.name}-admin-account-vault-credential-converter.png`, fullPage: true })
-          await accountCreator.getByRole('tab', { name: '表单新增' }).click()
+          await accountCreator.getByRole('tab', { name: '手动', exact: true }).click()
           await accountCreator.getByLabel('邮箱 *').waitFor()
-          await accountCreator.getByRole('tab', { name: '发货文本' }).click()
-          const deliveryFormat = accountCreator.getByLabel('发货格式 *')
-          await deliveryFormat.selectOption('password_totp')
+          await accountCreator.getByRole('tab', { name: '批量导入', exact: true }).click()
+          await accountCreator.getByLabel('来源 *').selectOption('ldxp')
+          await accountCreator.getByText('2FA 密钥', { exact: true }).click()
           await accountCreator.locator('textarea').fill('totp@example.com----secret-password----MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7')
           await accountCreator.getByText('totp@example.com', { exact: true }).waitFor()
-          await accountCreator.locator('.vault-delivery-preview').getByText('邮箱 + 密码 + 2FA 密钥', { exact: true }).waitFor()
+          await accountCreator.locator('.vault-delivery-preview').getByText('账号 + 密码 + 2FA 密钥', { exact: true }).waitFor()
           if (await accountCreator.locator('.vault-delivery-preview', { hasText: 'secret-password' }).count() || await accountCreator.locator('.vault-delivery-preview', { hasText: 'MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7' }).count()) {
             throw new Error('delivery preview exposes imported credentials')
           }
@@ -454,7 +573,7 @@ try {
   }
 }
 
-if (results.some(result => result.documentWidth > result.viewportWidth + 1 || result.fixedOverflow > 0 || result.pageErrors.length)) {
+if (results.some(result => result.documentWidth > result.viewportWidth + 1 || result.fixedOverflow.length > 0 || result.inaccessibleIconButtons.length > 0 || result.pageErrors.length)) {
   throw new Error(`UI overflow detected: ${JSON.stringify(results)}`)
 }
 console.log(JSON.stringify({ passed: true, results, output }))

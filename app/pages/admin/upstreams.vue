@@ -1036,6 +1036,7 @@ onMounted(async () => {
                 <button
                   class="icon-button"
                   title="仅验证"
+                  aria-label="仅验证账号"
                   @click="verifyAccount(item)"
                 >
                   <IconCircleCheck :size="16" /></button
@@ -1043,18 +1044,21 @@ onMounted(async () => {
                   v-if="!item.schedulable"
                   class="icon-button"
                   title="验证并启用"
+                  aria-label="验证并启用账号"
                   @click="verifyAccount(item, true)"
                 >
                   <IconPlayerPlay :size="16" /></button
                 ><button
                   class="icon-button"
                   title="编辑"
+                  aria-label="编辑账号"
                   @click="editAccount(item)"
                 >
                   <IconEdit :size="16" /></button
                 ><button
                   class="icon-button danger"
                   title="永久删除"
+                  aria-label="永久删除账号"
                   @click="deleteAccount(item)"
                 >
                   <IconTrash :size="16" />
@@ -1125,12 +1129,14 @@ onMounted(async () => {
                 <button
                   class="icon-button"
                   title="编辑策略"
+                  aria-label="编辑分组策略"
                   @click="openGroup(item)"
                 >
                   <IconEdit :size="16" /></button
                 ><button
                   class="icon-button danger"
                   title="删除"
+                  aria-label="删除分组"
                   @click="deleteGroup(item)"
                 >
                   <IconTrash :size="16" />
@@ -1159,7 +1165,7 @@ onMounted(async () => {
             <td><strong>{{ item.accountCount }} 个 Sub2API 账号</strong><code>{{ [item.id === defaultProxyId ? 'Sub2API 默认' : '', item.id === cpaDefaultProxyId ? 'CPA 全局默认' : ''].filter(Boolean).join(' · ') || '普通代理' }}</code></td>
             <td><strong>{{ item.latencyMs === null ? '—' : `${item.latencyMs} ms` }}</strong><code>质量 {{ item.qualityScore ?? '待检测' }}</code></td>
             <td><strong>{{ item.expiresAt ? time(item.expiresAt) : '长期有效' }}</strong><code>{{ item.backupProxyName ? `回退至 ${item.backupProxyName}` : item.fallbackMode === 'direct' ? '失败后直连' : item.fallbackMode }}</code></td>
-            <td><div class="table-actions"><button class="icon-button" title="连通性测试" @click="checkProxy(item)"><IconActivityHeartbeat :size="16" /></button><button class="icon-button" title="质量检测" @click="checkProxy(item, true)"><IconShieldCheck :size="16" /></button><button class="icon-button" :title="item.status === 'active' ? '停用' : '启用'" @click="toggleProxy(item)"><component :is="item.status === 'active' ? IconPlayerPause : IconPlayerPlay" :size="16" /></button><button class="icon-button" title="编辑" @click="openProxy(item)"><IconEdit :size="16" /></button><button class="icon-button danger" title="永久删除" @click="deleteProxy(item)"><IconTrash :size="16" /></button></div></td>
+            <td><div class="table-actions"><button class="icon-button" title="连通性测试" aria-label="代理连通性测试" @click="checkProxy(item)"><IconActivityHeartbeat :size="16" /></button><button class="icon-button" title="质量检测" aria-label="代理质量检测" @click="checkProxy(item, true)"><IconShieldCheck :size="16" /></button><button class="icon-button" :title="item.status === 'active' ? '停用' : '启用'" :aria-label="item.status === 'active' ? '停用代理' : '启用代理'" @click="toggleProxy(item)"><component :is="item.status === 'active' ? IconPlayerPause : IconPlayerPlay" :size="16" /></button><button class="icon-button" title="编辑" aria-label="编辑代理" @click="openProxy(item)"><IconEdit :size="16" /></button><button class="icon-button danger" title="永久删除" aria-label="永久删除代理" @click="deleteProxy(item)"><IconTrash :size="16" /></button></div></td>
           </tr>
           <tr v-if="!filteredProxies.length"><td colspan="6"><div class="admin-empty">{{ loading ? '正在读取代理…' : '没有代理' }}</div></td></tr>
         </tbody>
@@ -1409,7 +1415,7 @@ onMounted(async () => {
             <span>SUB2API ACCOUNT</span>
             <h2>{{ modal === "account-import" ? "导入账号" : "编辑账号" }}</h2>
           </div>
-          <button class="icon-button" @click="modal = null">
+          <button class="icon-button" type="button" title="关闭" aria-label="关闭" @click="modal = null">
             <IconX :size="18" />
           </button>
         </header>
@@ -1681,7 +1687,7 @@ onMounted(async () => {
             <span>SUB2API GROUP POLICY</span>
             <h2>{{ editingGroup ? "编辑分组策略" : "新建分组" }}</h2>
           </div>
-          <button class="icon-button" @click="modal = null">
+          <button class="icon-button" type="button" title="关闭" aria-label="关闭" @click="modal = null">
             <IconX :size="18" />
           </button>
         </header>

@@ -4,6 +4,7 @@ import { useDatabase } from '../../../db'
 import { channels } from '../../../db/schema'
 import { beginChannelDeletion, finishChannelDeletion } from '../../../services/hub-limits'
 import { deleteChannelPreservingRollups } from '../../../services/hub-deletion'
+import { invalidateChannelAccess } from '../../../services/channel-access'
 
 export default defineEventHandler(async (event) => {
   const admin = await requireAdmin(event)
@@ -17,6 +18,7 @@ export default defineEventHandler(async (event) => {
   try {
     await auditedMutation(event, async () => {
       await deleteChannelPreservingRollups(event, id)
+      await invalidateChannelAccess(event, [id])
       await writeAudit(event, admin.userId, 'channel.delete', 'channel', id)
     })
     return { success: true }

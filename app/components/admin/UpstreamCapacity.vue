@@ -45,6 +45,7 @@ const radarInitialized = useState('account-quota-radar-initialized', () => false
 const radarLoading = useState('account-quota-radar-loading', () => true)
 const radarError = useState('account-quota-radar-error', () => '')
 const radar = useState<CodexRadarResponse | null>('account-quota-radar-data', () => null)
+const upstreamRefreshing = computed(() => radarLoading.value || cpaRefreshingAll.value || subRefreshingAll.value)
 
 function errorMessage(value: unknown) {
   const status = value as {
@@ -162,19 +163,14 @@ function subQuota(item: Sub2ApiAccountQuotaResult): CodexQuotaResult {
   }
 }
 
-function subScheduleStatus(item: Sub2ApiAccountQuotaResult): 'available' | 'paused' {
-  return item.schedulable ? 'available' : 'paused'
-}
-
 const subCards = computed(() => subResults.value.map((item) => ({
   account: subAccount(item),
-  quota: subQuota(item),
-  scheduleStatus: subScheduleStatus(item)
+  quota: subQuota(item)
 })))
 
-function radarModelLabel(model: string) {
-  return model.replace(/^gpt-/i, '')
-}
+const RADAR_EFFORT_ORDER = ['ultra', 'max', 'xhigh', 'high', 'medium', 'low']
+
+function radarModelLabel(model: string) { return model }
 
 const radarGroups = computed(() => {
   const groups = new Map<string, CodexRadarModel[]>()
@@ -185,11 +181,24 @@ const radarGroups = computed(() => {
 
   return [...groups.entries()].map(([model, models]) => ({
     model,
-    models: [...models].sort((left, right) =>
-      right.costUsd - left.costUsd || left.reasoningEffort.localeCompare(right.reasoningEffort)
-    )
+    models: [...models].sort((left, right) => {
+      const leftIndex = RADAR_EFFORT_ORDER.indexOf(left.reasoningEffort.toLowerCase())
+      const rightIndex = RADAR_EFFORT_ORDER.indexOf(right.reasoningEffort.toLowerCase())
+      return (leftIndex < 0 ? RADAR_EFFORT_ORDER.length : leftIndex) - (rightIndex < 0 ? RADAR_EFFORT_ORDER.length : rightIndex)
+    })
   }))
 })
+const regularRadarGroups = computed(() => radarGroups.value.filter(group => group.models.length > 2))
+const compactRadarGroups = computed(() => radarGroups.value.filter(group => group.models.length <= 2))
+
+function updateSpotlight(event: PointerEvent) {
+  if (!window.matchMedia('(min-width: 961px) and (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference)').matches
+    || window.matchMedia('(prefers-reduced-transparency: reduce)').matches) return
+  const element = event.currentTarget as HTMLElement
+  const rect = element.getBoundingClientRect()
+  element.style.setProperty('--spot-x', `${event.clientX - rect.left}px`)
+  element.style.setProperty('--spot-y', `${event.clientY - rect.top}px`)
+}
 
 async function loadRadarDirect() {
   let lastError: unknown
@@ -272,6 +281,14 @@ async function loadRadar() {
   }
 }
 
+async function refreshAllUpstreams() {
+  await Promise.all([
+    loadRadar(),
+    ...(cpaAccounts.value.length ? [refreshAllCpa()] : []),
+    ...(subResults.value.length ? [refreshAllSub()] : [])
+  ])
+}
+
 function radarTimestamp(value: number | null | undefined) {
   if (!value) return '更新时间未知'
   return `更新于 ${new Intl.DateTimeFormat('zh-CN', {
@@ -308,21 +325,26 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="codex-page" :class="{ 'page-width': !embedded, 'upstream-capacity--embedded': embedded }">
-    <section v-if="!embedded" class="page-heading">
+  <component :is="embedded ? 'section' : 'div'" :class="embedded ? 'upstream-section' : 'codex-page admin-page'" :aria-labelledby="embedded ? 'upstream-title' : undefined">
+    <header v-if="!embedded" class="admin-page__header">
       <div>
+        <span class="admin-kicker">ACCOUNT CAPACITY</span>
         <h1>账号余量</h1>
         <p>分别查看 CPA 与 Sub2API 的账号额度，并按数据源独立刷新。</p>
       </div>
-    </section>
-    <section v-else class="resource-section-heading upstream-capacity-heading">
-      <div><span>UPSTREAM CAPACITY</span><h2>上游账号余量</h2><p>CPA 与 Sub2API 账号额度及模型效率。</p></div>
-    </section>
+    </header>
+    <div v-else class="upstream-heading">
+      <div><span>UPSTREAM CAPACITY</span><h2 id="upstream-title">上游账号余量</h2><p>CPA 与 Sub2API 账号额度及模型效率。</p></div>
+      <button class="button button--quiet button--small" type="button" :disabled="upstreamRefreshing" @click="refreshAllUpstreams">
+        <IconRefresh :size="16" :stroke-width="1.8" :class="{ 'is-spinning': upstreamRefreshing }" />
+        {{ upstreamRefreshing ? '正在刷新' : '全部刷新' }}
+      </button>
+    </div>
 
     <section class="quota-source radar-source" aria-labelledby="radar-title">
       <header class="quota-source__header">
         <div>
-          <h2 id="radar-title">Codex 模型智能效率</h2>
+          <h3 id="radar-title">Codex 模型智能效率</h3>
           <p>
             <a href="https://codexradar.com/" target="_blank" rel="noreferrer" class="radar-source__link">
               CodexRadar <IconExternalLink :size="13" :stroke-width="1.8" />
@@ -346,24 +368,19 @@ onMounted(() => {
       </div>
 
       <div v-else-if="radarGroups.length" class="radar-groups">
-        <section v-for="group in radarGroups" :key="group.model" class="radar-group">
+        <section v-for="group in regularRadarGroups" :key="group.model" class="glass-panel radar-group spotlight-panel" @pointermove="updateSpotlight">
           <header class="radar-group__header">
-            <h3>{{ radarModelLabel(group.model) }}</h3>
+            <h4>{{ radarModelLabel(group.model) }}</h4>
             <span>{{ group.models.length }} 种推理强度</span>
           </header>
-          <ul class="radar-list">
-            <li v-for="model in group.models" :key="model.id">
-              <div class="radar-list__primary">
-                <strong>{{ radarScore(model.intelligenceScore) }}</strong>
-                <span>{{ model.reasoningEffort }}</span>
-              </div>
-              <dl class="radar-list__stats">
-                <div><dt>通过率</dt><dd>{{ radarPassRate(model.passed, model.tasks) }}</dd></div>
-                <div><dt>通过数</dt><dd>{{ model.passed }}/{{ model.tasks }}</dd></div>
-              </dl>
-            </li>
-          </ul>
+          <div v-for="model in group.models" :key="model.id" class="radar-row"><strong class="radar-row__score">{{ radarScore(model.intelligenceScore) }}</strong><div class="radar-row__mid"><span class="radar-row__effort">{{ model.reasoningEffort }}</span></div><div class="radar-row__stats"><strong>{{ radarPassRate(model.passed, model.tasks) }}</strong><span>{{ model.passed }} / {{ model.tasks }}</span></div></div>
         </section>
+        <div v-if="compactRadarGroups.length" class="radar-group-stack">
+          <section v-for="group in compactRadarGroups" :key="group.model" class="glass-panel radar-group spotlight-panel" @pointermove="updateSpotlight">
+            <header class="radar-group__header"><h4>{{ radarModelLabel(group.model) }}</h4><span>{{ group.models.length }} 种推理强度</span></header>
+            <div v-for="model in group.models" :key="model.id" class="radar-row"><strong class="radar-row__score">{{ radarScore(model.intelligenceScore) }}</strong><div class="radar-row__mid"><span class="radar-row__effort">{{ model.reasoningEffort }}</span></div><div class="radar-row__stats"><strong>{{ radarPassRate(model.passed, model.tasks) }}</strong><span>{{ model.passed }} / {{ model.tasks }}</span></div></div>
+          </section>
+        </div>
       </div>
 
       <div v-else-if="!radarError" class="empty-state empty-state--compact">
@@ -377,13 +394,13 @@ onMounted(() => {
     <section v-if="cpaAccounts.length" id="cpa" class="quota-source" aria-labelledby="cpa-quota-title">
       <header class="quota-source__header">
         <div>
-          <h2 id="cpa-quota-title">CPA Codex</h2>
+          <h3 id="cpa-quota-title">CPA Codex</h3>
           <p>CLIProxyAPI 中启用的 Codex OAuth 账号</p>
         </div>
         <div class="quota-source__actions">
           <span class="account-count">{{ cpaAccounts.length }} 个账号</span>
-          <button class="button button--primary" type="button" :disabled="cpaRefreshingAll || cpaLoadingAccounts" @click="refreshAllCpa">
-            <IconRefresh :size="18" :stroke-width="1.8" :class="{ 'is-spinning': cpaRefreshingAll }" />
+          <button class="button button--quiet button--small" type="button" :disabled="cpaRefreshingAll || cpaLoadingAccounts" @click="refreshAllCpa">
+            <IconRefresh :size="16" :stroke-width="1.8" :class="{ 'is-spinning': cpaRefreshingAll }" />
             {{ cpaRefreshingAll ? '正在刷新' : '全部刷新' }}
           </button>
         </div>
@@ -406,13 +423,13 @@ onMounted(() => {
     <section v-if="subResults.length" id="sub2api" class="quota-source" aria-labelledby="sub2api-quota-title">
       <header class="quota-source__header">
         <div>
-          <h2 id="sub2api-quota-title">Sub2API</h2>
+          <h3 id="sub2api-quota-title">Sub2API</h3>
           <p>Sub2API 管理端中的上游账号</p>
         </div>
         <div class="quota-source__actions">
           <span class="account-count">{{ subResults.length }} 个账号</span>
-          <button class="button button--primary" type="button" :disabled="subRefreshingAll || subLoadingAccounts" @click="refreshAllSub">
-            <IconRefresh :size="18" :stroke-width="1.8" :class="{ 'is-spinning': subRefreshingAll }" />
+          <button class="button button--quiet button--small" type="button" :disabled="subRefreshingAll || subLoadingAccounts" @click="refreshAllSub">
+            <IconRefresh :size="16" :stroke-width="1.8" :class="{ 'is-spinning': subRefreshingAll }" />
             {{ subRefreshingAll ? '正在刷新' : '全部刷新' }}
           </button>
         </div>
@@ -426,11 +443,44 @@ onMounted(() => {
           :key="item.account.id"
           :account="item.account"
           :quota="item.quota"
-          :schedule-status="item.scheduleStatus"
           :loading="subLoadingIds.has(item.account.id) || subRefreshingAll"
           @refresh="refreshOneSub"
         />
       </div>
     </section>
-  </div>
+  </component>
 </template>
+
+<style scoped>
+.upstream-section { margin-top: var(--hub-space-4); }
+.upstream-heading { min-height: 69px; margin-bottom: var(--hub-grid-gap); display: flex; align-items: flex-end; justify-content: space-between; gap: var(--hub-space-4); }
+.upstream-heading span { color: var(--hub-accent-bright); font-size: var(--hub-text-xs); font-weight: var(--hub-weight-medium); }
+.upstream-heading h2 { margin-top: var(--hub-space-1); color: var(--hub-text); font-size: 1.05rem; font-weight: var(--hub-weight-semibold); }
+.upstream-heading p { margin-top: var(--hub-space-1); color: var(--hub-text-muted); font-size: var(--hub-text-xs); }
+.quota-source { margin-top: 1.35rem; padding: 0; border: 0; border-radius: 0; overflow: visible; background: transparent; box-shadow: none; }
+.quota-source__header { min-height: 43px; margin-bottom: var(--hub-grid-gap); padding: 0; border: 0; display: flex; align-items: flex-end; justify-content: space-between; gap: var(--hub-space-4); }
+.quota-source__header h3 { color: var(--hub-text); font-size: .86rem; font-weight: var(--hub-weight-semibold); }
+.quota-source__header p { margin-top: .3rem; display: flex; align-items: center; gap: .35rem; color: var(--hub-text-faint); font-size: .72rem; }
+.quota-source__actions { display: flex; align-items: center; gap: .55rem; flex: 0 0 auto; }
+.radar-source__link { display: inline-flex; align-items: center; gap: .2rem; color: var(--hub-accent-bright); }
+.radar-updated, .account-count { color: var(--hub-text-faint); font-family: var(--hub-font-mono); font-size: .68rem; }
+.radar-groups { margin: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--hub-grid-gap); }
+.radar-group { min-width: 0; padding: .85rem .9rem .45rem; }
+.radar-group-stack { min-width: 0; display: grid; align-content: start; gap: var(--hub-grid-gap); }
+.radar-group__header { min-height: 0; padding-bottom: .55rem; border-bottom: 1px solid var(--hub-line); display: flex; align-items: baseline; justify-content: space-between; gap: .6rem; }
+.radar-group__header h4 { min-width: 0; margin: 0; overflow: hidden; color: var(--hub-text); font-size: .95rem; font-weight: var(--hub-weight-semibold); line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+.radar-group__header span { color: var(--hub-text-faint); font-size: .68rem; white-space: nowrap; }
+.radar-row { padding: .56rem 0; border-bottom: 1px solid var(--hub-line-row); display: grid; grid-template-columns: minmax(3.75rem, auto) minmax(0, 1fr) auto; align-items: center; gap: .65rem; }
+.radar-row:last-child { border-bottom: 0; }
+.radar-row__score { min-width: 3.75rem; color: var(--hub-text); font-family: var(--hub-font-mono); font-size: var(--hub-text-radar-score); font-weight: var(--hub-weight-medium); line-height: 1.5; }
+.radar-row__mid { min-width: 0; display: flex; align-items: center; }
+.radar-row__effort { padding: .14rem .42rem; border: 1px solid var(--hub-accent-line); border-radius: var(--hub-radius-xs); color: var(--hub-accent-text); background: var(--hub-accent-soft); font-family: var(--hub-font-mono); font-size: .62rem; }
+.radar-row__stats { display: grid; gap: .18rem; text-align: right; }
+.radar-row__stats strong { color: var(--hub-text); font-family: var(--hub-font-mono); font-size: .74rem; font-weight: var(--hub-weight-medium); }
+.radar-row__stats span { color: var(--hub-text-faint); font-family: var(--hub-font-mono); font-size: .62rem; }
+.radar-loading-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--hub-grid-gap); }
+.radar-loading-grid span { min-height: 384px; border-radius: var(--hub-radius-panel); background: var(--hub-skeleton); }
+.quota-board { margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: var(--hub-grid-gap); }
+@media (max-width: 1180px) { .radar-groups, .radar-loading-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 720px) { .upstream-heading, .quota-source__header { align-items: stretch; flex-direction: column; } .radar-source__actions { align-items: flex-end; flex-direction: column; } .radar-groups, .radar-loading-grid, .quota-board { grid-template-columns: 1fr; } }
+</style>

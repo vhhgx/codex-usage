@@ -1,4 +1,4 @@
-import { and, desc, eq, lte } from 'drizzle-orm'
+import { and, desc, eq, gte, lte, sql } from 'drizzle-orm'
 import { once } from 'node:events'
 import { createHash } from 'node:crypto'
 import { createReadStream, createWriteStream } from 'node:fs'
@@ -9,6 +9,8 @@ import type { H3Event } from 'h3'
 import { useDatabase } from '../db'
 import {
   channelModels,
+  channelModelBindings,
+  channelProtocolBindings,
   channels,
   groupChannelRules,
   groupMemberships,
@@ -19,11 +21,15 @@ import {
   keyModelRules,
   modelPrices,
   modelPools,
+  servicePlanVersions,
+  usageRollups,
+  userPoolAccounts,
+  userPoolGroups,
   requestAttempts,
   requestLogs,
   users
 } from '../db/schema'
-import { contentHash, decryptSecret, hashClientIp, hashHubKey } from '../utils/hub-crypto'
+import { contentHash, decryptChannelSecret, hashCacheAffinity, hashClientIp, hashHubKey } from '../utils/hub-crypto'
 import { storeEncryptedBody, storeEncryptedStream } from '../utils/object-storage'
 import {
   acquireChannel,
@@ -36,14 +42,18 @@ import {
   type ChannelConcurrencyLease,
   type HubConcurrencyLease
 } from './hub-limits'
-import { recordChannelFailure, recordChannelSuccess, routeCandidates } from './hub-routing'
+import { keyRouteSources, recordChannelFailure, recordChannelSuccess, rememberAffinitySelection, routeCandidates, selectSupplySource, type SupplyDecision } from './hub-routing'
 import { getHubSettings } from './hub-settings'
 import { recordUsageRollups } from './hub-rollups'
 import { acquireIdempotency, completeIdempotency, failIdempotency } from './hub-idempotency'
 import { assertTrafficAccepting } from './hub-traffic'
 import { useRedis } from '../utils/redis'
 import { trustedClientIp } from '../utils/client-ip'
+import { pinnedUpstreamFetch } from '../utils/upstream-url'
 import { effectivePriceMultiplier, policyAllows } from './group-policy'
+import { getActiveSubscription } from './customer-management'
+import { holdUserWallet, releaseUserWallet, settleUserWallet } from './user-wallet'
+import { visibleChannels } from './channel-access'
 
 const MAX_BODY_BYTES = 50 * 1024 * 1024
 const MAX_BUFFERED_BODY_BYTES = 256 * 1024 * 1024
@@ -105,7 +115,7 @@ export async function writeResponseChunk(response: WritableResponse, chunk: Buff
   })
 }
 
-interface UsageValue {
+export interface UsageValue {
   inputTokens: number
   outputTokens: number
   cachedTokens: number
@@ -120,10 +130,13 @@ function openAiError(status: number, message: string, type = 'invalid_request_er
 
 function bearerToken(event: H3Event) {
   const header = getHeader(event, 'authorization') || ''
-  return header.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || ''
+  const bearer = header.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || ''
+  const apiKey = (getHeader(event, 'x-api-key') || '').trim()
+  if (bearer && apiKey && bearer !== apiKey) openAiError(401, 'Conflicting Hub Key headers', 'authentication_error', 'invalid_api_key')
+  return bearer || apiKey
 }
 
-async function authenticate(event: H3Event) {
+export async function authenticateHubRequest(event: H3Event) {
   const token = bearerToken(event)
   if (!token) openAiError(401, 'Missing bearer token', 'authentication_error', 'invalid_api_key')
   const db = useDatabase(event)
@@ -160,7 +173,7 @@ async function authenticate(event: H3Event) {
   return { key, group, userId: owner.id }
 }
 
-async function touchKeyCredential(event: H3Event, keyId: string) {
+export async function touchKeyCredential(event: H3Event, keyId: string) {
   const now = new Date()
   const db = useDatabase(event)
   await db.update(hubKeys).set({ lastUsedAt: now, updatedAt: now }).where(eq(hubKeys.id, keyId))
@@ -235,6 +248,19 @@ function bodyModel(raw: Buffer, contentType: string) {
   return { model: '', json: null, metadata: null }
 }
 
+function stableOpenAiPrefix(metadata: Record<string, unknown> | null | undefined) {
+  if (metadata?.instructions !== undefined) return metadata.instructions
+  if (!Array.isArray(metadata?.messages)) return null
+  const prefix = []
+  for (const rawMessage of metadata.messages) {
+    if (!rawMessage || typeof rawMessage !== 'object') break
+    const message = rawMessage as Record<string, unknown>
+    if (message.role !== 'system' && message.role !== 'developer') break
+    prefix.push(message)
+  }
+  return prefix.length ? prefix : null
+}
+
 const ARCHIVE_SECRET_FIELDS = new Set([
   'authorization', 'proxyauthorization', 'cookie', 'setcookie', 'xapikey', 'apikey',
   'accesstoken', 'refreshtoken', 'clientsecret'
@@ -262,7 +288,7 @@ export function sanitizeArchiveBody(raw: Buffer, contentType: string) {
   }
 }
 
-function upstreamHeaders(event: H3Event, apiKey: string) {
+function upstreamHeaders(event: H3Event, apiKey: string, authScheme: 'bearer' | 'x_api_key' = 'bearer', apiVersion?: string | null) {
   const headers = new Headers()
   const requestHeaders = getRequestHeaders(event)
   const connectionTokens = String(requestHeaders.connection || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
@@ -274,7 +300,10 @@ function upstreamHeaders(event: H3Event, apiKey: string) {
   for (const [name, value] of Object.entries(requestHeaders)) {
     if (!blocked.has(name.toLowerCase()) && value !== undefined) headers.set(name, String(value))
   }
-  headers.set('authorization', `Bearer ${apiKey}`)
+  if (authScheme === 'x_api_key') {
+    headers.set('x-api-key', apiKey)
+    headers.set('anthropic-version', apiVersion || '2023-06-01')
+  } else headers.set('authorization', `Bearer ${apiKey}`)
   headers.set('accept-encoding', 'identity')
   return headers
 }
@@ -379,7 +408,7 @@ export function normalizeUpstreamError(buffer: Buffer, status: number, statusTex
   }
 }
 
-async function calculateCost(event: H3Event, model: string, usage: UsageValue, request: Record<string, unknown> | null, multipliers: number) {
+export async function calculateCost(event: H3Event, model: string, usage: UsageValue, request: Record<string, unknown> | null, multipliers: number) {
   const [price] = await useDatabase(event).select().from(modelPrices)
     .where(and(eq(modelPrices.publicModel, model), lte(modelPrices.effectiveAt, new Date())))
     .orderBy(desc(modelPrices.effectiveAt)).limit(1)
@@ -395,7 +424,7 @@ async function calculateCost(event: H3Event, model: string, usage: UsageValue, r
   return (tokenCost + usage.imageCount * imageUnit) * multipliers
 }
 
-async function estimateReservation(event: H3Event, model: string, endpoint: string, request: Record<string, unknown> | null, bodyLength: number, multiplier: number) {
+export async function estimateReservation(event: H3Event, model: string, endpoint: string, request: Record<string, unknown> | null, bodyLength: number, multiplier: number) {
   const outputLimit = endpoint === '/v1/embeddings' || endpoint.startsWith('/v1/images/') ? 0 : Math.max(0, numberValue(request?.max_output_tokens ?? request?.max_completion_tokens ?? request?.max_tokens) || 4096)
   const inputEstimate = endpoint.startsWith('/v1/images/') ? 0 : Math.ceil(bodyLength / 4)
   const usesImageTool = endpoint === '/v1/responses' && Array.isArray(request?.tools)
@@ -405,7 +434,7 @@ async function estimateReservation(event: H3Event, model: string, endpoint: stri
   return { tokens: usage.totalTokens, cost: await calculateCost(event, model, usage, request, multiplier), imageCount, ...imageRequestOptions(request) }
 }
 
-function enforceRequestProtection(key: typeof hubKeys.$inferSelect, reservation: Awaited<ReturnType<typeof estimateReservation>>) {
+export function enforceRequestProtection(key: typeof hubKeys.$inferSelect, reservation: Awaited<ReturnType<typeof estimateReservation>>) {
   if (key.maxRequestTokens !== null && reservation.tokens > key.maxRequestTokens) {
     openAiError(400, 'Request exceeds this Hub Key token limit', 'invalid_request_error', 'request_token_limit')
   }
@@ -423,11 +452,11 @@ function enforceRequestProtection(key: typeof hubKeys.$inferSelect, reservation:
   }
 }
 
-async function storeBodySafe(event: H3Event, requestId: string, kind: 'request' | 'response', body: Buffer, contentType: string) {
+export async function storeBodySafe(event: H3Event, requestId: string, kind: 'request' | 'response', body: Buffer, contentType: string) {
   try { return await storeEncryptedBody(event, requestId, kind, body, contentType) } catch { return null }
 }
 
-async function storeFileSafe(event: H3Event, requestId: string, kind: 'request' | 'response', path: string, contentType: string) {
+export async function storeFileSafe(event: H3Event, requestId: string, kind: 'request' | 'response', path: string, contentType: string) {
   try { return await storeEncryptedStream(event, requestId, kind, createReadStream(path), contentType) } catch { return null }
 }
 
@@ -476,25 +505,28 @@ async function readRequestBodyLimited(event: H3Event, limit: number, memory: Ret
   return Buffer.concat(chunks, total)
 }
 
-async function listModels(event: H3Event, key: typeof hubKeys.$inferSelect, group: typeof groups.$inferSelect) {
+export async function listAccessibleModels(event: H3Event, key: typeof hubKeys.$inferSelect, group: typeof groups.$inferSelect, userId: string, protocols: Array<'anthropic_messages' | 'openai_responses' | 'openai_chat'>) {
   const db = useDatabase(event)
   const [rules, groupRules, channelRules] = await Promise.all([
     db.select().from(keyModelRules).where(eq(keyModelRules.keyId, key.id)),
     db.select().from(groupModelRules).where(eq(groupModelRules.groupId, group.id)),
     db.select().from(groupChannelRules).where(eq(groupChannelRules.groupId, group.id))
   ])
-  const rows = await db.select({ publicModel: channelModels.publicModel, channelId: channels.id, healthStatus: channels.healthStatus })
-    .from(channelModels)
+  const rows = await db.select({ publicModel: channelModels.publicModel, channelId: channels.id, healthStatus: channels.healthStatus, protocol: channelProtocolBindings.protocol })
+    .from(channelModelBindings)
+    .innerJoin(channelModels, eq(channelModelBindings.channelModelId, channelModels.id))
+    .innerJoin(channelProtocolBindings, eq(channelModelBindings.protocolBindingId, channelProtocolBindings.id))
     .innerJoin(channels, eq(channelModels.channelId, channels.id))
-    .where(and(eq(channelModels.enabled, true), eq(channels.enabled, true)))
+    .where(and(eq(channelModels.enabled, true), eq(channelModelBindings.enabled, true), eq(channelProtocolBindings.enabled, true), eq(channels.enabled, true)))
   const pools = await db.select().from(modelPools)
   const disabledPools = new Set(pools.filter(pool => !pool.enabled).map(pool => pool.publicModel))
   const redis = useRedis(event)
+  const visibleIds = new Set((await visibleChannels(event, userId, key.id)).map(channel => channel.id))
   const usableRows = []
   const restrictedChannels = channelRules.length > 0
   const enabledChannels = new Set(channelRules.filter(rule => rule.enabled).map(rule => rule.channelId))
   for (const row of rows) {
-    if (row.healthStatus !== 'healthy' || disabledPools.has(row.publicModel)) continue
+    if (!protocols.includes(row.protocol) || !visibleIds.has(row.channelId) || row.healthStatus !== 'healthy' || disabledPools.has(row.publicModel)) continue
     if (restrictedChannels && !enabledChannels.has(row.channelId)) continue
     if (!await redis.exists(`hub:circuit:${row.channelId}:open`)) usableRows.push(row)
   }
@@ -506,7 +538,7 @@ async function listModels(event: H3Event, key: typeof hubKeys.$inferSelect, grou
   return { object: 'list', data: models.sort().map(id => ({ id, object: 'model', created: 0, owned_by: 'zephyr-hub' })) }
 }
 
-async function handleModelsRequest(event: H3Event, access: Awaited<ReturnType<typeof authenticate>>, requestId: string) {
+async function handleModelsRequest(event: H3Event, access: Awaited<ReturnType<typeof authenticateHubRequest>>, requestId: string) {
   const { key, group, userId } = access
   const endpoint = '/v1/models'
   const startedAt = Date.now()
@@ -534,7 +566,7 @@ async function handleModelsRequest(event: H3Event, access: Awaited<ReturnType<ty
     }).returning()
     if (!log) throw new Error('Unable to initialize request log')
 
-    const result = await listModels(event, key, group)
+    const result = await listAccessibleModels(event, key, group, userId, ['openai_responses', 'openai_chat'])
     const durationMs = Date.now() - startedAt
     await useDatabase(event).update(requestLogs).set({
       status: 'success',
@@ -595,7 +627,7 @@ async function handleModelsRequest(event: H3Event, access: Awaited<ReturnType<ty
 
 export async function handleHubRequest(event: H3Event, path: string) {
   const endpoint = endpointName(path)
-  const access = await authenticate(event)
+  const access = await authenticateHubRequest(event)
   const { key, group, userId } = access
   await assertTrafficAccepting(event)
   if (!policyAllows(key.allowedEndpoints, endpoint)) {
@@ -640,6 +672,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
       groupId: group.id,
       endpoint,
       requestedModel: parsed.model,
+      inboundProtocol: endpoint === '/v1/responses' ? 'openai_responses' : 'openai_chat',
       status: replay.status >= 200 && replay.status < 400 ? 'success' : 'error',
       httpStatus: replay.status,
       errorCode: 'idempotent_replay',
@@ -654,11 +687,33 @@ export async function handleHubRequest(event: H3Event, path: string) {
     return replay.status >= 400 ? normalizeUpstreamError(replay.body, replay.status, '', (await getHubSettings(event)).errorMessageOverrides[String(replay.status)] || '') : replay.body
   }
   let candidates: Awaited<ReturnType<typeof routeCandidates>>
+  let supplyDecision: SupplyDecision = { source: 'platform', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
+  let selectedSupplyMode = 'platform_only'
+  let selectedPoolGroupId: string | undefined
+  let walletHoldKey: string | null = null
+  let walletHeld = false
+  let affinityKey: string | undefined
+  let affinityWasReused = false
   let reservation: Awaited<ReturnType<typeof estimateReservation>>
   let concurrencyLease: HubConcurrencyLease
   try {
-    candidates = await routeCandidates(event, parsed.model, endpoint, group.id)
-    if (!candidates.length) {
+    const inboundProtocol: 'openai_responses' | 'openai_chat' = endpoint === '/v1/responses' ? 'openai_responses' : 'openai_chat'
+    affinityKey = hashCacheAffinity(event, {
+      scope: `${userId}:${key.id}`,
+      protocol: inboundProtocol,
+      model: parsed.model,
+      system: stableOpenAiPrefix(parsed.metadata),
+      tools: parsed.metadata?.tools,
+      sessionId: getHeader(event, 'x-zephyr-session-id') || null
+    })
+    const routeOptions = { userId, keyId: key.id, protocol: inboundProtocol, affinityKey }
+    let requestedSource: 'platform' | 'user_relay' = key.routeMode === 'private_only' ? 'user_relay' : 'platform'
+    let initialCandidates: Awaited<ReturnType<typeof routeCandidates>> = []
+    for (const source of keyRouteSources(key.routeMode)) {
+      const matching = await routeCandidates(event, parsed.model, endpoint, group.id, source, undefined, routeOptions)
+      if (matching.length) { requestedSource = source; initialCandidates = matching; break }
+    }
+    if (!initialCandidates.length) {
       const message = (await getHubSettings(event)).errorMessageOverrides['503'] || `No healthy channel supports model ${parsed.model}`
       openAiError(503, message, 'server_error', 'no_available_channel')
     }
@@ -668,12 +723,72 @@ export async function handleHubRequest(event: H3Event, path: string) {
       endpoint,
       parsed.metadata,
       requestBody.length,
-      effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Math.max(...candidates.map(candidate => Number(candidate.channel.priceMultiplier))))
+      effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Math.max(...initialCandidates.map(candidate => Number(candidate.channel.priceMultiplier))))
     )
+    if (requestedSource === 'user_relay') {
+      candidates = initialCandidates
+      supplyDecision = { source: 'user_relay', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
+      event.context.hubSupplySource = 'user_relay'
+      enforceRequestProtection(key, reservation)
+      concurrencyLease = await admitHubRequest(event, key, group, reservation.tokens, 0, { skipSubscriptionQuota: true })
+    } else {
+    const activeSubscription = await getActiveSubscription(event, userId)
+    const version = activeSubscription?.subscription.planVersionId
+      ? (await useDatabase(event).select().from(servicePlanVersions).where(eq(servicePlanVersions.id, activeSubscription.subscription.planVersionId)).limit(1))[0]
+      : null
+    const snapshot = activeSubscription?.subscription.entitlementSnapshot || {}
+    const billingMode = String(version?.billingMode || snapshot.billingMode || (activeSubscription?.plan.mode === 'token' ? 'token_package' : activeSubscription?.plan.mode === 'cost' ? 'token_metered' : 'unlimited'))
+    const supplyMode = String(version?.supplyMode || snapshot.supplyMode || 'platform_only')
+    selectedSupplyMode = supplyMode
+    const tokenLimit = Number(version?.tokenLimit ?? snapshot.tokenLimit ?? activeSubscription?.plan.tokenLimit ?? 0)
+    const usedRow = activeSubscription && tokenLimit > 0
+      ? (await useDatabase(event).select({ tokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}), 0)` }).from(usageRollups).where(and(eq(usageRollups.userId, userId), eq(usageRollups.granularity, 'day'), gte(usageRollups.bucketStart, activeSubscription.subscription.startsAt))))[0]
+      : null
+    const pool = await useDatabase(event).select().from(userPoolGroups).where(and(eq(userPoolGroups.ownerUserId, userId), eq(userPoolGroups.status, 'active'))).limit(1)
+    selectedPoolGroupId = pool[0]?.id
+    const privatePoolAvailable = Boolean(pool[0] && (await useDatabase(event).select({ id: userPoolAccounts.id }).from(userPoolAccounts).where(and(eq(userPoolAccounts.poolGroupId, pool[0]!.id), eq(userPoolAccounts.status, 'active'), eq(userPoolAccounts.schedulable, true))).limit(1))[0])
+    supplyDecision = selectSupplySource({
+      billingMode,
+      supplyMode,
+      estimatedTokens: reservation.tokens,
+      remainingTokens: tokenLimit > 0 ? Math.max(0, tokenLimit - Number(usedRow?.tokens || 0)) : null,
+      privatePoolAvailable,
+      subscriptionId: activeSubscription?.subscription.id,
+      planVersionId: version?.id || activeSubscription?.subscription.planVersionId,
+      poolGroupId: pool[0]?.id
+    })
+    candidates = supplyDecision.source === 'private_pool'
+      ? await routeCandidates(event, parsed.model, endpoint, group.id, 'private_pool', supplyDecision.poolGroupId, routeOptions)
+      : initialCandidates
+    if (!candidates.length) openAiError(503, '专属号池当前没有可调度账号', 'server_error', 'private_pool_unavailable')
+    event.context.hubSupplySource = supplyDecision.source
+    event.context.hubPoolGroupId = supplyDecision.poolGroupId
+    event.context.hubSubscriptionId = supplyDecision.subscriptionId
+    event.context.hubPlanVersionId = supplyDecision.planVersionId
+    if (billingMode === 'token_metered' && reservation.cost > 0) {
+      walletHoldKey = `request:${requestId}:hold`
+      await holdUserWallet(event, userId, reservation.cost, walletHoldKey, requestId)
+      walletHeld = true
+    }
     enforceRequestProtection(key, reservation)
-    concurrencyLease = await admitHubRequest(event, key, group, reservation.tokens, reservation.cost)
+    try {
+      concurrencyLease = await admitHubRequest(event, key, group, reservation.tokens, reservation.cost, { skipSubscriptionQuota: supplyDecision.source === 'private_pool' })
+    } catch (error) {
+      const failure = error as { statusCode?: number; message?: string }
+      const quotaExhausted = failure.statusCode === 429 && /当前套餐.*(?:Token|额度).*用尽|subscription:token_quota/i.test(String(failure.message || ''))
+      if (supplyDecision.source !== 'platform' || selectedSupplyMode !== 'platform_then_private' || !quotaExhausted || !selectedPoolGroupId || !privatePoolAvailable) throw error
+      supplyDecision = { source: 'private_pool', subscriptionId: supplyDecision.subscriptionId, planVersionId: supplyDecision.planVersionId, reservedTokens: 0, poolGroupId: selectedPoolGroupId }
+      candidates = await routeCandidates(event, parsed.model, endpoint, group.id, 'private_pool', selectedPoolGroupId, routeOptions)
+      if (!candidates.length) throw createError({ statusCode: 429, message: '套餐额度已用尽，专属号池当前不可用', data: { code: 'private_pool_unavailable' } })
+      event.context.hubSupplySource = supplyDecision.source
+      event.context.hubPoolGroupId = supplyDecision.poolGroupId
+      concurrencyLease = await admitHubRequest(event, key, group, reservation.tokens, reservation.cost, { skipSubscriptionQuota: true })
+    }
+    }
+    affinityWasReused = candidates[0]?.affinityReused === true
   } catch (error) {
     if (idempotency) await failIdempotency(event, idempotency.record.id, false).catch(() => {})
+    if (walletHeld && walletHoldKey) { await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {}); walletHeld = false }
     const failure = error as { statusCode?: number; message?: string }
     if (failure.statusCode === 429) {
       openAiError(429, failure.message || 'Hub Key has reached its usage limit', 'rate_limit_error', 'rate_limit_exceeded')
@@ -691,19 +806,28 @@ export async function handleHubRequest(event: H3Event, path: string) {
       groupId: group.id,
       endpoint,
       requestedModel: parsed.model,
+      inboundProtocol: endpoint === '/v1/responses' ? 'openai_responses' : 'openai_chat',
       status: 'pending',
       streaming,
+      supplySource: supplyDecision.source,
+      poolGroupId: supplyDecision.poolGroupId || null,
+      subscriptionId: supplyDecision.subscriptionId,
+      planVersionId: supplyDecision.planVersionId,
+      billableTokens: reservation.tokens,
+      billedAmount: String(supplyDecision.source === 'user_relay' ? 0 : reservation.cost),
       clientIpHash: hashClientIp(trustedClientIp(event), event),
       requestBodyHash: contentHash(archivedRequestBody),
       bodyExpiresAt: new Date(Date.now() + settings.bodyRetentionDays * 24 * 60 * 60 * 1000)
     }).returning()
   } catch (error) {
     await settleHubRequest(event, key, group, 0, 0, reservation.tokens, reservation.cost, concurrencyLease!)
+    if (walletHeld && walletHoldKey) { await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {}); walletHeld = false }
     if (idempotency) await failIdempotency(event, idempotency.record.id, false).catch(() => {})
     throw error
   }
   if (!log) {
     await settleHubRequest(event, key, group, 0, 0, reservation.tokens, reservation.cost, concurrencyLease!)
+    if (walletHeld && walletHoldKey) { await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {}); walletHeld = false }
     throw createError({ statusCode: 500, message: 'Unable to initialize request log' })
   }
   const requestObject = await storeBodySafe(event, requestId, 'request', archivedRequestBody, contentType)
@@ -725,6 +849,11 @@ export async function handleHubRequest(event: H3Event, path: string) {
       admittedChannel = channelLease
       const attemptStarted = Date.now()
       let upstreamHeadersReceived = false
+      let closePinnedConnection: (() => Promise<void>) | null = null
+      const closePinned = async () => {
+        const close = closePinnedConnection
+        if (close) await close().catch(() => {})
+      }
       const upstreamAbort = new AbortController()
       const upstreamTimeout = setTimeout(() => {
         upstreamAbort.abort(timeoutError(`Upstream request timed out after ${candidate.channel.timeoutMs} ms`))
@@ -742,18 +871,22 @@ export async function handleHubRequest(event: H3Event, path: string) {
         } else if (contentType.includes('multipart/form-data')) {
           outgoing = replaceMultipartModel(requestBody, contentType, candidate.upstreamModel)
         }
-        const upstreamBase = candidate.channel.baseUrl.replace(/\/+$/, '').replace(/\/v1$/i, '')
+        const upstreamBase = (candidate.protocolBinding.baseUrlOverride || candidate.channel.baseUrl).replace(/\/+$/, '').replace(/\/v1$/i, '')
+        const credential = candidate.credential || decryptChannelSecret(candidate.channel.encryptedApiKey, candidate.channel.id, candidate.channel.ownerKind, event)
+        const headers = upstreamHeaders(event, credential, candidate.protocolBinding.authScheme, candidate.protocolBinding.apiVersion)
         upstreamRequestStarted = true
-        const response = await fetch(`${upstreamBase}${endpoint}`, {
-          method: 'POST',
-          headers: upstreamHeaders(event, decryptSecret(candidate.channel.encryptedApiKey, event)),
-          body: outgoing as unknown as BodyInit,
-          signal: upstreamAbort.signal
-        })
+        const response = candidate.channel.ownerKind === 'user'
+          ? await (async () => {
+              const result = await pinnedUpstreamFetch(upstreamBase, endpoint, { method: 'POST', headers, body: outgoing, signal: upstreamAbort.signal })
+              closePinnedConnection = result.close
+              return result.response as unknown as Response
+            })()
+          : await fetch(`${upstreamBase}${endpoint}`, { method: 'POST', headers, body: outgoing as unknown as BodyInit, redirect: 'manual', signal: upstreamAbort.signal })
         upstreamHeadersReceived = true
         const retryable = RETRYABLE_STATUS.has(response.status)
         if (retryable && index < candidates.length - 1) {
           const errorText = (await response.text()).slice(0, 1000)
+          await closePinned()
           stopUpstreamTimeout()
           await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, attempt: attemptCount, status: 'failed', httpStatus: response.status, durationMs: Date.now() - attemptStarted, errorMessage: errorText })
           await recordChannelFailure(event, candidate.channel.id, `HTTP ${response.status}`)
@@ -808,6 +941,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
             event.node.res.off('close', markAborted)
             archive.end()
             await once(archive, 'finish').catch(() => {})
+            await closePinned()
             try {
               await releaseHubConcurrency(event, concurrencyLease)
             } catch {}
@@ -819,12 +953,13 @@ export async function handleHubRequest(event: H3Event, path: string) {
           }
           const usage = extractUsage(usageTail, responseContentType)
           const streamAborted = clientAborted || Boolean(streamError)
-          const cost = await calculateCost(event, parsed.model, usage, parsed.metadata, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Number(candidate.channel.priceMultiplier)))
+          const cost = supplyDecision.source === 'user_relay' ? 0 : await calculateCost(event, parsed.model, usage, parsed.metadata, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Number(candidate.channel.priceMultiplier)))
           const responseObject = await storeFileSafe(event, requestId, 'response', temporaryPath, responseContentType)
           await rm(temporaryDirectory, { recursive: true, force: true })
           await useDatabase(event).insert(requestAttempts).values({
             requestLogId: log.id,
             channelId: candidate.channel.id,
+            protocolBindingId: candidate.protocolBinding.id,
             attempt: attemptCount,
             status: streamAborted ? 'stream_aborted' : 'success',
             httpStatus: response.status,
@@ -833,6 +968,12 @@ export async function handleHubRequest(event: H3Event, path: string) {
           })
           await useDatabase(event).update(requestLogs).set({
             channelId: candidate.channel.id,
+            protocolBindingId: candidate.protocolBinding.id,
+            outboundProtocol: candidate.protocolBinding.protocol,
+            conversionMode: candidate.conversionMode,
+            sourceOwnerKind: candidate.channel.ownerKind,
+            sourceOwnerUserId: candidate.channel.ownerUserId,
+            cacheAffinityReused: affinityWasReused,
             upstreamModel: candidate.upstreamModel,
             status: streamAborted ? 'stream_aborted' : 'success',
             httpStatus: response.status,
@@ -843,6 +984,9 @@ export async function handleHubRequest(event: H3Event, path: string) {
             totalTokens: usage.totalTokens,
             imageCount: usage.imageCount,
             cost: String(cost),
+            billableTokens: usage.totalTokens,
+            billedAmount: String(cost),
+            pricingSnapshot: { model: parsed.model, channelMultiplier: Number(candidate.channel.priceMultiplier), groupMultiplier: Number(group.priceMultiplier), keyMultiplier: Number(key.priceMultiplier) },
             firstByteMs: firstByteMs ?? Date.now() - startedAt,
             durationMs: Date.now() - startedAt,
             failoverCount: Math.max(0, attemptCount - 1),
@@ -853,15 +997,19 @@ export async function handleHubRequest(event: H3Event, path: string) {
             completedAt: new Date()
           }).where(eq(requestLogs.id, log.id))
           await touchKeyCredential(event, key.id)
-          await recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: candidate.channel.id, model: parsed.model, endpoint, status: streamAborted ? 'stream_aborted' : 'success', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, totalTokens: usage.totalTokens, cost, durationMs: Date.now() - startedAt, failovers: Math.max(0, attemptCount - 1) })
+          await recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, protocol: candidate.protocolBinding.protocol, model: parsed.model, endpoint, status: streamAborted ? 'stream_aborted' : 'success', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, affinityReused: affinityWasReused, affinityEligible: Boolean(affinityKey), totalTokens: usage.totalTokens, cost, durationMs: Date.now() - startedAt, failovers: Math.max(0, attemptCount - 1) })
           await settleHubRequest(event, key, group, usage.totalTokens, cost, reservation.tokens, reservation.cost, concurrencyLease)
+          if (walletHeld && walletHoldKey) { await settleUserWallet(event, userId, walletHoldKey, cost, `request:${requestId}:settle`, requestId); walletHeld = false }
           settled = true
           if (admittedChannel) {
             await releaseChannel(event, admittedChannel)
             admittedChannel = null
           }
           if (streamError) await recordChannelFailure(event, candidate.channel.id, streamError.message)
-          else await recordChannelSuccess(event, candidate.channel.id)
+          else {
+            await recordChannelSuccess(event, candidate.channel.id)
+            await rememberAffinitySelection(event, affinityKey, candidate)
+          }
           return
         }
         const responseChunks: Buffer[] = []
@@ -876,14 +1024,21 @@ export async function handleHubRequest(event: H3Event, path: string) {
         }
         stopUpstreamTimeout()
         const responseBuffer = Buffer.concat(responseChunks)
+        await closePinned()
         firstByteMs ??= Date.now() - startedAt
         const usage = extractUsage(responseBuffer, responseContentType)
-        const cost = await calculateCost(event, parsed.model, usage, parsed.metadata, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Number(candidate.channel.priceMultiplier)))
+        const cost = supplyDecision.source === 'user_relay' ? 0 : await calculateCost(event, parsed.model, usage, parsed.metadata, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Number(candidate.channel.priceMultiplier)))
         const responseObject = await storeBodySafe(event, requestId, 'response', responseBuffer, responseContentType)
         if (idempotency) await completeIdempotency(event, idempotency.record.id, response.status, responseContentType, responseObject)
-        await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, attempt: attemptCount, status: response.ok ? 'success' : 'failed', httpStatus: response.status, durationMs: Date.now() - attemptStarted })
+        await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attemptCount, status: response.ok ? 'success' : 'failed', httpStatus: response.status, durationMs: Date.now() - attemptStarted })
         await useDatabase(event).update(requestLogs).set({
           channelId: candidate.channel.id,
+          protocolBindingId: candidate.protocolBinding.id,
+          outboundProtocol: candidate.protocolBinding.protocol,
+          conversionMode: candidate.conversionMode,
+          sourceOwnerKind: candidate.channel.ownerKind,
+          sourceOwnerUserId: candidate.channel.ownerUserId,
+          cacheAffinityReused: affinityWasReused,
           upstreamModel: candidate.upstreamModel,
           status: response.ok ? 'success' : 'error',
           httpStatus: response.status,
@@ -894,6 +1049,9 @@ export async function handleHubRequest(event: H3Event, path: string) {
           totalTokens: usage.totalTokens,
           imageCount: usage.imageCount,
           cost: String(cost),
+          billableTokens: usage.totalTokens,
+          billedAmount: String(cost),
+          pricingSnapshot: { model: parsed.model, channelMultiplier: Number(candidate.channel.priceMultiplier), groupMultiplier: Number(group.priceMultiplier), keyMultiplier: Number(key.priceMultiplier) },
           firstByteMs,
           durationMs: Date.now() - startedAt,
           failoverCount: Math.max(0, attemptCount - 1),
@@ -903,12 +1061,16 @@ export async function handleHubRequest(event: H3Event, path: string) {
           completedAt: new Date()
         }).where(eq(requestLogs.id, log.id))
         await touchKeyCredential(event, key.id)
-        await recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: candidate.channel.id, model: parsed.model, endpoint, status: response.ok ? 'success' : 'error', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, totalTokens: usage.totalTokens, cost, durationMs: Date.now() - startedAt, failovers: Math.max(0, attemptCount - 1) })
+        await recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, protocol: candidate.protocolBinding.protocol, model: parsed.model, endpoint, status: response.ok ? 'success' : 'error', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, affinityReused: affinityWasReused, affinityEligible: Boolean(affinityKey), totalTokens: usage.totalTokens, cost, durationMs: Date.now() - startedAt, failovers: Math.max(0, attemptCount - 1) })
         await settleHubRequest(event, key, group, usage.totalTokens, cost, reservation.tokens, reservation.cost, concurrencyLease)
+        if (walletHeld && walletHoldKey) { await settleUserWallet(event, userId, walletHoldKey, cost, `request:${requestId}:settle`, requestId); walletHeld = false }
         settled = true
         await releaseChannel(event, channelLease)
         admittedChannel = null
-        if (response.ok) await recordChannelSuccess(event, candidate.channel.id)
+        if (response.ok) {
+          await recordChannelSuccess(event, candidate.channel.id)
+          await rememberAffinitySelection(event, affinityKey, candidate)
+        }
         else if (response.status === 401 || response.status === 403 || RETRYABLE_STATUS.has(response.status)) await recordChannelFailure(event, candidate.channel.id, `HTTP ${response.status}`)
         responseHeaders(event, response, requestId)
         if (!response.ok) {
@@ -918,6 +1080,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
         return responseBuffer
       } catch (error) {
         stopUpstreamTimeout()
+        await closePinned()
         if (responseStarted) throw error
         await useDatabase(event).insert(requestAttempts).values({
           requestLogId: log.id,
@@ -940,6 +1103,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
     if (idempotency) await failIdempotency(event, idempotency.record.id, upstreamRequestStarted).catch(() => {})
     if (admittedChannel) await releaseChannel(event, admittedChannel)
     if (!settled) await settleHubRequest(event, key, group, 0, 0, reservation.tokens, reservation.cost, concurrencyLease)
+    if (walletHeld && walletHoldKey) { await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {}); walletHeld = false }
     const message = error instanceof Error ? error.message : 'All upstream channels failed'
     await useDatabase(event).update(requestLogs).set({ channelId: lastCandidate?.channel.id || null, upstreamModel: lastCandidate?.upstreamModel || null, status: 'error', httpStatus: 502, errorMessage: message.slice(0, 2000), durationMs: Date.now() - startedAt, failoverCount: Math.max(0, attemptCount - 1), completedAt: new Date() }).where(eq(requestLogs.id, log.id))
     if (lastCandidate) await recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: lastCandidate.channel.id, model: parsed.model, endpoint, status: 'error', inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0, durationMs: Date.now() - startedAt, failovers: Math.max(0, attemptCount - 1) })

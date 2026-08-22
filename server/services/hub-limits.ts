@@ -67,8 +67,9 @@ function groupPeriods(group: Group, timeZone: string, now = new Date()): LimitPe
   ]
 }
 
-export function subscriptionAdmissionScope(subscription: UserSubscription, plan: ServicePlan): AdmissionScope | null {
-  if (plan.mode === 'unlimited') return null
+export function subscriptionAdmissionScope(subscription: UserSubscription, plan: ServicePlan, entitlement?: { billingMode?: string; tokenLimit?: number | null; quotaUnit?: string }): AdmissionScope | null {
+  const billingMode = entitlement?.billingMode
+  if (billingMode === 'unlimited' || billingMode === 'token_metered' || !billingMode && plan.mode === 'unlimited') return null
   const expiresInSeconds = subscription.expiresAt
     ? Math.max(60, Math.ceil((subscription.expiresAt.getTime() - Date.now()) / 1000) + 86400)
     : 0
@@ -81,8 +82,8 @@ export function subscriptionAdmissionScope(subscription: UserSubscription, plan:
     periods: [{
       suffix: 'cycle',
       requestLimit: null,
-      tokenLimit: plan.mode === 'token' ? plan.tokenLimit : null,
-      costLimit: plan.mode === 'cost' ? plan.costLimit : null,
+      tokenLimit: billingMode === 'token_package' ? entitlement?.tokenLimit ?? plan.tokenLimit : plan.mode === 'token' ? plan.tokenLimit : null,
+      costLimit: !billingMode && plan.mode === 'cost' ? plan.costLimit : null,
       ttl: expiresInSeconds,
       startsAt: subscription.startsAt
     }]
@@ -265,13 +266,14 @@ end
 return 'ok'
 `
 
-export async function admitHubRequest(event: H3Event, key: HubKey, group: Group | null, reservedTokens: number, reservedCost: number) {
+export async function admitHubRequest(event: H3Event, key: HubKey, group: Group | null, reservedTokens: number, reservedCost: number, options: { skipSubscriptionQuota?: boolean } = {}) {
   const settings = await getHubSettings(event)
   const scopes = admissionScopes(key, group, settings.timezone)
   if (key.ownerUserId) {
     const { subscription, plan } = await requireActiveSubscription(event, key.ownerUserId)
-    const planScope = subscriptionAdmissionScope(subscription, plan)
-    if (planScope) scopes.push(planScope)
+    const snapshot = subscription.entitlementSnapshot as { billingMode?: string; tokenLimit?: number | null } | null
+    const planScope = subscriptionAdmissionScope(subscription, plan, snapshot || undefined)
+    if (planScope && !options.skipSubscriptionQuota) scopes.push(planScope)
   }
   await hydrateUsageCounters(event, scopes, settings.timezone)
   const redis = useRedis(event)

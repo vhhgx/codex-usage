@@ -9,37 +9,20 @@ const props = defineProps<{
   account: CodexAccountView
   quota?: CodexQuotaResult
   loading?: boolean
-  scheduleStatus?: 'available' | 'paused'
 }>()
 
 defineEmits<{ refresh: [id: string] }>()
 
 const primaryWindow = computed(() =>
-  props.quota?.windows.find((window) => window.kind === 'five-hour') || props.quota?.windows[0]
+  props.quota?.windows.find(window => window.kind === 'five-hour') || props.quota?.windows[0]
 )
 
 const secondaryWindow = computed(() =>
-  props.quota?.windows.find((window) => window.kind === 'weekly' || window.kind === 'monthly') ||
-  props.quota?.windows.find((window) => window.id !== primaryWindow.value?.id)
+  props.quota?.windows.find(window => window.kind === 'weekly' || window.kind === 'monthly') ||
+  props.quota?.windows.find(window => window.id !== primaryWindow.value?.id)
 )
-
-const extraWindows = computed(() =>
-  (props.quota?.windows || []).filter(
-    (window) => window.id !== primaryWindow.value?.id && window.id !== secondaryWindow.value?.id
-  )
-)
-
-const weeklyWindow = computed(() =>
-  props.quota?.windows.find((window) => window.kind === 'weekly')
-)
-
-const quotaUnavailable = computed(() => {
-  const remaining = weeklyWindow.value?.remainingPercent
-  return typeof remaining === 'number' && remaining <= 0
-})
 
 const cardTone = computed(() => {
-  if (quotaUnavailable.value) return 'neutral'
   const values = [primaryWindow.value?.remainingPercent, secondaryWindow.value?.remainingPercent]
     .filter((value): value is number => typeof value === 'number')
   const minimum = values.length ? Math.min(...values) : null
@@ -54,108 +37,63 @@ function percent(value: number | null | undefined) {
 }
 
 function resetText(value: number | null | undefined) {
-  if (!value) return '重置时间未知'
-  return new Intl.DateTimeFormat('zh-CN', {
+  if (!value) return '恢复时间未知'
+  return `${new Intl.DateTimeFormat('zh-CN', {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit'
-  }).format(value)
+  }).format(value)} 恢复`
 }
 
-function refreshedText(value: number | undefined) {
-  if (!value) return '尚未查询'
-  return `更新于 ${new Intl.DateTimeFormat('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit'
-  }).format(value)}`
+function updateSpotlight(event: PointerEvent) {
+  if (!window.matchMedia('(min-width: 961px) and (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference)').matches
+    || window.matchMedia('(prefers-reduced-transparency: reduce)').matches) return
+  const element = event.currentTarget as HTMLElement
+  const rect = element.getBoundingClientRect()
+  element.style.setProperty('--spot-x', `${event.clientX - rect.left}px`)
+  element.style.setProperty('--spot-y', `${event.clientY - rect.top}px`)
 }
-
 </script>
 
 <template>
-  <article class="quota-ticket" :data-tone="cardTone" :data-unavailable="quotaUnavailable">
+  <article class="glass-panel quota-ticket spotlight-panel" :data-tone="cardTone" @pointermove="updateSpotlight">
     <header class="quota-ticket__header">
-      <div class="quota-ticket__identity">
-        <h2>{{ account.email || account.name }}</h2>
-      </div>
-      <div class="quota-ticket__meta">
-        <div class="quota-ticket__plan">
-          {{ quota?.planType || account.planType || 'Codex' }}
-        </div>
-        <div v-if="quotaUnavailable || scheduleStatus" class="quota-ticket__states">
-          <span v-if="quotaUnavailable" class="quota-ticket__state" data-tone="neutral">额度不可用</span>
-          <span v-if="scheduleStatus" class="quota-ticket__state" :data-tone="scheduleStatus === 'available' ? 'healthy' : 'warning'">
-            <strong>{{ scheduleStatus === 'available' ? '可调度' : '不可调度' }}</strong>
-          </span>
-        </div>
-      </div>
+      <div class="quota-ticket__identity"><h4>{{ account.email || account.name }}</h4></div>
+      <button type="button" class="icon-button quota-ticket__refresh" :disabled="loading" title="刷新此账号" :aria-label="`刷新 ${account.email || account.name} 额度`" @click="$emit('refresh', account.id)"><IconRefresh :size="14" :stroke-width="1.8" :class="{ 'is-spinning': loading }" /></button>
     </header>
 
-    <div v-if="loading" class="quota-ticket__loading" aria-label="正在读取额度">
-      <span class="quota-ticket__loading-main" />
-      <span class="quota-ticket__loading-side" />
+    <div v-if="loading" class="quota-ticket__windows quota-ticket__loading" aria-label="正在读取额度"><span /><span /></div>
+    <div v-else-if="quota?.quotaStatus === 'error'" class="quota-ticket__error"><IconAlertTriangle :size="16" :stroke-width="1.7" /><div><strong>额度读取失败</strong><p>{{ quota.error || '未知错误' }}</p></div></div>
+    <div v-else class="quota-ticket__windows">
+      <section class="quota-window"><span class="quota-window__label">{{ primaryWindow?.label || '5 小时额度' }}</span><div class="quota-window__number"><strong>{{ percent(primaryWindow?.remainingPercent) }}</strong><span>%</span></div><div class="quota-window__reset">{{ resetText(primaryWindow?.resetAt) }}</div></section>
+      <section class="quota-window"><span class="quota-window__label">{{ secondaryWindow?.label || '每周额度' }}</span><div class="quota-window__number"><strong>{{ percent(secondaryWindow?.remainingPercent) }}</strong><span>%</span></div><div class="quota-window__reset">{{ resetText(secondaryWindow?.resetAt) }}</div></section>
     </div>
-
-    <div v-else-if="quota?.quotaStatus === 'error'" class="quota-ticket__error">
-      <IconAlertTriangle :size="24" :stroke-width="1.7" />
-      <div>
-        <strong>额度读取失败</strong>
-        <p>{{ quota.error }}</p>
-      </div>
-    </div>
-
-    <div v-else class="quota-ticket__content">
-      <section
-        class="quota-ticket__primary quota-ticket__window"
-        :style="{ '--quota-level': `${primaryWindow?.remainingPercent ?? 0}%` }"
-      >
-        <div>
-          <span class="quota-ticket__window-label">{{ primaryWindow?.label || '5 小时额度' }}</span>
-          <div class="quota-ticket__window-number">
-            <strong>{{ percent(primaryWindow?.remainingPercent) }}</strong><span>%</span>
-          </div>
-        </div>
-        <div class="quota-ticket__window-reset">
-          <strong>{{ resetText(primaryWindow?.resetAt) }}</strong>
-        </div>
-      </section>
-
-      <section
-        class="quota-ticket__secondary quota-ticket__window"
-        :style="{ '--quota-level': `${secondaryWindow?.remainingPercent ?? 0}%` }"
-      >
-        <div>
-          <span class="quota-ticket__window-label">{{ secondaryWindow?.label || '每周额度' }}</span>
-          <div class="quota-ticket__window-number">
-            <strong>{{ percent(secondaryWindow?.remainingPercent) }}</strong><span>%</span>
-          </div>
-        </div>
-        <div class="quota-ticket__window-reset">
-          <strong>{{ resetText(secondaryWindow?.resetAt) }}</strong>
-        </div>
-      </section>
-    </div>
-
-    <div v-if="!loading && extraWindows.length" class="quota-ticket__extras">
-      <div v-for="window in extraWindows" :key="window.id">
-        <span>{{ window.label }}</span>
-        <strong>{{ percent(window.remainingPercent) }}%</strong>
-      </div>
-    </div>
-
-    <footer class="quota-ticket__footer">
-      <span>{{ refreshedText(quota?.refreshedAt) }}</span>
-      <button
-        type="button"
-        class="button button--quiet button--small"
-        :disabled="loading"
-        @click="$emit('refresh', account.id)"
-      >
-        <IconRefresh :size="16" :stroke-width="1.8" :class="{ 'is-spinning': loading }" />
-        刷新此账号
-      </button>
-    </footer>
   </article>
 </template>
+
+<style scoped>
+.quota-ticket { width: auto; min-width: 0; min-height: 0; padding: .68rem .75rem; display: grid; gap: .55rem; overflow: hidden; }
+.quota-ticket[data-tone] { border-top: 1px solid var(--hub-line); }
+.quota-ticket__header { min-width: 0; min-height: 0; padding: 0; border-bottom: 0; display: flex; grid-template-columns: none; align-content: normal; align-items: center; justify-content: space-between; gap: .55rem; }
+.quota-ticket__identity { min-width: 0; }
+.quota-ticket__identity h4 { margin: 0; overflow: hidden; color: var(--hub-text); font-family: var(--hub-font-mono); font-size: .8rem; font-weight: var(--hub-weight-semibold); text-overflow: ellipsis; white-space: nowrap; }
+.quota-ticket__refresh { width: var(--hub-icon-button-size-compact); height: var(--hub-icon-button-size-compact); border-radius: var(--hub-radius-md); }
+.quota-ticket__windows { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.quota-window { min-width: 0; padding: .12rem .55rem .08rem 0; }
+.quota-window + .quota-window { padding-right: 0; padding-left: .65rem; border-left: 1px solid var(--hub-line); }
+.quota-window__label { overflow: hidden; display: block; color: var(--hub-text-faint); font-size: .68rem; text-overflow: ellipsis; white-space: nowrap; }
+.quota-window__number { margin-top: .18rem; display: flex; align-items: baseline; gap: .14rem; font-family: var(--hub-font-mono); }
+.quota-window__number strong { color: var(--hub-text); font-size: 1.35rem; font-weight: var(--hub-weight-medium); line-height: 1.54; }
+.quota-window__number span { color: var(--hub-text-faint); font-size: .72rem; }
+.quota-window__reset { margin-top: .12rem; overflow: hidden; color: var(--hub-text-faint); font-size: .65rem; text-overflow: ellipsis; white-space: nowrap; }
+.quota-ticket[data-tone='warning'] .quota-window__number strong { color: var(--hub-warning); }
+.quota-ticket[data-tone='danger'] .quota-window__number strong { color: var(--hub-danger); }
+.quota-ticket[data-tone='neutral'] .quota-window__number strong { color: var(--hub-text-faint); }
+.quota-ticket__error { min-width: 0; min-height: 0; padding: .42rem .5rem; border: 1px dashed var(--hub-danger-line); border-radius: var(--hub-radius-md); display: flex; flex: none; align-items: center; justify-content: flex-start; gap: .45rem; color: var(--hub-danger); background: var(--hub-danger-soft); font-size: .7rem; }
+.quota-ticket__error div { min-width: 0; }
+.quota-ticket__error strong { font-size: .7rem; }
+.quota-ticket__error p { margin-top: .12rem; overflow: hidden; color: var(--hub-text-muted); font-size: .65rem; text-overflow: ellipsis; white-space: nowrap; }
+.quota-ticket__loading { min-height: 64px; padding: 0; gap: var(--hub-space-2); }
+.quota-ticket__loading span { border-radius: var(--hub-radius-md); background: var(--hub-skeleton); }
+</style>

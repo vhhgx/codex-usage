@@ -1,4 +1,10 @@
-export type ChannelType = 'cpa' | 'sub2api'
+export type ChannelType = 'cpa' | 'sub2api' | 'openai_compatible' | 'anthropic_compatible'
+export type ChannelOwnerKind = 'platform' | 'user'
+export type ChannelAccessScope = 'all' | 'restricted' | 'private'
+export type ChannelProtocol = 'anthropic_messages' | 'openai_responses' | 'openai_chat'
+export type ChannelAuthScheme = 'bearer' | 'x_api_key'
+export type ProtocolVerificationStatus = 'unknown' | 'verified' | 'failed'
+export type KeyRouteMode = 'platform_only' | 'private_only' | 'platform_then_private' | 'private_then_platform'
 export type RoutingStrategy = 'priority' | 'weighted_round_robin'
 export type HubKeyStatus = 'active' | 'disabled' | 'expired'
 
@@ -11,6 +17,12 @@ export interface ChannelView {
   id: string
   name: string
   type: ChannelType
+  ownerKind: ChannelOwnerKind
+  ownerUserId: string | null
+  ownerUserName: string | null
+  accessScope: ChannelAccessScope
+  grantedUserIds: string[]
+  grantedGroupIds: string[]
   baseUrl: string
   enabled: boolean
   priority: number
@@ -22,9 +34,39 @@ export interface ChannelView {
   circuitState: 'closed' | 'open' | 'half_open'
   lastHealthCheckAt: number | null
   lastHealthError: string | null
+  protocols: ChannelProtocolBindingView[]
   models: ChannelModelView[]
+  cache: ChannelCacheView
   createdAt: number
   updatedAt: number
+}
+
+export interface ChannelCacheSliceView {
+  label: string
+  inputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  tokenHitRate: number | null
+  requestHitRate: number | null
+  affinityReuseRate: number | null
+  affinityFailovers: number
+}
+
+export interface ChannelCacheView extends ChannelCacheSliceView {
+  protocols: ChannelCacheSliceView[]
+  models: ChannelCacheSliceView[]
+}
+
+export interface ChannelProtocolBindingView {
+  id?: string
+  protocol: ChannelProtocol
+  enabled: boolean
+  baseUrlOverride: string | null
+  authScheme: ChannelAuthScheme
+  apiVersion: string | null
+  verificationStatus: ProtocolVerificationStatus
+  verifiedAt: number | null
+  lastError: string | null
 }
 
 export interface ChannelModelView {
@@ -33,6 +75,15 @@ export interface ChannelModelView {
   upstreamModel: string
   enabled: boolean
   endpoints: string[]
+  protocolBindings?: ChannelModelProtocolView[]
+}
+
+export interface ChannelModelProtocolView {
+  id?: string
+  protocol: ChannelProtocol
+  upstreamModel: string
+  enabled: boolean
+  capabilities: Record<string, boolean>
 }
 
 export interface HubKeyView {
@@ -46,6 +97,8 @@ export interface HubKeyView {
   groupId: string | null
   groupName: string | null
   status: HubKeyStatus
+  routeMode: KeyRouteMode
+  channelIds: string[]
   expiresAt: number | null
   allowedEndpoints: string[]
   allowedModels: string[]
@@ -149,6 +202,12 @@ export interface HubOverview {
     streamAbortRate: number | null
     successRate: number | null
     failovers: number
+    cacheReadTokens: number
+    cacheCreationTokens: number
+    tokenCacheHitRate: number | null
+    requestCacheHitRate: number | null
+    affinityReuseRate: number | null
+    affinityFailovers: number
   }
   timeline: Array<{ timestamp: number; requests: number; tokens: number; cost: number; failures: number }>
   models: Array<{ model: string; requests: number; tokens: number; cost: number }>

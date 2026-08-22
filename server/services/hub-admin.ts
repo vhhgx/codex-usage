@@ -1,14 +1,15 @@
 import { randomUUID } from 'node:crypto'
-import { and, asc, desc, eq, inArray } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm'
 import type { H3Event } from 'h3'
-import type { ChannelModelView, ChannelView, HubKeyCredentialView, HubKeyView } from '#shared/types/hub'
+import type { ChannelCacheSliceView, ChannelCacheView, ChannelModelView, ChannelProtocol, ChannelProtocolBindingView, ChannelType, ChannelView, HubKeyCredentialView, HubKeyView, KeyRouteMode } from '#shared/types/hub'
 import { supportsImagePricing } from '#shared/utils/model-capabilities'
 import { useDatabase } from '../db'
-import { channelModels, channels, groupMemberships, groups, hubKeyCredentials, hubKeys, keyModelRules, modelPools, modelPrices, users } from '../db/schema'
-import { createHubKey, decryptHubKeySecret, decryptSecret, encryptHubKeySecret, encryptSecret, hashHubKey, validateHubKeySecret } from '../utils/hub-crypto'
+import { channelGroupGrants, channelModelBindings, channelModels, channelProtocolBindings, channels, channelUserGrants, groupMemberships, groups, hubKeyCredentials, hubKeys, keyChannelRules, keyModelRules, modelPools, modelPrices, usageRollups, users } from '../db/schema'
+import { createHubKey, decryptChannelSecret, decryptHubKeySecret, encryptChannelSecret, encryptHubKeySecret, encryptSecret, hashHubKey, validateHubKeySecret } from '../utils/hub-crypto'
 import { getHubSettings } from './hub-settings'
 import { channelCircuitState } from './hub-routing'
 import { discoverUpstreamModelIds, mergeDiscoveredModelMappings } from './hub-model-discovery'
+import { invalidateChannelAccess } from './channel-access'
 
 type UnknownRecord = Record<string, unknown>
 
@@ -72,11 +73,26 @@ function expiryValue(body: UnknownRecord, createdAt: Date) {
   return dateValue(body.expiresAt)
 }
 
-function channelView(row: typeof channels.$inferSelect, models: ChannelModelView[], circuitState: ChannelView['circuitState']): ChannelView {
+function channelView(
+  row: typeof channels.$inferSelect,
+  models: ChannelModelView[],
+  protocols: ChannelProtocolBindingView[],
+  grantedUserIds: string[],
+  grantedGroupIds: string[],
+  ownerUserName: string | null,
+  circuitState: ChannelView['circuitState'],
+  cache: ChannelCacheView
+): ChannelView {
   return {
     id: row.id,
     name: row.name,
     type: row.type,
+    ownerKind: row.ownerKind,
+    ownerUserId: row.ownerUserId,
+    ownerUserName,
+    accessScope: row.accessScope,
+    grantedUserIds,
+    grantedGroupIds,
     baseUrl: row.baseUrl,
     enabled: row.enabled,
     priority: row.priority,
@@ -88,18 +104,77 @@ function channelView(row: typeof channels.$inferSelect, models: ChannelModelView
     circuitState,
     lastHealthCheckAt: row.lastHealthCheckAt?.getTime() || null,
     lastHealthError: row.lastHealthError,
+    protocols,
     models,
+    cache,
     createdAt: row.createdAt.getTime(),
     updatedAt: row.updatedAt.getTime()
+  }
+}
+
+type CacheRow = { channelId: string | null; protocol: ChannelProtocol | null; model: string | null; inputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; cacheHitRequests: number; cacheEligibleRequests: number; affinityReuses: number; requests: number; affinityFailovers: number }
+
+function cacheSlice(label: string, rows: CacheRow[]): ChannelCacheSliceView {
+  const sum = (key: keyof CacheRow) => rows.reduce((total, row) => total + Number(row[key] || 0), 0)
+  const inputTokens = sum('inputTokens')
+  const cacheReadTokens = sum('cacheReadTokens')
+  const cacheHitRequests = sum('cacheHitRequests')
+  const cacheEligibleRequests = sum('cacheEligibleRequests')
+  const affinityReuses = sum('affinityReuses')
+  const requests = sum('requests')
+  return {
+    label,
+    inputTokens,
+    cacheReadTokens,
+    cacheCreationTokens: sum('cacheCreationTokens'),
+    tokenHitRate: inputTokens ? cacheReadTokens / inputTokens * 100 : null,
+    requestHitRate: cacheEligibleRequests ? cacheHitRequests / cacheEligibleRequests * 100 : null,
+    affinityReuseRate: requests ? affinityReuses / requests * 100 : null,
+    affinityFailovers: sum('affinityFailovers')
+  }
+}
+
+function channelCache(channelId: string, allRows: CacheRow[]): ChannelCacheView {
+  const rows = allRows.filter(row => row.channelId === channelId)
+  const protocolLabels = [...new Set(rows.map(row => row.protocol).filter((value): value is ChannelProtocol => Boolean(value)))]
+  const modelLabels = [...new Set(rows.map(row => row.model).filter((value): value is string => Boolean(value)))]
+  return {
+    ...cacheSlice('全部', rows),
+    protocols: protocolLabels.map(label => cacheSlice(label, rows.filter(row => row.protocol === label))),
+    models: modelLabels.map(label => cacheSlice(label, rows.filter(row => row.model === label)))
   }
 }
 
 export async function listChannels(event: H3Event) {
   const db = useDatabase(event)
   const rows = await db.select().from(channels).orderBy(asc(channels.priority), asc(channels.name))
-  const modelRows = rows.length
-    ? await db.select().from(channelModels).where(inArray(channelModels.channelId, rows.map(row => row.id)))
-    : []
+  const ids = rows.map(row => row.id)
+  const [modelRows, protocolRows, modelBindingRows, userGrantRows, groupGrantRows, ownerRows, cacheRows] = await Promise.all([
+    ids.length ? db.select().from(channelModels).where(inArray(channelModels.channelId, ids)) : [],
+    ids.length ? db.select().from(channelProtocolBindings).where(inArray(channelProtocolBindings.channelId, ids)) : [],
+    ids.length ? db.select({ binding: channelModelBindings, channelId: channelModels.channelId, protocol: channelProtocolBindings.protocol })
+      .from(channelModelBindings)
+      .innerJoin(channelModels, eq(channelModelBindings.channelModelId, channelModels.id))
+      .innerJoin(channelProtocolBindings, eq(channelModelBindings.protocolBindingId, channelProtocolBindings.id))
+      .where(inArray(channelModels.channelId, ids)) : [],
+    ids.length ? db.select().from(channelUserGrants).where(inArray(channelUserGrants.channelId, ids)) : [],
+    ids.length ? db.select().from(channelGroupGrants).where(inArray(channelGroupGrants.channelId, ids)) : [],
+    db.select({ id: users.id, username: users.username, displayName: users.displayName }).from(users),
+    ids.length ? db.select({
+      channelId: usageRollups.channelId,
+      protocol: usageRollups.protocol,
+      model: usageRollups.model,
+      inputTokens: sql<number>`coalesce(sum(${usageRollups.inputTokens}), 0)`,
+      cacheReadTokens: sql<number>`coalesce(sum(${usageRollups.cachedTokens}), 0)`,
+      cacheCreationTokens: sql<number>`coalesce(sum(${usageRollups.cacheCreationTokens}), 0)`,
+      cacheHitRequests: sql<number>`coalesce(sum(${usageRollups.cacheHitRequests}), 0)`,
+      cacheEligibleRequests: sql<number>`coalesce(sum(${usageRollups.cacheEligibleRequests}), 0)`,
+      affinityReuses: sql<number>`coalesce(sum(${usageRollups.affinityReuses}), 0)`,
+      requests: sql<number>`coalesce(sum(${usageRollups.requests}), 0)`,
+      affinityFailovers: sql<number>`coalesce(sum(${usageRollups.affinityFailovers}), 0)`
+    }).from(usageRollups).where(and(inArray(usageRollups.channelId, ids), eq(usageRollups.granularity, 'day'))).groupBy(usageRollups.channelId, usageRollups.protocol, usageRollups.model) : []
+  ])
+  const ownerNames = new Map(ownerRows.map(user => [user.id, user.displayName || user.username]))
   return Promise.all(rows.map(async row => channelView(
     row,
     modelRows.filter(model => model.channelId === row.id).map(model => ({
@@ -107,38 +182,166 @@ export async function listChannels(event: H3Event) {
       publicModel: model.publicModel,
       upstreamModel: model.upstreamModel,
       enabled: model.enabled,
-      endpoints: model.endpoints
+      endpoints: model.endpoints,
+      protocolBindings: modelBindingRows.filter(item => item.binding.channelModelId === model.id).map(item => ({
+        id: item.binding.id,
+        protocol: item.protocol,
+        upstreamModel: item.binding.upstreamModel,
+        enabled: item.binding.enabled,
+        capabilities: item.binding.capabilities
+      }))
     })),
-    await channelCircuitState(event, row.id)
+    protocolRows.filter(binding => binding.channelId === row.id).map(binding => ({
+      id: binding.id,
+      protocol: binding.protocol,
+      enabled: binding.enabled,
+      baseUrlOverride: binding.baseUrlOverride,
+      authScheme: binding.authScheme,
+      apiVersion: binding.apiVersion,
+      verificationStatus: binding.verificationStatus,
+      verifiedAt: binding.verifiedAt?.getTime() || null,
+      lastError: binding.lastError
+    })),
+    userGrantRows.filter(grant => grant.channelId === row.id).map(grant => grant.userId),
+    groupGrantRows.filter(grant => grant.channelId === row.id).map(grant => grant.groupId),
+    row.ownerUserId ? ownerNames.get(row.ownerUserId) || null : null,
+    await channelCircuitState(event, row.id),
+    channelCache(row.id, cacheRows)
   )))
 }
 
-function parseModels(value: unknown): ChannelModelView[] {
+function channelType(value: unknown): ChannelType | null {
+  return value === 'cpa' || value === 'sub2api' || value === 'openai_compatible' || value === 'anthropic_compatible' ? value : null
+}
+
+export function parseChannelProtocols(value: unknown, type: ChannelType): Array<Omit<ChannelProtocolBindingView, 'id' | 'verificationStatus' | 'verifiedAt' | 'lastError'>> {
+  const fallback: ChannelProtocol[] = type === 'anthropic_compatible'
+    ? ['anthropic_messages']
+    : ['openai_responses', 'openai_chat']
+  const input = Array.isArray(value) && value.length ? value : fallback.map(protocol => ({ protocol }))
+  const parsed = input.flatMap((raw) => {
+    const item = typeof raw === 'string' ? { protocol: raw } : raw && typeof raw === 'object' ? raw as UnknownRecord : null
+    if (!item) return []
+    const protocol = item?.protocol
+    if (protocol !== 'anthropic_messages' && protocol !== 'openai_responses' && protocol !== 'openai_chat') return []
+    const normalizedProtocol: ChannelProtocol = protocol
+    const baseUrlOverride = text(item.baseUrlOverride, 1000).replace(/\/+$/, '') || null
+    if (baseUrlOverride) {
+      try { new URL(baseUrlOverride) } catch { throw createError({ statusCode: 400, message: '协议 Base URL 格式不正确' }) }
+    }
+    return [{
+      protocol: normalizedProtocol,
+      enabled: item.enabled !== false,
+      baseUrlOverride,
+      authScheme: item.authScheme === 'x_api_key' || protocol === 'anthropic_messages' && item.authScheme !== 'bearer' ? 'x_api_key' as const : 'bearer' as const,
+      apiVersion: text(item.apiVersion, 100) || (protocol === 'anthropic_messages' ? '2023-06-01' : null)
+    }]
+  })
+  return [...new Map(parsed.map(binding => [binding.protocol, binding])).values()]
+}
+
+export function parseChannelModels(value: unknown): ChannelModelView[] {
   if (!Array.isArray(value)) return []
   const parsed = value.flatMap((raw) => {
     const item = raw && typeof raw === 'object' ? raw as UnknownRecord : null
     const publicModel = text(item?.publicModel, 200)
     const upstreamModel = text(item?.upstreamModel, 200)
     if (!publicModel || !upstreamModel) return []
+    const protocolBindings = Array.isArray(item?.protocolBindings) ? item.protocolBindings.flatMap((rawBinding) => {
+      const binding = rawBinding && typeof rawBinding === 'object' ? rawBinding as UnknownRecord : null
+      if (!binding) return []
+      const protocol = binding?.protocol
+      const bindingModel = text(binding?.upstreamModel, 200)
+      if (!bindingModel || protocol !== 'anthropic_messages' && protocol !== 'openai_responses' && protocol !== 'openai_chat') return []
+      const normalizedProtocol: ChannelProtocol = protocol
+      const capabilities = binding?.capabilities && typeof binding.capabilities === 'object' && !Array.isArray(binding.capabilities)
+        ? Object.fromEntries(Object.entries(binding.capabilities as UnknownRecord).flatMap(([key, enabled]) => text(key, 100) && typeof enabled === 'boolean' ? [[text(key, 100), enabled]] : []))
+        : {}
+      return [{ protocol: normalizedProtocol, upstreamModel: bindingModel, enabled: binding.enabled !== false, capabilities }]
+    }) : undefined
     return [{
       publicModel,
       upstreamModel,
       enabled: item?.enabled !== false,
-      endpoints: stringArray(item?.endpoints, 10)
+      endpoints: stringArray(item?.endpoints, 10),
+      protocolBindings
     }]
   })
   return [...new Map(parsed.map(model => [model.publicModel, model])).values()]
 }
 
-export async function createChannelRecord(event: H3Event, body: UnknownRecord) {
+export async function replaceChannelProtocols(event: H3Event, channelId: string, protocols: ReturnType<typeof parseChannelProtocols>) {
+  const db = useDatabase(event)
+  await db.delete(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, channelId))
+  if (!protocols.length) return []
+  return db.insert(channelProtocolBindings).values(protocols.map(protocol => ({ ...protocol, channelId }))).returning()
+}
+
+export async function replaceChannelModels(event: H3Event, channelId: string, models: ChannelModelView[], protocols: Array<typeof channelProtocolBindings.$inferSelect>) {
+  const db = useDatabase(event)
+  await db.delete(channelModels).where(eq(channelModels.channelId, channelId))
+  for (const model of models) {
+    const [created] = await db.insert(channelModels).values({
+      channelId,
+      publicModel: model.publicModel,
+      upstreamModel: model.upstreamModel,
+      enabled: model.enabled,
+      endpoints: model.endpoints
+    }).returning()
+    if (!created) continue
+    const overrides = new Map((model.protocolBindings || []).map(binding => [binding.protocol, binding]))
+    const bindings = protocols.flatMap((protocol) => {
+      const override = overrides.get(protocol.protocol)
+      if (model.protocolBindings?.length && !override) return []
+      return [{
+        channelModelId: created.id,
+        protocolBindingId: protocol.id,
+        upstreamModel: override?.upstreamModel || model.upstreamModel,
+        enabled: override?.enabled ?? model.enabled,
+        capabilities: override?.capabilities || { streaming: true, tools: true }
+      }]
+    })
+    if (bindings.length) await db.insert(channelModelBindings).values(bindings)
+    await db.insert(modelPools).values({ publicModel: model.publicModel }).onConflictDoNothing()
+  }
+}
+
+type ChannelGrantDatabase = Pick<ReturnType<typeof useDatabase>, 'delete' | 'insert'>
+
+async function replaceChannelGrantsInDatabase(db: ChannelGrantDatabase, channelId: string, userIds: string[], groupIds: string[], actorId?: string) {
+  await db.delete(channelUserGrants).where(eq(channelUserGrants.channelId, channelId))
+  await db.delete(channelGroupGrants).where(eq(channelGroupGrants.channelId, channelId))
+  if (userIds.length) await db.insert(channelUserGrants).values(userIds.map(userId => ({ channelId, userId, createdBy: actorId || null })))
+  if (groupIds.length) await db.insert(channelGroupGrants).values(groupIds.map(groupId => ({ channelId, groupId, createdBy: actorId || null })))
+}
+
+async function replaceChannelGrants(event: H3Event, channelId: string, userIds: string[], groupIds: string[], actorId?: string) {
+  await replaceChannelGrantsInDatabase(useDatabase(event), channelId, userIds, groupIds, actorId)
+  await invalidateChannelAccess(event, [channelId])
+}
+
+export async function updateChannelAccess(event: H3Event, id: string, body: UnknownRecord, actorId: string) {
+  const [channel] = await useDatabase(event).select().from(channels).where(eq(channels.id, id)).limit(1)
+  if (!channel) throw createError({ statusCode: 404, message: '渠道不存在' })
+  if (channel.ownerKind !== 'platform') throw createError({ statusCode: 409, message: '用户私有中转不能修改为平台共享渠道' })
+  return updateChannelRecord(event, id, {
+    accessScope: body.accessScope === 'restricted' ? 'restricted' : 'all',
+    grantedUserIds: body.grantedUserIds,
+    grantedGroupIds: body.grantedGroupIds
+  }, actorId)
+}
+
+export async function createChannelRecord(event: H3Event, body: UnknownRecord, actorId?: string) {
   const name = text(body.name, 120)
   const baseUrl = text(body.baseUrl, 1000).replace(/\/+$/, '')
   const apiKey = text(body.apiKey, 2000)
-  const type = body.type === 'sub2api' ? 'sub2api' : body.type === 'cpa' ? 'cpa' : null
+  const type = channelType(body.type)
   if (!name || !baseUrl || !apiKey || !type) throw createError({ statusCode: 400, message: '渠道名称、类型、地址和 API Key 均为必填项' })
   try { new URL(baseUrl) } catch { throw createError({ statusCode: 400, message: '渠道地址格式不正确' }) }
-  let models = parseModels(body.models)
-  if (type === 'sub2api') {
+  const protocols = parseChannelProtocols(body.protocols, type)
+  if (!protocols.length) throw createError({ statusCode: 400, message: '请至少选择一种上游协议' })
+  let models = parseChannelModels(body.models)
+  if (type === 'sub2api' || type === 'openai_compatible') {
     try {
       const discovered = await discoverUpstreamModelIds(baseUrl, apiKey, integer(body.timeoutMs, 1000, 600000, 15000))
       models = mergeDiscoveredModelMappings(discovered, models)
@@ -148,11 +351,15 @@ export async function createChannelRecord(event: H3Event, body: UnknownRecord) {
   }
   const db = useDatabase(event)
   const defaultTimeoutMs = (await getHubSettings(event)).defaultTimeoutMs
+  const accessScope = body.accessScope === 'restricted' ? 'restricted' : 'all'
   const [row] = await db.insert(channels).values({
     name,
     type,
     baseUrl,
     encryptedApiKey: encryptSecret(apiKey, event),
+    ownerKind: 'platform',
+    accessScope,
+    createdBy: actorId || null,
     enabled: body.enabled !== false,
     priority: integer(body.priority, 0, 10000, 100),
     weight: integer(body.weight, 1, 1000, 1),
@@ -161,16 +368,13 @@ export async function createChannelRecord(event: H3Event, body: UnknownRecord) {
     priceMultiplier: String(nonnegativeNumber(body.priceMultiplier, 1))
   }).returning()
   if (!row) throw createError({ statusCode: 500, message: '创建渠道失败' })
-  if (models.length) {
-    await db.insert(channelModels).values(models.map(model => ({ ...model, channelId: row.id })))
-    for (const model of models) {
-      await db.insert(modelPools).values({ publicModel: model.publicModel }).onConflictDoNothing()
-    }
-  }
+  const protocolRows = await replaceChannelProtocols(event, row.id, protocols)
+  await replaceChannelModels(event, row.id, models, protocolRows)
+  await replaceChannelGrants(event, row.id, accessScope === 'restricted' ? stringArray(body.grantedUserIds, 1000) : [], accessScope === 'restricted' ? stringArray(body.grantedGroupIds, 1000) : [], actorId)
   return (await listChannels(event)).find(item => item.id === row.id)!
 }
 
-export async function updateChannelRecord(event: H3Event, id: string, body: UnknownRecord) {
+export async function updateChannelRecord(event: H3Event, id: string, body: UnknownRecord, actorId?: string) {
   const db = useDatabase(event)
   const [existing] = await db.select().from(channels).where(eq(channels.id, id)).limit(1)
   if (!existing) throw createError({ statusCode: 404, message: '渠道不存在' })
@@ -181,18 +385,21 @@ export async function updateChannelRecord(event: H3Event, id: string, body: Unkn
     try { new URL(baseUrl) } catch { throw createError({ statusCode: 400, message: '渠道地址格式不正确' }) }
     patch.baseUrl = baseUrl
   }
-  if (text(body.apiKey, 2000)) patch.encryptedApiKey = encryptSecret(text(body.apiKey, 2000), event)
+  if (text(body.apiKey, 2000)) patch.encryptedApiKey = encryptChannelSecret(text(body.apiKey, 2000), existing.id, existing.ownerKind, event)
   if ('enabled' in body) patch.enabled = body.enabled === true
   if ('priority' in body) patch.priority = integer(body.priority, 0, 10000, existing.priority)
   if ('weight' in body) patch.weight = integer(body.weight, 1, 1000, existing.weight)
   if ('maxConcurrency' in body) patch.maxConcurrency = integer(body.maxConcurrency, 1, 10000, existing.maxConcurrency)
   if ('timeoutMs' in body) patch.timeoutMs = integer(body.timeoutMs, 1000, 600000, existing.timeoutMs)
   if ('priceMultiplier' in body) patch.priceMultiplier = String(nonnegativeNumber(body.priceMultiplier, Number(existing.priceMultiplier)))
+  const requestedAccessScope = body.accessScope === 'restricted' ? 'restricted' as const : 'all' as const
   await db.update(channels).set(patch).where(eq(channels.id, id))
+  let protocolRows = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, id))
+  if ('protocols' in body) protocolRows = await replaceChannelProtocols(event, id, parseChannelProtocols(body.protocols, existing.type))
   if ('models' in body) {
-    let models = parseModels(body.models)
-    if (existing.type === 'sub2api' && !models.length) {
-      const apiKey = text(body.apiKey, 2000) || decryptSecret(existing.encryptedApiKey, event)
+    let models = parseChannelModels(body.models)
+    if ((existing.type === 'sub2api' || existing.type === 'openai_compatible') && !models.length) {
+      const apiKey = text(body.apiKey, 2000) || decryptChannelSecret(existing.encryptedApiKey, existing.id, existing.ownerKind, event)
       const discovered = await discoverUpstreamModelIds(
         String(patch.baseUrl || existing.baseUrl),
         apiKey,
@@ -200,14 +407,25 @@ export async function updateChannelRecord(event: H3Event, id: string, body: Unkn
       )
       models = discovered.map(publicModel => ({ publicModel, upstreamModel: publicModel, enabled: true, endpoints: [] }))
     }
-    await db.delete(channelModels).where(eq(channelModels.channelId, id))
-    if (models.length) await db.insert(channelModels).values(models.map(model => ({ ...model, channelId: id })))
-    for (const model of models) await db.insert(modelPools).values({ publicModel: model.publicModel }).onConflictDoNothing()
+    await replaceChannelModels(event, id, models, protocolRows)
+  } else if ('protocols' in body) {
+    const currentModels = await db.select().from(channelModels).where(eq(channelModels.channelId, id))
+    await replaceChannelModels(event, id, currentModels.map(model => ({ publicModel: model.publicModel, upstreamModel: model.upstreamModel, enabled: model.enabled, endpoints: model.endpoints })), protocolRows)
   }
+  if (existing.ownerKind === 'platform' && ('accessScope' in body || 'grantedUserIds' in body || 'grantedGroupIds' in body)) {
+    const scope = 'accessScope' in body ? requestedAccessScope : existing.accessScope
+    const userIds = scope === 'restricted' ? stringArray(body.grantedUserIds, 1000) : []
+    const groupIds = scope === 'restricted' ? stringArray(body.grantedGroupIds, 1000) : []
+    await db.transaction(async (tx) => {
+      await tx.update(channels).set({ accessScope: scope, updatedAt: new Date() }).where(eq(channels.id, id))
+      await replaceChannelGrantsInDatabase(tx, id, userIds, groupIds, actorId)
+    })
+  }
+  await invalidateChannelAccess(event, [id])
   return (await listChannels(event)).find(item => item.id === id)!
 }
 
-function keyView(row: typeof hubKeys.$inferSelect, models: string[], ownerUserName: string | null = null, groupName: string | null = null): HubKeyView {
+function keyView(row: typeof hubKeys.$inferSelect, models: string[], channelIds: string[], ownerUserName: string | null = null, groupName: string | null = null): HubKeyView {
   return {
     id: row.id,
     name: row.name,
@@ -219,6 +437,8 @@ function keyView(row: typeof hubKeys.$inferSelect, models: string[], ownerUserNa
     groupId: row.groupId,
     groupName,
     status: row.expiresAt && row.expiresAt <= new Date() && row.status === 'active' ? 'expired' : row.status,
+    routeMode: row.routeMode,
+    channelIds,
     expiresAt: row.expiresAt?.getTime() || null,
     allowedEndpoints: row.allowedEndpoints,
     allowedModels: models,
@@ -250,8 +470,9 @@ function keyView(row: typeof hubKeys.$inferSelect, models: string[], ownerUserNa
 export async function listHubKeys(event: H3Event) {
   const db = useDatabase(event)
   const rows = await db.select().from(hubKeys).orderBy(desc(hubKeys.createdAt))
-  const [rules, userRows, groupRows] = await Promise.all([
+  const [rules, channelRules, userRows, groupRows] = await Promise.all([
     rows.length ? db.select().from(keyModelRules).where(inArray(keyModelRules.keyId, rows.map(row => row.id))) : [],
+    rows.length ? db.select().from(keyChannelRules).where(inArray(keyChannelRules.keyId, rows.map(row => row.id))) : [],
     db.select({ id: users.id, username: users.username, displayName: users.displayName }).from(users),
     db.select({ id: groups.id, name: groups.name }).from(groups)
   ])
@@ -260,15 +481,20 @@ export async function listHubKeys(event: H3Event) {
   return rows.map(row => keyView(
     row,
     rules.filter(rule => rule.keyId === row.id).map(rule => rule.publicModel),
+    channelRules.filter(rule => rule.keyId === row.id).map(rule => rule.channelId),
     row.ownerUserId ? userNames.get(row.ownerUserId) || null : null,
     row.groupId ? groupNames.get(row.groupId) || null : null
   ))
 }
 
 function keyValues(body: UnknownRecord, createdAt = new Date()) {
+  const routeMode: KeyRouteMode = body.routeMode === 'private_only' || body.routeMode === 'platform_then_private' || body.routeMode === 'private_then_platform'
+    ? body.routeMode
+    : 'platform_only'
   return {
     name: text(body.name, 120),
     note: text(body.note, 1000) || null,
+    routeMode,
     expiresAt: expiryValue(body, createdAt),
     allowedEndpoints: stringArray(body.allowedEndpoints, 20),
     rpmLimit: nullableInteger(body.rpmLimit, 1),
@@ -321,6 +547,7 @@ export async function createHubKeyRecord(event: H3Event, body: UnknownRecord, ac
   const encrypted = encryptHubKeySecret(plainKey, keyId, credentialId, event)
   const db = useDatabase(event)
   const models = stringArray(body.allowedModels, 200)
+  const channelIds = stringArray(body.channelIds, 500)
   const row = await db.transaction(async (tx) => {
     const [created] = await tx.insert(hubKeys).values({
       id: keyId,
@@ -348,6 +575,7 @@ export async function createHubKeyRecord(event: H3Event, body: UnknownRecord, ac
       createdBy: actorId || ownership.ownerUserId
     })
     if (models.length) await tx.insert(keyModelRules).values(models.map(publicModel => ({ keyId: created.id, publicModel })))
+    if (channelIds.length) await tx.insert(keyChannelRules).values(channelIds.map(channelId => ({ keyId: created.id, channelId })))
     return created
   })
   return { key: plainKey, item: (await listHubKeys(event)).find(item => item.id === row.id)! }
@@ -466,6 +694,11 @@ export async function updateHubKeyRecord(event: H3Event, id: string, body: Unkno
       const models = stringArray(body.allowedModels, 200)
       await tx.delete(keyModelRules).where(eq(keyModelRules.keyId, id))
       if (models.length) await tx.insert(keyModelRules).values(models.map(publicModel => ({ keyId: id, publicModel })))
+    }
+    if ('channelIds' in body) {
+      const channelIds = stringArray(body.channelIds, 500)
+      await tx.delete(keyChannelRules).where(eq(keyChannelRules.keyId, id))
+      if (channelIds.length) await tx.insert(keyChannelRules).values(channelIds.map(channelId => ({ keyId: id, channelId })))
     }
   })
   return (await listHubKeys(event)).find(item => item.id === id)!

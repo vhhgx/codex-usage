@@ -46,7 +46,7 @@ let browser
 try {
   browser = await chromium.launch({ headless: true, executablePath: browserPath })
   for (const viewport of [{ name: 'desktop', width: 1440, height: 1000 }, { name: 'mobile', width: 390, height: 844 }]) {
-    const context = await browser.newContext({ viewport })
+    const context = await browser.newContext({ viewport: { width: viewport.width, height: viewport.height } })
     const login = await context.request.post(`${baseUrl}/api/auth/login`, { data: { username, password } })
     if (!login.ok()) throw new Error(`login failed: ${login.status()}`)
     const page = await context.newPage()
@@ -113,11 +113,14 @@ try {
         errorMessage: null, updatedAt: Date.now()
       } } })
     })
-    await page.goto(`${baseUrl}/admin`)
+    const overviewResponse = await page.goto(`${baseUrl}/admin`)
+    if (!overviewResponse?.ok()) throw new Error(`admin overview failed: ${overviewResponse?.status()}`)
+    await page.waitForLoadState('networkidle')
+    if (viewport.width <= 960) await page.getByRole('button', { name: '打开导航' }).click()
     await page.getByRole('link', { name: '账号管理', exact: true }).click()
     await page.waitForURL('**/admin/account-vault')
     await page.waitForLoadState('networkidle')
-    if (!await page.locator('.admin-shell > .admin-sidebar').count()) throw new Error('account management did not render the admin sidebar')
+    if (!await page.locator('.workspace-shell > .workspace-sidebar').count()) throw new Error('account management did not render the admin sidebar')
     if (await page.locator('.site-header').count()) throw new Error('account management rendered the public site header')
     await page.getByTitle('刷新全部数据').click()
     await page.waitForLoadState('networkidle')
@@ -225,13 +228,13 @@ try {
       htmlOverflow: getComputedStyle(document.documentElement).overflowX,
       bodyOverflow: getComputedStyle(document.body).overflowX,
       sidebar: (() => {
-        const element = document.querySelector('.admin-sidebar')
+        const element = document.querySelector('.workspace-sidebar')
         if (!element) return null
         const style = getComputedStyle(element)
         return { width: style.width, overflow: style.overflow, contain: style.contain, scrollWidth: element.scrollWidth, clientWidth: element.clientWidth }
       })(),
       navigation: (() => {
-        const element = document.querySelector('.admin-nav')
+        const element = document.querySelector('.workspace-nav')
         return element ? { scrollWidth: element.scrollWidth, clientWidth: element.clientWidth, overflow: getComputedStyle(element).overflowX } : null
       })(),
       offenders: [...document.querySelectorAll('body *')].map(element => {

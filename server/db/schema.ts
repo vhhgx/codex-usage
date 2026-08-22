@@ -17,10 +17,20 @@ import {
 } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 
-export const channelTypeEnum = pgEnum('channel_type', ['cpa', 'sub2api'])
+export const channelTypeEnum = pgEnum('channel_type', ['cpa', 'sub2api', 'openai_compatible', 'anthropic_compatible'])
+export const channelOwnerKindEnum = pgEnum('channel_owner_kind', ['platform', 'user'])
+export const channelAccessScopeEnum = pgEnum('channel_access_scope', ['all', 'restricted', 'private'])
+export const channelProtocolEnum = pgEnum('channel_protocol', ['anthropic_messages', 'openai_responses', 'openai_chat'])
+export const channelAuthSchemeEnum = pgEnum('channel_auth_scheme', ['bearer', 'x_api_key'])
+export const protocolVerificationStatusEnum = pgEnum('protocol_verification_status', ['unknown', 'verified', 'failed'])
+export const keyRouteModeEnum = pgEnum('key_route_mode', ['platform_only', 'private_only', 'platform_then_private', 'private_then_platform'])
+export const protocolConversionModeEnum = pgEnum('protocol_conversion_mode', ['passthrough', 'anthropic_to_openai', 'openai_to_anthropic'])
 export const routingStrategyEnum = pgEnum('routing_strategy', ['priority', 'weighted_round_robin'])
 export const keyStatusEnum = pgEnum('hub_key_status', ['active', 'disabled', 'expired'])
 export const requestStatusEnum = pgEnum('request_status', ['pending', 'success', 'error', 'stream_aborted'])
+export const supplySourceEnum = pgEnum('supply_source', ['platform', 'private_pool', 'user_relay'])
+export const userPoolStatusEnum = pgEnum('user_pool_status', ['provisioning', 'active', 'disabled', 'error'])
+export const walletTransactionTypeEnum = pgEnum('wallet_transaction_type', ['recharge', 'hold', 'settle', 'release', 'refund', 'manual_adjustment'])
 export const userRoleEnum = pgEnum('user_role', ['super_admin', 'admin', 'operator', 'auditor', 'user'])
 export const userStatusEnum = pgEnum('user_status', ['active', 'disabled', 'locked'])
 export const groupStatusEnum = pgEnum('group_status', ['active', 'disabled'])
@@ -94,6 +104,11 @@ export const channels = pgTable('channels', {
   type: channelTypeEnum('type').notNull(),
   baseUrl: text('base_url').notNull(),
   encryptedApiKey: text('encrypted_api_key').notNull(),
+  ownerKind: channelOwnerKindEnum('owner_kind').notNull().default('platform'),
+  ownerUserId: uuid('owner_user_id').references(() => users.id, { onDelete: 'cascade' }),
+  accessScope: channelAccessScopeEnum('access_scope').notNull().default('all'),
+  createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+  credentialKeyVersion: text('credential_key_version'),
   enabled: boolean('enabled').notNull().default(true),
   priority: integer('priority').notNull().default(100),
   weight: integer('weight').notNull().default(1),
@@ -104,7 +119,33 @@ export const channels = pgTable('channels', {
   lastHealthCheckAt: timestamp('last_health_check_at', { withTimezone: true }),
   lastHealthError: text('last_health_error'),
   ...timestamps
-}, table => [index('channels_enabled_priority_idx').on(table.enabled, table.priority)])
+}, table => [
+  index('channels_enabled_priority_idx').on(table.enabled, table.priority),
+  index('channels_owner_idx').on(table.ownerKind, table.ownerUserId),
+  check('channels_owner_scope_check', sql`(
+    (${table.ownerKind} = 'platform' AND ${table.ownerUserId} IS NULL AND ${table.accessScope} IN ('all', 'restricted'))
+    OR
+    (${table.ownerKind} = 'user' AND ${table.ownerUserId} IS NOT NULL AND ${table.accessScope} = 'private')
+  )`)
+])
+
+export const channelProtocolBindings = pgTable('channel_protocol_bindings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  channelId: uuid('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
+  protocol: channelProtocolEnum('protocol').notNull(),
+  enabled: boolean('enabled').notNull().default(true),
+  baseUrlOverride: text('base_url_override'),
+  authScheme: channelAuthSchemeEnum('auth_scheme').notNull().default('bearer'),
+  apiVersion: text('api_version'),
+  adapterOptions: jsonb('adapter_options').$type<Record<string, unknown>>().notNull().default({}),
+  verificationStatus: protocolVerificationStatusEnum('verification_status').notNull().default('unknown'),
+  verifiedAt: timestamp('verified_at', { withTimezone: true }),
+  lastError: text('last_error'),
+  ...timestamps
+}, table => [
+  uniqueIndex('channel_protocol_bindings_channel_protocol_idx').on(table.channelId, table.protocol),
+  index('channel_protocol_bindings_enabled_idx').on(table.protocol, table.enabled)
+])
 
 export const channelModels = pgTable('channel_models', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -117,6 +158,41 @@ export const channelModels = pgTable('channel_models', {
 }, table => [
   uniqueIndex('channel_models_channel_public_idx').on(table.channelId, table.publicModel),
   index('channel_models_public_enabled_idx').on(table.publicModel, table.enabled)
+])
+
+export const channelModelBindings = pgTable('channel_model_bindings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  channelModelId: uuid('channel_model_id').notNull().references(() => channelModels.id, { onDelete: 'cascade' }),
+  protocolBindingId: uuid('protocol_binding_id').notNull().references(() => channelProtocolBindings.id, { onDelete: 'cascade' }),
+  upstreamModel: text('upstream_model').notNull(),
+  capabilities: jsonb('capabilities').$type<Record<string, boolean>>().notNull().default({}),
+  enabled: boolean('enabled').notNull().default(true),
+  ...timestamps
+}, table => [
+  uniqueIndex('channel_model_bindings_model_protocol_idx').on(table.channelModelId, table.protocolBindingId),
+  index('channel_model_bindings_protocol_idx').on(table.protocolBindingId, table.enabled)
+])
+
+export const channelUserGrants = pgTable('channel_user_grants', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  channelId: uuid('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+}, table => [
+  uniqueIndex('channel_user_grants_channel_user_idx').on(table.channelId, table.userId),
+  index('channel_user_grants_user_idx').on(table.userId)
+])
+
+export const channelGroupGrants = pgTable('channel_group_grants', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  channelId: uuid('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
+  groupId: uuid('group_id').notNull().references(() => groups.id, { onDelete: 'cascade' }),
+  createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+}, table => [
+  uniqueIndex('channel_group_grants_channel_group_idx').on(table.channelId, table.groupId),
+  index('channel_group_grants_group_idx').on(table.groupId)
 ])
 
 export const groupModelRules = pgTable('group_model_rules', {
@@ -161,6 +237,7 @@ export const hubKeys = pgTable('hub_keys', {
   secretUpdatedAt: timestamp('secret_updated_at', { withTimezone: true }),
   secretUpdatedBy: uuid('secret_updated_by').references(() => users.id, { onDelete: 'set null' }),
   status: keyStatusEnum('status').notNull().default('active'),
+  routeMode: keyRouteModeEnum('route_mode').notNull().default('platform_only'),
   expiresAt: timestamp('expires_at', { withTimezone: true }),
   allowedEndpoints: jsonb('allowed_endpoints').$type<string[]>().notNull().default([]),
   rpmLimit: integer('rpm_limit'),
@@ -189,6 +266,16 @@ export const hubKeys = pgTable('hub_keys', {
   uniqueIndex('hub_keys_hash_idx').on(table.keyHash),
   index('hub_keys_status_idx').on(table.status),
   index('hub_keys_owner_group_idx').on(table.ownerUserId, table.groupId)
+])
+
+export const keyChannelRules = pgTable('key_channel_rules', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  keyId: uuid('key_id').notNull().references(() => hubKeys.id, { onDelete: 'cascade' }),
+  channelId: uuid('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+}, table => [
+  uniqueIndex('key_channel_rules_key_channel_idx').on(table.keyId, table.channelId),
+  index('key_channel_rules_channel_idx').on(table.channelId)
 ])
 
 export const hubKeyCredentials = pgTable('hub_key_credentials', {
@@ -239,11 +326,26 @@ export const requestLogs = pgTable('request_logs', {
   requestedModel: text('requested_model'),
   upstreamModel: text('upstream_model'),
   channelId: uuid('channel_id').references(() => channels.id, { onDelete: 'set null' }),
+  protocolBindingId: uuid('protocol_binding_id').references(() => channelProtocolBindings.id, { onDelete: 'set null' }),
+  inboundProtocol: channelProtocolEnum('inbound_protocol'),
+  outboundProtocol: channelProtocolEnum('outbound_protocol'),
+  conversionMode: protocolConversionModeEnum('conversion_mode').notNull().default('passthrough'),
+  sourceOwnerKind: channelOwnerKindEnum('source_owner_kind'),
+  sourceOwnerUserId: uuid('source_owner_user_id').references(() => users.id, { onDelete: 'set null' }),
+  supplySource: supplySourceEnum('supply_source').notNull().default('platform'),
+  poolGroupId: uuid('pool_group_id'),
+  subscriptionId: uuid('subscription_id'),
+  planVersionId: uuid('plan_version_id'),
+  billableTokens: bigint('billable_tokens', { mode: 'number' }).notNull().default(0),
+  billedAmount: numeric('billed_amount', { precision: 20, scale: 8 }).notNull().default('0'),
+  pricingSnapshot: jsonb('pricing_snapshot').$type<Record<string, unknown>>().notNull().default({}),
   status: requestStatusEnum('status').notNull().default('pending'),
   httpStatus: integer('http_status'),
   inputTokens: bigint('input_tokens', { mode: 'number' }).notNull().default(0),
   outputTokens: bigint('output_tokens', { mode: 'number' }).notNull().default(0),
   cachedTokens: bigint('cached_tokens', { mode: 'number' }).notNull().default(0),
+  cacheCreationTokens: bigint('cache_creation_tokens', { mode: 'number' }).notNull().default(0),
+  cacheAffinityReused: boolean('cache_affinity_reused').notNull().default(false),
   reasoningTokens: bigint('reasoning_tokens', { mode: 'number' }).notNull().default(0),
   totalTokens: bigint('total_tokens', { mode: 'number' }).notNull().default(0),
   imageCount: integer('image_count').notNull().default(0),
@@ -275,6 +377,7 @@ export const requestAttempts = pgTable('request_attempts', {
   id: bigserial('id', { mode: 'number' }).primaryKey(),
   requestLogId: uuid('request_log_id').notNull().references(() => requestLogs.id, { onDelete: 'cascade' }),
   channelId: uuid('channel_id').references(() => channels.id, { onDelete: 'set null' }),
+  protocolBindingId: uuid('protocol_binding_id').references(() => channelProtocolBindings.id, { onDelete: 'set null' }),
   attempt: integer('attempt').notNull(),
   status: text('status').notNull(),
   httpStatus: integer('http_status'),
@@ -312,12 +415,26 @@ export const usageRollups = pgTable('usage_rollups', {
   endpoint: text('endpoint').notNull(),
   status: text('status').notNull().default('success'),
   channelId: uuid('channel_id').references(() => channels.id, { onDelete: 'set null' }),
+  protocolBindingId: uuid('protocol_binding_id').references(() => channelProtocolBindings.id, { onDelete: 'set null' }),
+  protocol: channelProtocolEnum('protocol'),
+  supplySource: supplySourceEnum('supply_source').notNull().default('platform'),
+  poolGroupId: uuid('pool_group_id'),
+  subscriptionId: uuid('subscription_id'),
+  planVersionId: uuid('plan_version_id'),
+  billableTokens: bigint('billable_tokens', { mode: 'number' }).notNull().default(0),
+  billedAmount: numeric('billed_amount', { precision: 20, scale: 8 }).notNull().default('0'),
   requests: bigint('requests', { mode: 'number' }).notNull().default(0),
   admittedRequests: bigint('admitted_requests', { mode: 'number' }).notNull().default(0),
   successes: bigint('successes', { mode: 'number' }).notNull().default(0),
   failures: bigint('failures', { mode: 'number' }).notNull().default(0),
   inputTokens: bigint('input_tokens', { mode: 'number' }).notNull().default(0),
   outputTokens: bigint('output_tokens', { mode: 'number' }).notNull().default(0),
+  cachedTokens: bigint('cached_tokens', { mode: 'number' }).notNull().default(0),
+  cacheCreationTokens: bigint('cache_creation_tokens', { mode: 'number' }).notNull().default(0),
+  cacheHitRequests: bigint('cache_hit_requests', { mode: 'number' }).notNull().default(0),
+  cacheEligibleRequests: bigint('cache_eligible_requests', { mode: 'number' }).notNull().default(0),
+  affinityReuses: bigint('affinity_reuses', { mode: 'number' }).notNull().default(0),
+  affinityFailovers: bigint('affinity_failovers', { mode: 'number' }).notNull().default(0),
   totalTokens: bigint('total_tokens', { mode: 'number' }).notNull().default(0),
   cost: numeric('cost', { precision: 20, scale: 8 }).notNull().default('0'),
   durationMs: bigint('duration_ms', { mode: 'number' }).notNull().default(0),
@@ -340,7 +457,13 @@ export const usageRollups = pgTable('usage_rollups', {
   table.model,
   table.endpoint,
   table.status,
-  table.channelId
+  table.channelId,
+  table.protocolBindingId,
+  table.protocol,
+  table.supplySource,
+  table.poolGroupId,
+  table.subscriptionId,
+  table.planVersionId
 ).nullsNotDistinct()])
 
 export const auditLogs = pgTable('audit_logs', {
@@ -401,6 +524,7 @@ export const servicePlans = pgTable('service_plans', {
   costLimit: numeric('cost_limit', { precision: 20, scale: 8 }),
   price: numeric('price', { precision: 20, scale: 2 }).notNull().default('0'),
   status: text('status').notNull().default('active'),
+  currentVersionId: uuid('current_version_id'),
   createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
   ...timestamps
 }, table => [
@@ -412,6 +536,8 @@ export const userSubscriptions = pgTable('user_subscriptions', {
   id: uuid('id').primaryKey().defaultRandom(),
   userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
   planId: uuid('plan_id').notNull().references(() => servicePlans.id, { onDelete: 'restrict' }),
+  planVersionId: uuid('plan_version_id'),
+  entitlementSnapshot: jsonb('entitlement_snapshot').$type<Record<string, unknown>>().notNull().default({}),
   startsAt: timestamp('starts_at', { withTimezone: true }).notNull().defaultNow(),
   expiresAt: timestamp('expires_at', { withTimezone: true }),
   status: text('status').notNull().default('active'),
@@ -422,6 +548,94 @@ export const userSubscriptions = pgTable('user_subscriptions', {
   index('user_subscriptions_plan_idx').on(table.planId),
   index('user_subscriptions_status_expiry_idx').on(table.status, table.expiresAt)
 ])
+
+export const servicePlanVersions = pgTable('service_plan_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  planId: uuid('plan_id').notNull().references(() => servicePlans.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  billingMode: text('billing_mode').notNull().default('unlimited'),
+  supplyMode: text('supply_mode').notNull().default('platform_only'),
+  cycle: text('cycle').notNull().default('none'),
+  tokenLimit: bigint('token_limit', { mode: 'number' }),
+  quotaUnit: text('quota_unit').notNull().default('raw_token'),
+  price: numeric('price', { precision: 20, scale: 8 }).notNull().default('0'),
+  maxPoolAccounts: integer('max_pool_accounts'),
+  privateUsageBilling: text('private_usage_billing').notNull().default('free'),
+  privateUsageRateMultiplier: numeric('private_usage_rate_multiplier', { precision: 12, scale: 6 }).notNull().default('1'),
+  allowedModels: jsonb('allowed_models').$type<string[]>().notNull().default([]),
+  settings: jsonb('settings').$type<Record<string, unknown>>().notNull().default({}),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' })
+}, table => [uniqueIndex('service_plan_versions_plan_version_idx').on(table.planId, table.version), index('service_plan_versions_plan_idx').on(table.planId)])
+
+export const userPoolGroups = pgTable('user_pool_groups', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  ownerUserId: uuid('owner_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  connectionId: text('connection_id').notNull().default('sub2api'),
+  upstreamUserId: bigint('upstream_user_id', { mode: 'number' }).notNull(),
+  upstreamGroupId: bigint('upstream_group_id', { mode: 'number' }).notNull(),
+  upstreamApiKeyId: bigint('upstream_api_key_id', { mode: 'number' }).notNull(),
+  encryptedUpstreamApiKey: text('encrypted_upstream_api_key').notNull(),
+  encryptionKeyVersion: text('encryption_key_version').notNull(),
+  internalName: text('internal_name').notNull(),
+  displayName: text('display_name').notNull(),
+  status: userPoolStatusEnum('status').notNull().default('provisioning'),
+  maxAccounts: integer('max_accounts'),
+  lastReconciledAt: timestamp('last_reconciled_at', { withTimezone: true }),
+  lastError: text('last_error'),
+  createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+  ...timestamps
+}, table => [
+  uniqueIndex('user_pool_groups_owner_idx').on(table.ownerUserId),
+  uniqueIndex('user_pool_groups_connection_user_idx').on(table.connectionId, table.upstreamUserId),
+  uniqueIndex('user_pool_groups_connection_group_idx').on(table.connectionId, table.upstreamGroupId),
+  uniqueIndex('user_pool_groups_connection_key_idx').on(table.connectionId, table.upstreamApiKeyId),
+  index('user_pool_groups_status_idx').on(table.status)
+])
+
+export const userPoolAccounts = pgTable('user_pool_accounts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  ownerUserId: uuid('owner_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  poolGroupId: uuid('pool_group_id').notNull().references(() => userPoolGroups.id, { onDelete: 'cascade' }),
+  accountVaultId: uuid('account_vault_id').references(() => accountVaultEntries.id, { onDelete: 'set null' }),
+  upstreamAccountId: bigint('upstream_account_id', { mode: 'number' }).notNull(),
+  platform: text('platform').notNull(),
+  accountType: text('account_type').notNull(),
+  displayName: text('display_name').notNull(),
+  email: text('email'),
+  status: text('status').notNull().default('active'),
+  schedulable: boolean('schedulable').notNull().default(false),
+  source: text('source').notNull().default('import'),
+  lastVerifiedAt: timestamp('last_verified_at', { withTimezone: true }),
+  lastError: text('last_error'),
+  createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+  removedAt: timestamp('removed_at', { withTimezone: true }),
+  ...timestamps
+}, table => [uniqueIndex('user_pool_accounts_group_upstream_idx').on(table.poolGroupId, table.upstreamAccountId), index('user_pool_accounts_owner_status_idx').on(table.ownerUserId, table.status)])
+
+export const userWallets = pgTable('user_wallets', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  currency: text('currency').notNull().default('CNY'),
+  availableBalance: numeric('available_balance', { precision: 20, scale: 8 }).notNull().default('0'),
+  heldBalance: numeric('held_balance', { precision: 20, scale: 8 }).notNull().default('0'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  ...timestamps
+}, table => [uniqueIndex('user_wallets_user_idx').on(table.userId)])
+
+export const walletTransactions = pgTable('wallet_transactions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  walletId: uuid('wallet_id').notNull().references(() => userWallets.id, { onDelete: 'cascade' }),
+  requestId: text('request_id'),
+  type: walletTransactionTypeEnum('type').notNull(),
+  amount: numeric('amount', { precision: 20, scale: 8 }).notNull(),
+  balanceBefore: numeric('balance_before', { precision: 20, scale: 8 }).notNull(),
+  balanceAfter: numeric('balance_after', { precision: 20, scale: 8 }).notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  note: text('note'),
+  createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+}, table => [uniqueIndex('wallet_transactions_wallet_idempotency_idx').on(table.walletId, table.idempotencyKey), index('wallet_transactions_request_idx').on(table.requestId), index('wallet_transactions_created_idx').on(table.createdAt)])
 
 export const announcements = pgTable('announcements', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -442,6 +656,7 @@ export const accountVaultEntries = pgTable('account_vault_entries', {
   id: uuid('id').primaryKey().defaultRandom(),
   email: text('email').notNull(),
   displayName: text('display_name'),
+  source: text('source').notNull().default('unknown'),
   status: text('status').notNull().default('Codex'),
   encryptedPassword: text('encrypted_password').notNull(),
   encryptedAccessToken: text('encrypted_access_token'),
@@ -465,6 +680,7 @@ export const accountVaultEntries = pgTable('account_vault_entries', {
   ...timestamps
 }, table => [
   index('account_vault_email_idx').on(table.email),
+  index('account_vault_source_idx').on(table.source),
   index('account_vault_status_idx').on(table.status),
   index('account_vault_sub2api_pool_status_idx').on(table.sub2apiPoolStatus),
   index('account_vault_sub2api_account_idx').on(table.sub2apiAccountId),
@@ -528,6 +744,8 @@ export const ledgerTransactions = pgTable('ledger_transactions', {
 ])
 
 export type Channel = typeof channels.$inferSelect
+export type ChannelProtocolBinding = typeof channelProtocolBindings.$inferSelect
+export type ChannelModelBinding = typeof channelModelBindings.$inferSelect
 export type ChannelModel = typeof channelModels.$inferSelect
 export type HubKey = typeof hubKeys.$inferSelect
 export type HubKeyCredential = typeof hubKeyCredentials.$inferSelect
@@ -538,5 +756,10 @@ export type AccountVaultEntry = typeof accountVaultEntries.$inferSelect
 export type LedgerTransaction = typeof ledgerTransactions.$inferSelect
 export type SmsReceiver = typeof smsReceivers.$inferSelect
 export type ServicePlan = typeof servicePlans.$inferSelect
+export type ServicePlanVersion = typeof servicePlanVersions.$inferSelect
 export type UserSubscription = typeof userSubscriptions.$inferSelect
+export type UserPoolGroup = typeof userPoolGroups.$inferSelect
+export type UserPoolAccount = typeof userPoolAccounts.$inferSelect
+export type UserWallet = typeof userWallets.$inferSelect
+export type WalletTransaction = typeof walletTransactions.$inferSelect
 export type Announcement = typeof announcements.$inferSelect

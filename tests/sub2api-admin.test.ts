@@ -59,7 +59,14 @@ describe('Sub2API admin account quota parser', () => {
       subscription_tier: 'max',
       five_hour: {
         utilization: 40,
-        resets_at: '2026-07-21T23:00:00+08:00'
+        resets_at: '2026-07-21T23:00:00+08:00',
+        window_stats: {
+          requests: 42,
+          tokens: 123456,
+          cost: 1.25,
+          standard_cost: 1.5,
+          user_cost: 2
+        }
       },
       seven_day: {
         utilization: 60,
@@ -71,7 +78,11 @@ describe('Sub2API admin account quota parser', () => {
     expect(result.windows).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'account-total', usedPercent: 25, remainingPercent: 75 }),
       expect.objectContaining({ id: 'account-daily', used: 5, limit: 20 }),
-      expect.objectContaining({ id: 'five_hour', remainingPercent: 60 }),
+      expect.objectContaining({
+        id: 'five_hour',
+        remainingPercent: 60,
+        stats: { requests: 42, tokens: 123456, cost: 1.25, standardCost: 1.5, userCost: 2 }
+      }),
       expect.objectContaining({ id: 'seven_day', remainingPercent: 40 })
     ]))
   })

@@ -10,8 +10,16 @@ const mergeColumns = sql`
   failures = usage_rollups.failures + excluded.failures,
   input_tokens = usage_rollups.input_tokens + excluded.input_tokens,
   output_tokens = usage_rollups.output_tokens + excluded.output_tokens,
+  cached_tokens = usage_rollups.cached_tokens + excluded.cached_tokens,
+  cache_creation_tokens = usage_rollups.cache_creation_tokens + excluded.cache_creation_tokens,
+  cache_hit_requests = usage_rollups.cache_hit_requests + excluded.cache_hit_requests,
+  cache_eligible_requests = usage_rollups.cache_eligible_requests + excluded.cache_eligible_requests,
+  affinity_reuses = usage_rollups.affinity_reuses + excluded.affinity_reuses,
+  affinity_failovers = usage_rollups.affinity_failovers + excluded.affinity_failovers,
   total_tokens = usage_rollups.total_tokens + excluded.total_tokens,
   cost = usage_rollups.cost + excluded.cost,
+  billable_tokens = usage_rollups.billable_tokens + excluded.billable_tokens,
+  billed_amount = usage_rollups.billed_amount + excluded.billed_amount,
   duration_ms = usage_rollups.duration_ms + excluded.duration_ms,
   latency_count = usage_rollups.latency_count + excluded.latency_count,
   latency_le_100 = usage_rollups.latency_le_100 + excluded.latency_le_100,
@@ -27,14 +35,18 @@ const mergeColumns = sql`
 
 const rollupColumns = sql`
   bucket_start, granularity, key_id, user_id, group_id, model, endpoint, status, channel_id,
-  requests, admitted_requests, successes, failures, input_tokens, output_tokens, total_tokens,
-  cost, duration_ms, latency_count, latency_le_100, latency_le_250, latency_le_500,
+  protocol_binding_id, protocol, supply_source, pool_group_id, subscription_id, plan_version_id,
+  billable_tokens, billed_amount, requests, admitted_requests, successes, failures,
+  input_tokens, output_tokens, cached_tokens, cache_creation_tokens, cache_hit_requests,
+  cache_eligible_requests, affinity_reuses, affinity_failovers, total_tokens, cost,
+  duration_ms, latency_count, latency_le_100, latency_le_250, latency_le_500,
   latency_le_1000, latency_le_2500, latency_le_5000, latency_le_10000, failovers,
   created_at, updated_at
 `
 
 const conflictDimensions = sql`
-  (bucket_start, granularity, key_id, user_id, group_id, model, endpoint, status, channel_id)
+  (bucket_start, granularity, key_id, user_id, group_id, model, endpoint, status, channel_id,
+   protocol_binding_id, protocol, supply_source, pool_group_id, subscription_id, plan_version_id)
 `
 
 export async function deleteHubKeyPreservingRollups(event: H3Event, id: string) {
@@ -44,8 +56,11 @@ export async function deleteHubKeyPreservingRollups(event: H3Event, id: string) 
     await tx.execute(sql`
       insert into usage_rollups (${rollupColumns})
       select bucket_start, granularity, null, user_id, group_id, model, endpoint, status, channel_id,
-        requests, admitted_requests, successes, failures, input_tokens, output_tokens, total_tokens,
-        cost, duration_ms, latency_count, latency_le_100, latency_le_250, latency_le_500,
+        protocol_binding_id, protocol, supply_source, pool_group_id, subscription_id, plan_version_id,
+        billable_tokens, billed_amount, requests, admitted_requests, successes, failures,
+        input_tokens, output_tokens, cached_tokens, cache_creation_tokens, cache_hit_requests,
+        cache_eligible_requests, affinity_reuses, affinity_failovers, total_tokens, cost,
+        duration_ms, latency_count, latency_le_100, latency_le_250, latency_le_500,
         latency_le_1000, latency_le_2500, latency_le_5000, latency_le_10000, failovers,
         created_at, now()
       from usage_rollups where key_id = ${id}
@@ -64,8 +79,11 @@ export async function deleteChannelPreservingRollups(event: H3Event, id: string)
     await tx.execute(sql`
       insert into usage_rollups (${rollupColumns})
       select bucket_start, granularity, key_id, user_id, group_id, model, endpoint, status, null,
-        requests, admitted_requests, successes, failures, input_tokens, output_tokens, total_tokens,
-        cost, duration_ms, latency_count, latency_le_100, latency_le_250, latency_le_500,
+        null, protocol, supply_source, pool_group_id, subscription_id, plan_version_id,
+        billable_tokens, billed_amount, requests, admitted_requests, successes, failures,
+        input_tokens, output_tokens, cached_tokens, cache_creation_tokens, cache_hit_requests,
+        cache_eligible_requests, affinity_reuses, affinity_failovers, total_tokens, cost,
+        duration_ms, latency_count, latency_le_100, latency_le_250, latency_le_500,
         latency_le_1000, latency_le_2500, latency_le_5000, latency_le_10000, failovers,
         created_at, now()
       from usage_rollups where channel_id = ${id}

@@ -21,6 +21,12 @@ describe('secure account record encryption', () => {
     expect(() => decryptContextSecret(encrypted, 'account-vault:b:password')).toThrow()
   })
 
+  it('round-trips an empty context secret without treating its empty body as corrupt', () => {
+    const encrypted = encryptContextSecret('', 'account-vault:a:password')
+    expect(encrypted.endsWith('.')).toBe(true)
+    expect(decryptContextSecret(encrypted, 'account-vault:a:password')).toBe('')
+  })
+
   it('isolates imported token and email-link ciphertext by field context', () => {
     const accessToken = encryptContextSecret('access-token-value', 'account-vault:a:access-token')
     const emailCodeUrl = encryptContextSecret('https://mail.example/code', 'account-vault:a:email-code-url')
@@ -40,17 +46,17 @@ describe('secure account record encryption', () => {
 
 describe('purchased account delivery parsing', () => {
   it('parses email-code links and password/AT/RT deliveries without echoing secrets in metadata', () => {
-    const [emailLink] = parseAccountDeliveryText('first@icloud.com----https://mail.example/messages/first', 'email_code_url')
-    const [tokens] = parseAccountDeliveryText('second@hotmail.com----account-password----access-token----refresh-token', 'tokens')
-    expect(emailLink).toMatchObject({ email: 'first@icloud.com', kind: 'email_code_url', message: null })
+    const [emailLink] = parseAccountDeliveryText('first@icloud.com----https://mail.example/messages/first', ['email', 'emailCodeUrl'])
+    const [tokens] = parseAccountDeliveryText('second@hotmail.com----account-password----access-token----refresh-token', ['email', 'password', 'accessToken', 'refreshToken'])
+    expect(emailLink).toMatchObject({ email: 'first@icloud.com', kind: 'custom', message: null })
     expect(emailLink?.record).toMatchObject({ emailCodeUrl: 'https://mail.example/messages/first' })
-    expect(tokens).toMatchObject({ email: 'second@hotmail.com', kind: 'tokens', message: null })
+    expect(tokens).toMatchObject({ email: 'second@hotmail.com', kind: 'custom', message: null })
     expect(tokens?.record).toMatchObject({ password: 'account-password', accessToken: 'access-token', refreshToken: 'refresh-token' })
     expect(JSON.stringify([emailLink, tokens].map(line => ({ email: line?.email, kind: line?.kind, message: line?.message, fingerprint: line?.fingerprint })))).not.toContain('account-password')
   })
 
   it('rejects malformed deliveries without including their credential value in errors', () => {
-    const [line] = parseAccountDeliveryText('buyer@example.com----top-secret----extra-secret', 'tokens')
+    const [line] = parseAccountDeliveryText('buyer@example.com----top-secret----extra-secret', ['email', 'password', 'accessToken', 'refreshToken'])
     expect(line).toMatchObject({ kind: 'invalid' })
     expect(line?.message).not.toContain('top-secret')
     expect(line?.message).not.toContain('extra-secret')
@@ -58,15 +64,32 @@ describe('purchased account delivery parsing', () => {
 
   it('parses password and TOTP deliveries only when that format is selected', () => {
     const source = 'buyer@example.com----account-password----MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7'
-    const [line] = parseAccountDeliveryText(source, 'password_totp')
-    expect(line).toMatchObject({ email: 'buyer@example.com', kind: 'password_totp', message: null })
+    const [line] = parseAccountDeliveryText(source, ['email', 'password', 'totpSecret'])
+    expect(line).toMatchObject({ email: 'buyer@example.com', kind: 'custom', message: null })
     expect(line?.record).toMatchObject({ password: 'account-password', totpSecret: 'MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7' })
-    expect(parseAccountDeliveryText(source, 'tokens')[0]).toMatchObject({ kind: 'invalid' })
+    expect(parseAccountDeliveryText(source, ['email', 'password', 'accessToken', 'refreshToken'])[0]).toMatchObject({ kind: 'invalid' })
     expect(JSON.stringify({ email: line?.email, kind: line?.kind, message: line?.message })).not.toContain('MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7')
   })
 
-  it('requires an explicit delivery format', () => {
-    expect(() => parseAccountDeliveryText('buyer@example.com----https://mail.example/code', '')).toThrow('请先选择发货格式')
+  it('supports a user-defined field order and mixed credential content', () => {
+    const [line] = parseAccountDeliveryText(
+      'access-token----buyer@example.com----MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7----refresh-token----https://mail.example/code',
+      ['accessToken', 'email', 'totpSecret', 'refreshToken', 'emailCodeUrl']
+    )
+    expect(line).toMatchObject({ email: 'buyer@example.com', kind: 'custom', message: null })
+    expect(line?.record).toMatchObject({
+      email: 'buyer@example.com',
+      accessToken: 'access-token',
+      refreshToken: 'refresh-token',
+      totpSecret: 'MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7',
+      emailCodeUrl: 'https://mail.example/code'
+    })
+  })
+
+  it('requires account and paired AT/RT fields', () => {
+    expect(() => parseAccountDeliveryText('buyer@example.com', [])).toThrow('请先配置发货字段')
+    expect(() => parseAccountDeliveryText('secret', ['password'])).toThrow('必须包含账号')
+    expect(() => parseAccountDeliveryText('buyer@example.com----access-token', ['email', 'accessToken'])).toThrow('AT 和 RT 必须同时选择')
   })
 })
 
