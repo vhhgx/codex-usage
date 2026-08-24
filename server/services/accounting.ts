@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { and, desc, eq, gte, ilike, inArray, isNotNull, lte, or } from 'drizzle-orm'
+import { and, desc, eq, gte, ilike, inArray, isNotNull, isNull, lte, or } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import {
   ACCOUNT_DELIVERY_FIELDS,
@@ -163,9 +163,23 @@ export async function listAccountVaultEntries(event: H3Event, query: Record<stri
   const status = query.status ? enumText(query.status, accountStatuses, 'Codex' as AccountVaultStatus, '账号状态') : null
   const [rows, receivers] = await Promise.all([
     useDatabase(event).select().from(accountVaultEntries)
-      .where(status ? eq(accountVaultEntries.status, status) : undefined)
+      .where(and(isNull(accountVaultEntries.ownerUserId), status ? eq(accountVaultEntries.status, status) : undefined))
       .orderBy(desc(accountVaultEntries.updatedAt)),
     accountSmsReceiverMap(event)
+  ])
+  const views = rows.map(row => accountView(row, receivers.get(row.id) || null))
+  if (!search) return views
+  const needle = search.toLowerCase()
+  return views.filter(item => `${item.email} ${item.displayName || ''} ${item.source} ${item.smsReceiver?.phone || ''} ${item.remark || ''}`.toLowerCase().includes(needle))
+}
+
+export async function listUserAccountVaultEntries(event: H3Event, ownerUserId: string, query: Record<string, string | undefined> = {}) {
+  const search = text(query.search, '搜索内容', 200)
+  const [rows, receivers] = await Promise.all([
+    useDatabase(event).select().from(accountVaultEntries)
+      .where(eq(accountVaultEntries.ownerUserId, ownerUserId))
+      .orderBy(desc(accountVaultEntries.updatedAt)),
+    accountSmsReceiverMap(event, ownerUserId)
   ])
   const views = rows.map(row => accountView(row, receivers.get(row.id) || null))
   if (!search) return views
@@ -180,12 +194,12 @@ export async function getAccountVaultEntry(event: H3Event, id: string) {
 }
 
 async function accountRow(event: H3Event, id: string) {
-  const [row] = await useDatabase(event).select().from(accountVaultEntries).where(eq(accountVaultEntries.id, id)).limit(1)
+  const [row] = await useDatabase(event).select().from(accountVaultEntries).where(and(eq(accountVaultEntries.id, id), isNull(accountVaultEntries.ownerUserId))).limit(1)
   if (!row) throw createError({ statusCode: 404, message: '账号资料不存在' })
   return row
 }
 
-export async function createAccountVaultEntry(event: H3Event, body: UnknownRecord, actorId: string, sourceRef: string | null = null) {
+export async function createAccountVaultEntry(event: H3Event, body: UnknownRecord, actorId: string, sourceRef: string | null = null, ownerUserId: string | null = null) {
   return withDatabaseTransaction(event, async () => {
     const id = randomUUID()
     const accessToken = accountSecret(body.accessToken, 'Access Token', 16_000)
@@ -203,9 +217,10 @@ export async function createAccountVaultEntry(event: H3Event, body: UnknownRecor
     if (values.source === 'unknown') throw createError({ statusCode: 400, message: '请选择账号来源' })
     let receiverId = typeof body.smsReceiverId === 'string' && body.smsReceiverId ? body.smsReceiverId : null
     if (!receiverId && body.phone && body.smsUrl) receiverId = await ensureLegacySmsReceiver(event, body.phone, body.smsUrl, actorId)
-    if (receiverId) await assertSmsReceiverAvailable(event, receiverId)
+    if (receiverId) await assertSmsReceiverAvailable(event, receiverId, ownerUserId)
     const [created] = await useDatabase(event).insert(accountVaultEntries).values({
       id,
+      ownerUserId,
       ...values,
       encryptedPassword: encryptContextSecret(password, accountContext(id), event),
       encryptedAccessToken: accessToken ? encryptContextSecret(accessToken, accountContext(id, 'access-token'), event) : null,
@@ -217,8 +232,13 @@ export async function createAccountVaultEntry(event: H3Event, body: UnknownRecor
       updatedBy: actorId
     }).returning()
     if (!created) throw createError({ statusCode: 500, message: '创建账号资料失败' })
-    if (receiverId) await bindAccountSmsReceiver(event, id, receiverId, actorId)
-    else await assignAvailableSmsReceiver(event, id, actorId)
+    if (receiverId) await bindAccountSmsReceiver(event, id, receiverId, actorId, ownerUserId)
+    else await assignAvailableSmsReceiver(event, id, actorId, ownerUserId)
+    if (ownerUserId) {
+      const item = (await listUserAccountVaultEntries(event, ownerUserId)).find(entry => entry.id === id)
+      if (!item) throw createError({ statusCode: 500, message: '创建账号资料后无法读取' })
+      return item
+    }
     return getAccountVaultEntry(event, id)
   })
 }
@@ -475,7 +495,7 @@ function safeAccountImportError(error: unknown) {
     : '账号创建失败'
 }
 
-export async function importAccountDeliveryText(event: H3Event, value: unknown, fields: unknown, source: unknown, actorId: string) {
+export async function importAccountDeliveryText(event: H3Event, value: unknown, fields: unknown, source: unknown, actorId: string, ownerUserId: string | null = null) {
   const normalizedSource = enumText(source, accountSources, 'unknown' as AccountVaultSource, '账号来源')
   if (normalizedSource === 'unknown') throw createError({ statusCode: 400, message: '请选择账号来源' })
   const lines = parseAccountDeliveryText(value, fields)
@@ -487,7 +507,7 @@ export async function importAccountDeliveryText(event: H3Event, value: unknown, 
       failed.push({ index: line.index, email: line.email, message: line.message || '发货格式不正确' })
       continue
     }
-    const sourceRef = `account-delivery:${line.fingerprint}`
+    const sourceRef = `account-delivery:${ownerUserId ? `${ownerUserId}:` : ''}${line.fingerprint}`
     const [existing] = await useDatabase(event).select({ id: accountVaultEntries.id }).from(accountVaultEntries)
       .where(eq(accountVaultEntries.sourceRef, sourceRef)).limit(1)
     if (existing) {
@@ -495,7 +515,7 @@ export async function importAccountDeliveryText(event: H3Event, value: unknown, 
       continue
     }
     try {
-      await createAccountVaultEntry(event, { ...line.record, source: normalizedSource }, actorId, sourceRef)
+      await createAccountVaultEntry(event, { ...line.record, source: normalizedSource }, actorId, sourceRef, ownerUserId)
       created++
     } catch (error) {
       failed.push({ index: line.index, email: line.email, message: safeAccountImportError(error) })

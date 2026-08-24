@@ -1,5 +1,6 @@
 export interface Sub2ApiAccountView {
   id: string
+  upstreamId?: number
   name: string
   email?: string | null
   notes: string | null
@@ -46,6 +47,8 @@ export interface Sub2ApiAccountQuotaResult extends Sub2ApiAccountView {
   usageSource: 'passive' | 'active'
   error?: string
   probeError?: Sub2ApiAccountProbeError
+  personalPoolOwnerUserId?: string | null
+  personalPoolOwnerName?: string | null
 }
 
 export interface Sub2ApiAccountsResponse {

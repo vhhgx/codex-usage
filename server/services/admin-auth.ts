@@ -139,9 +139,13 @@ export async function requireAccountAdmin(event: H3Event) {
   return session
 }
 
+export function canOwnPersonalResources(role: StoredSession['role']) {
+  return role === 'user' || role === 'admin' || role === 'super_admin'
+}
+
 export async function requireUser(event: H3Event) {
   const session = await requireAuthenticated(event)
-  if (session.role !== 'user') throw createError({ statusCode: 403, message: '该页面仅供普通用户使用' })
+  if (!canOwnPersonalResources(session.role)) throw createError({ statusCode: 403, message: '当前角色不能维护个人资源' })
   return session
 }
 

@@ -1,4 +1,5 @@
 import type { H3Event } from 'h3'
+import { eq } from 'drizzle-orm'
 import type {
   Sub2ApiAccountQuotaResult,
   Sub2ApiAccountQuotaWindow,
@@ -10,6 +11,8 @@ import { opaqueSub2ApiAccountId, opaqueSub2ApiGroupId, opaqueSub2ApiProxyId } fr
 import { normalizeBaseUrl, redactSensitiveText, requireUpstreamConfig } from '../utils/upstream'
 import { markAccountVaultSub2ApiDeleted, reconcileAccountVaultSub2ApiAccounts } from './accounting'
 import { getCpaDefaultProxyUpstreamId, getSub2ApiDefaultProxyUpstreamId, setSub2ApiDefaultProxyUpstreamId } from './hub-settings'
+import { useDatabase } from '../db'
+import { userPoolGroups, users } from '../db/schema'
 
 type UnknownRecord = Record<string, unknown>
 
@@ -142,15 +145,48 @@ function unwrap<T>(payload: unknown): T {
   return (Object.prototype.hasOwnProperty.call(envelope, 'data') ? envelope.data : envelope) as T
 }
 
+function sub2ApiBaseUrl(event: H3Event) {
+  const config = requireUpstreamConfig(event, ['sub2apiBaseUrl'])
+  return normalizeBaseUrl(config.sub2apiBaseUrl)
+    .replace(/\/api\/v1$/i, '')
+    .replace(/\/v1$/i, '')
+}
+
+export async function sub2ApiUserFetch<T>(
+  event: H3Event,
+  path: string,
+  options: Parameters<typeof $fetch>[1] = {},
+  accessToken?: string
+): Promise<T> {
+  try {
+    const payload = await $fetch<unknown>(`${sub2ApiBaseUrl(event)}/api/v1${path}`, {
+      ...options,
+      headers: {
+        ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        ...(options.headers || {})
+      },
+      timeout: 30_000
+    })
+    return unwrap<T>(payload)
+  } catch (error) {
+    const status = Number((error as { response?: { status?: number }; statusCode?: number })?.response?.status ||
+      (error as { statusCode?: number })?.statusCode || 0)
+    const message = redactSensitiveText(errorMessage(error, '无法连接 Sub2API 用户接口')) || '无法连接 Sub2API 用户接口'
+    throw createError({
+      statusCode: status >= 400 && status < 600 ? status : 502,
+      message,
+      data: { upstreamStatus: status || 502 }
+    })
+  }
+}
+
 export async function sub2ApiAdminFetch<T>(
   event: H3Event,
   path: string,
   options: Parameters<typeof $fetch>[1] = {}
 ): Promise<T> {
   const config = requireUpstreamConfig(event, ['sub2apiBaseUrl', 'sub2apiAdminApiKey'])
-  const base = normalizeBaseUrl(config.sub2apiBaseUrl)
-    .replace(/\/api\/v1$/i, '')
-    .replace(/\/v1$/i, '')
+  const base = sub2ApiBaseUrl(event)
   try {
     const payload = await $fetch<unknown>(`${base}/api/v1/admin${path}`, {
       ...options,
@@ -191,6 +227,7 @@ function accountView(event: H3Event, raw: UnknownRecord): InternalAccount | null
     raw,
     view: {
       id: opaqueSub2ApiAccountId(event, upstreamId),
+      upstreamId,
       name: text(raw.name) || `账号 ${upstreamId}`,
       email: accountEmail(raw),
       notes: text(raw.notes) || null,
@@ -442,12 +479,18 @@ export async function getAllSub2ApiAccountQuotas(
   concurrency = active ? 5 : 10
 ) {
   const accounts = await listSub2ApiAccounts(event)
+  const poolOwners = await useDatabase(event).select({ upstreamGroupId: userPoolGroups.upstreamGroupId, ownerUserId: userPoolGroups.ownerUserId, ownerName: users.username }).from(userPoolGroups).leftJoin(users, eq(userPoolGroups.ownerUserId, users.id))
+  const ownerByGroup = new Map(poolOwners.map(item => [item.upstreamGroupId, item]))
   const results: Sub2ApiAccountQuotaResult[] = new Array(accounts.length)
   let cursor = 0
   async function worker() {
     while (cursor < accounts.length) {
       const index = cursor++
-      results[index] = await fetchSub2ApiAccountQuota(event, accounts[index]!, active)
+      const account = accounts[index]!
+      const result = await fetchSub2ApiAccountQuota(event, account, active)
+      const groupIds = Array.isArray(account.raw.group_ids) ? account.raw.group_ids.map(numberValue).filter((id): id is number => id !== null) : []
+      const owner = groupIds.map(id => ownerByGroup.get(id)).find(Boolean)
+      results[index] = { ...result, personalPoolOwnerUserId: owner?.ownerUserId || null, personalPoolOwnerName: owner?.ownerName || null }
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, accounts.length) }, () => worker()))
@@ -810,11 +853,20 @@ export function managedAccountView(event: H3Event, account: InternalAccount, pro
 
 export async function listManagedSub2ApiAccounts(event: H3Event) {
   const [accounts, proxies] = await Promise.all([listSub2ApiAccounts(event), listManagedSub2ApiProxies(event, false)])
+  const poolOwners = await useDatabase(event).select({ upstreamGroupId: userPoolGroups.upstreamGroupId, ownerUserId: userPoolGroups.ownerUserId, ownerName: users.username }).from(userPoolGroups).leftJoin(users, eq(userPoolGroups.ownerUserId, users.id))
+  const ownerByGroup = new Map(poolOwners.map(item => [item.upstreamGroupId, item]))
   await reconcileAccountVaultSub2ApiAccounts(event, new Set(accounts.map(account => account.view.id)))
   return accounts.map(account => ({
     upstreamId: account.upstreamId,
     raw: account.raw,
-    view: managedAccountView(event, account, proxies)
+    view: {
+      ...managedAccountView(event, account, proxies),
+      ...(() => {
+        const groupIds = Array.isArray(account.raw.group_ids) ? account.raw.group_ids.map(numberValue).filter((id): id is number => id !== null) : []
+        const owner = groupIds.map(id => ownerByGroup.get(id)).find(Boolean)
+        return { isPersonalPool: Boolean(owner), personalPoolOwnerUserId: owner?.ownerUserId || null, personalPoolOwnerName: owner?.ownerName || null }
+      })()
+    }
   }))
 }
 

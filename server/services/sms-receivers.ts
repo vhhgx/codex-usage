@@ -3,11 +3,11 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { isIP } from 'node:net'
 import { randomUUID } from 'node:crypto'
-import { and, asc, eq, inArray, sql } from 'drizzle-orm'
+import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import type { AccountSmsReceiverView, SmsCodeResult, SmsReceiverImportResult, SmsReceiverView } from '#shared/types/accounting'
 import { useDatabase } from '../db'
-import { accountVaultEntries, smsReceiverBindings, smsReceivers } from '../db/schema'
+import { accountVaultEntries, smsReceiverBindings, smsReceivers, userPoolAccounts } from '../db/schema'
 import { decryptContextSecret, encryptContextSecret } from '../utils/hub-crypto'
 
 type UnknownRecord = Record<string, unknown>
@@ -348,20 +348,25 @@ async function fetchProvider(url: URL) {
   throw new Error('接码供应商重定向次数过多')
 }
 
-async function receiverRow(event: H3Event, id: string) {
-  const [row] = await useDatabase(event).select().from(smsReceivers).where(eq(smsReceivers.id, id)).limit(1)
+function receiverOwner(ownerUserId: string | null) {
+  return ownerUserId ? eq(smsReceivers.ownerUserId, ownerUserId) : isNull(smsReceivers.ownerUserId)
+}
+
+async function receiverRow(event: H3Event, id: string, ownerUserId: string | null = null) {
+  const [row] = await useDatabase(event).select().from(smsReceivers).where(and(eq(smsReceivers.id, id), receiverOwner(ownerUserId))).limit(1)
   if (!row) throw createError({ statusCode: 404, message: '接码资源不存在' })
   return row
 }
 
-export async function listSmsReceivers(event: H3Event): Promise<SmsReceiverView[]> {
+export async function listSmsReceivers(event: H3Event, ownerUserId: string | null = null): Promise<SmsReceiverView[]> {
   const db = useDatabase(event)
   const [receivers, bindings] = await Promise.all([
-    db.select().from(smsReceivers).orderBy(asc(smsReceivers.phone)),
+    db.select().from(smsReceivers).where(receiverOwner(ownerUserId)).orderBy(asc(smsReceivers.phone)),
     db.select({
       bindingId: smsReceiverBindings.id,
       receiverId: smsReceiverBindings.receiverId,
       accountId: smsReceiverBindings.accountId,
+      poolAccountId: smsReceiverBindings.poolAccountId,
       slot: smsReceiverBindings.slot,
       email: smsReceiverBindings.accountEmail,
       displayName: smsReceiverBindings.accountDisplayName,
@@ -373,12 +378,13 @@ export async function listSmsReceivers(event: H3Event): Promise<SmsReceiverView[
     const receiverBindings = bindings.filter(item => item.receiverId === receiver.id)
     const accounts = receiverBindings.map(item => ({
       bindingId: item.bindingId,
-      id: item.accountId || `deleted:${item.bindingId}`,
+      id: item.accountId || item.poolAccountId || `deleted:${item.bindingId}`,
       email: item.email,
       displayName: item.displayName,
       slot: item.slot,
       deleted: Boolean(item.deletedAt),
-      manual: Boolean(!item.accountId && !item.deletedAt)
+      manual: Boolean(!item.accountId && !item.poolAccountId && !item.deletedAt),
+      poolAccount: Boolean(item.poolAccountId)
     })).sort((left, right) => left.slot - right.slot)
     return {
       id: receiver.id,
@@ -400,10 +406,10 @@ export async function listSmsReceivers(event: H3Event): Promise<SmsReceiverView[
   })
 }
 
-export async function accountSmsReceiverMap(event: H3Event) {
+export async function accountSmsReceiverMap(event: H3Event, ownerUserId: string | null = null) {
   const [bindings, receivers] = await Promise.all([
     useDatabase(event).select().from(smsReceiverBindings),
-    useDatabase(event).select().from(smsReceivers)
+    useDatabase(event).select().from(smsReceivers).where(receiverOwner(ownerUserId))
   ])
   const receiverMap = new Map(receivers.map(receiver => [receiver.id, receiver]))
   const counts = new Map<string, number>()
@@ -429,14 +435,15 @@ export async function accountSmsReceiverMap(event: H3Event) {
   return result
 }
 
-export async function createSmsReceiver(event: H3Event, body: UnknownRecord, actorId: string) {
+export async function createSmsReceiver(event: H3Event, body: UnknownRecord, actorId: string, ownerUserId: string | null = null) {
   const { phone, phoneKey } = normalizeSmsPhone(body.phone)
   const url = await validateSmsFetchUrl(body.fetchUrl)
-  const [existing] = await useDatabase(event).select({ id: smsReceivers.id }).from(smsReceivers).where(eq(smsReceivers.phoneKey, phoneKey)).limit(1)
+  const [existing] = await useDatabase(event).select({ id: smsReceivers.id }).from(smsReceivers).where(and(receiverOwner(ownerUserId), eq(smsReceivers.phoneKey, phoneKey))).limit(1)
   if (existing) throw createError({ statusCode: 409, message: '这个手机号已经存在于接码管理中' })
   const id = randomUUID()
   const [created] = await useDatabase(event).insert(smsReceivers).values({
     id,
+    ownerUserId,
     phone,
     phoneKey,
     providerHost: url.hostname,
@@ -447,10 +454,10 @@ export async function createSmsReceiver(event: H3Event, body: UnknownRecord, act
     updatedBy: actorId
   }).returning()
   if (!created) throw createError({ statusCode: 500, message: '创建接码资源失败' })
-  return (await listSmsReceivers(event)).find(item => item.id === id)!
+  return (await listSmsReceivers(event, ownerUserId)).find(item => item.id === id)!
 }
 
-export async function importSmsReceivers(event: H3Event, value: unknown, actorId: string): Promise<SmsReceiverImportResult> {
+export async function importSmsReceivers(event: H3Event, value: unknown, actorId: string, ownerUserId: string | null = null): Promise<SmsReceiverImportResult> {
   const parsed = parseSmsReceiverImportText(value)
   const skipped: SmsReceiverImportResult['skipped'] = []
   const failed = [...parsed.failed]
@@ -486,7 +493,7 @@ export async function importSmsReceivers(event: H3Event, value: unknown, actorId
   const db = useDatabase(event)
   const existingRows = addressSafeCandidates.length
     ? await db.select({ phoneKey: smsReceivers.phoneKey }).from(smsReceivers)
-        .where(inArray(smsReceivers.phoneKey, addressSafeCandidates.map(item => item.phoneKey)))
+        .where(and(receiverOwner(ownerUserId), inArray(smsReceivers.phoneKey, addressSafeCandidates.map(item => item.phoneKey))))
     : []
   const existingKeys = new Set(existingRows.map(item => item.phoneKey))
   const insertCandidates = addressSafeCandidates.filter((candidate) => {
@@ -499,6 +506,7 @@ export async function importSmsReceivers(event: H3Event, value: unknown, actorId
     const id = randomUUID()
     return {
       id,
+      ownerUserId,
       phone: candidate.phone,
       phoneKey: candidate.phoneKey,
       providerHost: candidate.url.hostname,
@@ -509,7 +517,7 @@ export async function importSmsReceivers(event: H3Event, value: unknown, actorId
     }
   })
   const inserted = values.length
-    ? await db.insert(smsReceivers).values(values).onConflictDoNothing({ target: smsReceivers.phoneKey }).returning({
+    ? await db.insert(smsReceivers).values(values).onConflictDoNothing().returning({
         id: smsReceivers.id,
         phoneKey: smsReceivers.phoneKey,
         phone: smsReceivers.phone,
@@ -526,11 +534,11 @@ export async function importSmsReceivers(event: H3Event, value: unknown, actorId
   return { created, skipped, failed: failed.sort((left, right) => left.line - right.line) }
 }
 
-export async function updateSmsReceiver(event: H3Event, id: string, body: UnknownRecord, actorId: string) {
-  const current = await receiverRow(event, id)
+export async function updateSmsReceiver(event: H3Event, id: string, body: UnknownRecord, actorId: string, ownerUserId: string | null = null) {
+  const current = await receiverRow(event, id, ownerUserId)
   const { phone, phoneKey } = body.phone === undefined ? current : normalizeSmsPhone(body.phone)
   const fetchUrl = typeof body.fetchUrl === 'string' && body.fetchUrl.trim() ? await validateSmsFetchUrl(body.fetchUrl) : null
-  const [duplicate] = await useDatabase(event).select({ id: smsReceivers.id }).from(smsReceivers).where(eq(smsReceivers.phoneKey, phoneKey)).limit(1)
+  const [duplicate] = await useDatabase(event).select({ id: smsReceivers.id }).from(smsReceivers).where(and(receiverOwner(ownerUserId), eq(smsReceivers.phoneKey, phoneKey))).limit(1)
   if (duplicate && duplicate.id !== id) throw createError({ statusCode: 409, message: '这个手机号已经存在于接码管理中' })
   const status = receiverStatus(body.status, current.status as 'active' | 'disabled')
   const [updated] = await useDatabase(event).update(smsReceivers).set({
@@ -544,13 +552,13 @@ export async function updateSmsReceiver(event: H3Event, id: string, body: Unknow
     status,
     updatedBy: actorId,
     updatedAt: new Date()
-  }).where(eq(smsReceivers.id, id)).returning()
+  }).where(and(eq(smsReceivers.id, id), receiverOwner(ownerUserId))).returning()
   if (!updated) throw createError({ statusCode: 500, message: '更新接码资源失败' })
-  return (await listSmsReceivers(event)).find(item => item.id === id)!
+  return (await listSmsReceivers(event, ownerUserId)).find(item => item.id === id)!
 }
 
-export async function deleteSmsReceiver(event: H3Event, id: string) {
-  const receiver = await receiverRow(event, id)
+export async function deleteSmsReceiver(event: H3Event, id: string, ownerUserId: string | null = null) {
+  const receiver = await receiverRow(event, id, ownerUserId)
   const bindings = await useDatabase(event).select({
     accountId: smsReceiverBindings.accountId,
     deletedAt: smsReceiverBindings.deletedAt
@@ -558,12 +566,13 @@ export async function deleteSmsReceiver(event: H3Event, id: string) {
   if (bindings.length && !isSmsReceiverReadyForDeletion(bindings)) {
     throw createError({ statusCode: 409, message: '接码资源仍绑定有效账号，请先解除全部绑定' })
   }
-  await useDatabase(event).delete(smsReceivers).where(eq(smsReceivers.id, id))
+  await useDatabase(event).delete(smsReceivers).where(and(eq(smsReceivers.id, id), receiverOwner(ownerUserId)))
   return { id, phone: receiver.phone }
 }
 
-export async function deleteSmsReceiverBinding(event: H3Event, receiverId: string, bindingId: string) {
+export async function deleteSmsReceiverBinding(event: H3Event, receiverId: string, bindingId: string, ownerUserId: string | null = null) {
   const db = useDatabase(event)
+  await receiverRow(event, receiverId, ownerUserId)
   await db.execute(sql`select pg_advisory_xact_lock(hashtext('zephyr_sms_receiver_allocation'))`)
   const [binding] = await db.select().from(smsReceiverBindings).where(and(
     eq(smsReceiverBindings.id, bindingId),
@@ -580,10 +589,10 @@ export async function deleteSmsReceiverBinding(event: H3Event, receiverId: strin
   }
 }
 
-export async function addManualSmsReceiverBinding(event: H3Event, receiverId: string, body: UnknownRecord, actorId: string) {
+export async function addManualSmsReceiverBinding(event: H3Event, receiverId: string, body: UnknownRecord, actorId: string, ownerUserId: string | null = null) {
   const db = useDatabase(event)
   await db.execute(sql`select pg_advisory_xact_lock(hashtext('zephyr_sms_receiver_allocation'))`)
-  const receiver = await receiverRow(event, receiverId)
+  const receiver = await receiverRow(event, receiverId, ownerUserId)
   if (receiver.status !== 'active') throw createError({ statusCode: 409, message: '停用的接码资源不能添加占用' })
   const used = await db.select({ slot: smsReceiverBindings.slot }).from(smsReceiverBindings)
     .where(eq(smsReceiverBindings.receiverId, receiverId))
@@ -610,21 +619,24 @@ export async function addManualSmsReceiverBinding(event: H3Event, receiverId: st
   }
 }
 
-export async function bindAccountSmsReceiver(event: H3Event, accountId: string, receiverId: string | null, actorId: string) {
+export async function bindAccountSmsReceiver(event: H3Event, accountId: string, receiverId: string | null, actorId: string, ownerUserId: string | null = null) {
   const db = useDatabase(event)
   await db.execute(sql`select pg_advisory_xact_lock(hashtext('zephyr_sms_receiver_allocation'))`)
   const [account] = await db.select({
     id: accountVaultEntries.id,
     email: accountVaultEntries.email,
     displayName: accountVaultEntries.displayName
-  }).from(accountVaultEntries).where(eq(accountVaultEntries.id, accountId)).limit(1)
+  }).from(accountVaultEntries).where(and(
+    eq(accountVaultEntries.id, accountId),
+    ownerUserId ? eq(accountVaultEntries.ownerUserId, ownerUserId) : isNull(accountVaultEntries.ownerUserId)
+  )).limit(1)
   if (!account) throw createError({ statusCode: 404, message: '账号资料不存在' })
   const [current] = await db.select().from(smsReceiverBindings).where(eq(smsReceiverBindings.accountId, accountId)).limit(1)
   if (!receiverId) {
     if (current) await db.delete(smsReceiverBindings).where(eq(smsReceiverBindings.id, current.id))
     return null
   }
-  const receiver = await receiverRow(event, receiverId)
+  const receiver = await receiverRow(event, receiverId, ownerUserId)
   if (receiver.status !== 'active') throw createError({ statusCode: 409, message: '停用的接码资源不能绑定账号' })
   if (current?.receiverId === receiverId) return current
   const used = await db.select({ slot: smsReceiverBindings.slot }).from(smsReceiverBindings).where(eq(smsReceiverBindings.receiverId, receiverId))
@@ -649,23 +661,52 @@ export async function bindAccountSmsReceiver(event: H3Event, accountId: string, 
   }
 }
 
-export async function assignAvailableSmsReceiver(event: H3Event, accountId: string, actorId: string) {
+export async function bindUserPoolAccountSmsReceiver(event: H3Event, ownerUserId: string, accountId: string, receiverId: string | null, actorId: string) {
+  const db = useDatabase(event)
+  await db.execute(sql`select pg_advisory_xact_lock(hashtext('zephyr_sms_receiver_allocation'))`)
+  const [account] = await db.select({ id: userPoolAccounts.id, email: userPoolAccounts.email, displayName: userPoolAccounts.displayName })
+    .from(userPoolAccounts).where(and(eq(userPoolAccounts.id, accountId), eq(userPoolAccounts.ownerUserId, ownerUserId), isNull(userPoolAccounts.removedAt))).limit(1)
+  if (!account) throw createError({ statusCode: 404, message: '专属账号不存在' })
+  const [current] = await db.select().from(smsReceiverBindings).where(eq(smsReceiverBindings.poolAccountId, accountId)).limit(1)
+  if (!receiverId) {
+    if (current) await db.delete(smsReceiverBindings).where(eq(smsReceiverBindings.id, current.id))
+    return null
+  }
+  const receiver = await receiverRow(event, receiverId, ownerUserId)
+  if (receiver.status !== 'active') throw createError({ statusCode: 409, message: '停用的接码资源不能绑定账号' })
+  if (current?.receiverId === receiverId) return current
+  const used = await db.select({ slot: smsReceiverBindings.slot }).from(smsReceiverBindings).where(eq(smsReceiverBindings.receiverId, receiverId))
+  const slot = firstAvailableSmsSlot(used.map(item => item.slot))
+  if (!slot) throw createError({ statusCode: 409, message: '这个手机号已经绑定 3 个账号，请选择其他接码资源' })
+  if (current) await db.delete(smsReceiverBindings).where(eq(smsReceiverBindings.id, current.id))
+  const [created] = await db.insert(smsReceiverBindings).values({
+    receiverId,
+    poolAccountId: account.id,
+    accountEmail: account.email || account.displayName,
+    accountDisplayName: account.displayName,
+    slot,
+    createdBy: actorId
+  }).returning()
+  return created || null
+}
+
+export async function assignAvailableSmsReceiver(event: H3Event, accountId: string, actorId: string, ownerUserId: string | null = null) {
   const db = useDatabase(event)
   await db.execute(sql`select pg_advisory_xact_lock(hashtext('zephyr_sms_receiver_allocation'))`)
   const [receivers, bindings] = await Promise.all([
     db.select({ id: smsReceivers.id, createdAt: smsReceivers.createdAt }).from(smsReceivers)
-      .where(eq(smsReceivers.status, 'active')).orderBy(asc(smsReceivers.createdAt)),
+      .where(and(receiverOwner(ownerUserId), eq(smsReceivers.status, 'active'))).orderBy(asc(smsReceivers.createdAt)),
     db.select({ receiverId: smsReceiverBindings.receiverId }).from(smsReceiverBindings)
   ])
   const counts = new Map<string, number>()
   bindings.forEach(binding => counts.set(binding.receiverId, (counts.get(binding.receiverId) || 0) + 1))
   const receiverId = leastLoadedSmsReceiver(receivers, counts)
   if (!receiverId) return null
-  return bindAccountSmsReceiver(event, accountId, receiverId, actorId)
+  return bindAccountSmsReceiver(event, accountId, receiverId, actorId, ownerUserId)
 }
 
-export async function assertSmsReceiverAvailable(event: H3Event, receiverId: string) {
-  const receiver = await receiverRow(event, receiverId)
+export async function assertSmsReceiverAvailable(event: H3Event, receiverId: string, ownerUserId: string | null = null) {
+  const receiver = await receiverRow(event, receiverId, ownerUserId)
   if (receiver.status !== 'active') throw createError({ statusCode: 409, message: '停用的接码资源不能绑定账号' })
   const bindings = await useDatabase(event).select({ id: smsReceiverBindings.id }).from(smsReceiverBindings)
     .where(eq(smsReceiverBindings.receiverId, receiverId))
@@ -691,7 +732,7 @@ export function leastLoadedSmsReceiver(
 export async function ensureLegacySmsReceiver(event: H3Event, phoneValue: unknown, urlValue: unknown, actorId: string) {
   if (!phoneValue || !urlValue) return null
   const { phoneKey } = normalizeSmsPhone(phoneValue)
-  const [existing] = await useDatabase(event).select({ id: smsReceivers.id }).from(smsReceivers).where(eq(smsReceivers.phoneKey, phoneKey)).limit(1)
+  const [existing] = await useDatabase(event).select({ id: smsReceivers.id }).from(smsReceivers).where(and(isNull(smsReceivers.ownerUserId), eq(smsReceivers.phoneKey, phoneKey))).limit(1)
   if (existing) return existing.id
   return (await createSmsReceiver(event, { phone: phoneValue, fetchUrl: urlValue, note: '由旧账号资料迁移' }, actorId)).id
 }
@@ -703,8 +744,8 @@ export async function revealSmsReceiverFetchUrl(event: H3Event, id: string) {
   }
 }
 
-export async function refreshSmsReceiverCode(event: H3Event, id: string): Promise<SmsCodeResult> {
-  const receiver = await receiverRow(event, id)
+export async function refreshSmsReceiverCode(event: H3Event, id: string, ownerUserId: string | null = null): Promise<SmsCodeResult> {
+  const receiver = await receiverRow(event, id, ownerUserId)
   if (receiver.status !== 'active') throw createError({ statusCode: 409, message: '接码资源已停用' })
   const fetchedAt = Date.now()
   try {
@@ -727,6 +768,17 @@ export async function refreshSmsReceiverCode(event: H3Event, id: string): Promis
     }).where(eq(smsReceivers.id, id))
     throw createError({ statusCode: 502, message })
   }
+}
+
+export async function refreshUserPoolAccountSmsReceiverCode(event: H3Event, ownerUserId: string, accountId: string) {
+  const [binding] = await useDatabase(event).select({ id: smsReceiverBindings.id, receiverId: smsReceiverBindings.receiverId })
+    .from(smsReceiverBindings)
+    .innerJoin(userPoolAccounts, and(eq(smsReceiverBindings.poolAccountId, userPoolAccounts.id), eq(userPoolAccounts.ownerUserId, ownerUserId), isNull(userPoolAccounts.removedAt)))
+    .where(eq(smsReceiverBindings.poolAccountId, accountId)).limit(1)
+  if (!binding) throw createError({ statusCode: 404, message: '该账号尚未绑定接码资源' })
+  const result = await refreshSmsReceiverCode(event, binding.receiverId, ownerUserId)
+  if (result.code) await useDatabase(event).update(smsReceiverBindings).set({ codeReceivedAt: new Date() }).where(eq(smsReceiverBindings.id, binding.id))
+  return result
 }
 
 export async function refreshAccountSmsReceiverCode(event: H3Event, accountId: string): Promise<SmsCodeResult> {

@@ -118,6 +118,12 @@ export const channels = pgTable('channels', {
   healthStatus: text('health_status').notNull().default('unknown'),
   lastHealthCheckAt: timestamp('last_health_check_at', { withTimezone: true }),
   lastHealthError: text('last_health_error'),
+  checkinEnabled: boolean('checkin_enabled').notNull().default(false),
+  encryptedCheckinToken: text('encrypted_checkin_token'),
+  checkinUserId: text('checkin_user_id'),
+  lastCheckinAt: timestamp('last_checkin_at', { withTimezone: true }),
+  lastCheckinStatus: text('last_checkin_status'),
+  lastCheckinMessage: text('last_checkin_message'),
   ...timestamps
 }, table => [
   index('channels_enabled_priority_idx').on(table.enabled, table.priority),
@@ -549,6 +555,12 @@ export const userSubscriptions = pgTable('user_subscriptions', {
   index('user_subscriptions_status_expiry_idx').on(table.status, table.expiresAt)
 ])
 
+export const userRoutePreferences = pgTable('user_route_preferences', {
+  userId: uuid('user_id').primaryKey().references(() => users.id, { onDelete: 'cascade' }),
+  orderedSourceIds: jsonb('ordered_source_ids').$type<string[]>().notNull().default([]),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+})
+
 export const servicePlanVersions = pgTable('service_plan_versions', {
   id: uuid('id').primaryKey().defaultRandom(),
   planId: uuid('plan_id').notNull().references(() => servicePlans.id, { onDelete: 'cascade' }),
@@ -654,6 +666,7 @@ export const announcements = pgTable('announcements', {
 
 export const accountVaultEntries = pgTable('account_vault_entries', {
   id: uuid('id').primaryKey().defaultRandom(),
+  ownerUserId: uuid('owner_user_id').references(() => users.id, { onDelete: 'cascade' }),
   email: text('email').notNull(),
   displayName: text('display_name'),
   source: text('source').notNull().default('unknown'),
@@ -679,6 +692,7 @@ export const accountVaultEntries = pgTable('account_vault_entries', {
   updatedBy: uuid('updated_by').references(() => users.id, { onDelete: 'set null' }),
   ...timestamps
 }, table => [
+  index('account_vault_owner_idx').on(table.ownerUserId),
   index('account_vault_email_idx').on(table.email),
   index('account_vault_source_idx').on(table.source),
   index('account_vault_status_idx').on(table.status),
@@ -689,6 +703,7 @@ export const accountVaultEntries = pgTable('account_vault_entries', {
 
 export const smsReceivers = pgTable('sms_receivers', {
   id: uuid('id').primaryKey().defaultRandom(),
+  ownerUserId: uuid('owner_user_id').references(() => users.id, { onDelete: 'cascade' }),
   phone: text('phone').notNull(),
   phoneKey: text('phone_key').notNull(),
   providerHost: text('provider_host').notNull(),
@@ -702,7 +717,9 @@ export const smsReceivers = pgTable('sms_receivers', {
   updatedBy: uuid('updated_by').references(() => users.id, { onDelete: 'set null' }),
   ...timestamps
 }, table => [
-  uniqueIndex('sms_receivers_phone_key_idx').on(table.phoneKey),
+  uniqueIndex('sms_receivers_platform_phone_key_idx').on(table.phoneKey).where(sql`${table.ownerUserId} is null`),
+  uniqueIndex('sms_receivers_owner_phone_key_idx').on(table.ownerUserId, table.phoneKey).where(sql`${table.ownerUserId} is not null`),
+  index('sms_receivers_owner_idx').on(table.ownerUserId),
   index('sms_receivers_status_idx').on(table.status)
 ])
 
@@ -710,6 +727,7 @@ export const smsReceiverBindings = pgTable('sms_receiver_bindings', {
   id: uuid('id').primaryKey().defaultRandom(),
   receiverId: uuid('receiver_id').notNull().references(() => smsReceivers.id, { onDelete: 'cascade' }),
   accountId: uuid('account_id').references(() => accountVaultEntries.id, { onDelete: 'set null' }),
+  poolAccountId: uuid('pool_account_id').references(() => userPoolAccounts.id, { onDelete: 'set null' }),
   accountEmail: text('account_email').notNull(),
   accountDisplayName: text('account_display_name'),
   slot: integer('slot').notNull(),
@@ -719,7 +737,9 @@ export const smsReceiverBindings = pgTable('sms_receiver_bindings', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
 }, table => [
   check('sms_receiver_bindings_slot_check', sql`${table.slot} between 1 and 3`),
+  check('sms_receiver_bindings_account_kind_check', sql`not (${table.accountId} is not null and ${table.poolAccountId} is not null)`),
   uniqueIndex('sms_receiver_bindings_account_idx').on(table.accountId),
+  uniqueIndex('sms_receiver_bindings_pool_account_idx').on(table.poolAccountId),
   uniqueIndex('sms_receiver_bindings_receiver_slot_idx').on(table.receiverId, table.slot),
   index('sms_receiver_bindings_receiver_idx').on(table.receiverId)
 ])

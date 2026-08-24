@@ -9,6 +9,7 @@ const props = defineProps<{
   account: CodexAccountView
   quota?: CodexQuotaResult
   loading?: boolean
+  badge?: string
 }>()
 
 defineEmits<{ refresh: [id: string] }>()
@@ -59,7 +60,7 @@ function updateSpotlight(event: PointerEvent) {
 <template>
   <article class="glass-panel quota-ticket spotlight-panel" :data-tone="cardTone" @pointermove="updateSpotlight">
     <header class="quota-ticket__header">
-      <div class="quota-ticket__identity"><h4>{{ account.email || account.name }}</h4></div>
+      <div class="quota-ticket__identity"><h4>{{ account.email || account.name }}</h4><small v-if="badge">{{ badge }}</small></div>
       <button type="button" class="icon-button quota-ticket__refresh" :disabled="loading" title="刷新此账号" :aria-label="`刷新 ${account.email || account.name} 额度`" @click="$emit('refresh', account.id)"><IconRefresh :size="14" :stroke-width="1.8" :class="{ 'is-spinning': loading }" /></button>
     </header>
 
@@ -78,6 +79,7 @@ function updateSpotlight(event: PointerEvent) {
 .quota-ticket__header { min-width: 0; min-height: 0; padding: 0; border-bottom: 0; display: flex; grid-template-columns: none; align-content: normal; align-items: center; justify-content: space-between; gap: .55rem; }
 .quota-ticket__identity { min-width: 0; }
 .quota-ticket__identity h4 { margin: 0; overflow: hidden; color: var(--hub-text); font-family: var(--hub-font-mono); font-size: .8rem; font-weight: var(--hub-weight-semibold); text-overflow: ellipsis; white-space: nowrap; }
+.quota-ticket__identity small { margin-top:.14rem; display:block; color:var(--hub-accent); font-size:.61rem; }
 .quota-ticket__refresh { width: var(--hub-icon-button-size-compact); height: var(--hub-icon-button-size-compact); border-radius: var(--hub-radius-md); }
 .quota-ticket__windows { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .quota-window { min-width: 0; padding: .12rem .55rem .08rem 0; }

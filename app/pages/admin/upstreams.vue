@@ -58,6 +58,7 @@ const loading = ref(false);
 const saving = ref(false);
 const error = ref("");
 const { show: showToast } = useAppToast();
+const authSession = useState<{ user?: { id?: string } } | null>('auth-session', () => null);
 const search = ref("");
 const operationConnection = ref("");
 const operationStatus = ref("");
@@ -1002,6 +1003,7 @@ onMounted(async () => {
             <th>账号</th>
             <th>平台 / 类型</th>
             <th>分组</th>
+            <th>号池归属</th>
             <th>代理</th>
             <th>调度</th>
             <th>并发 / 优先级</th>
@@ -1018,6 +1020,7 @@ onMounted(async () => {
               {{ item.platform }}<code>{{ item.type }}</code>
             </td>
             <td>{{ item.groupNames.join("、") || "未分组" }}</td>
+            <td><span v-if="item.isPersonalPool" class="status-dot" data-status="active"><i />{{ item.personalPoolOwnerUserId === authSession?.user?.id ? '我的号池' : '用户号池' }}<code>{{ item.personalPoolOwnerName || '未知用户' }}</code></span><code v-else>公共号池</code></td>
             <td><strong>{{ item.proxyName || "直连" }}</strong><code v-if="!item.proxyEditable">继承主账号</code><code v-else-if="item.proxyFallbackOriginId">已触发回退</code></td>
             <td>
               <span
@@ -1067,7 +1070,7 @@ onMounted(async () => {
             </td>
           </tr>
           <tr v-if="!filteredAccounts.length">
-            <td colspan="7">
+            <td colspan="8">
               <div class="admin-empty">
                 {{ loading ? "正在读取账号…" : "没有账号" }}
               </div>

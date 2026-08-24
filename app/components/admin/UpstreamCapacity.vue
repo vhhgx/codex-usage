@@ -25,6 +25,7 @@ import {
 withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
 
 const requestFetch = useRequestFetch()
+const authSession = useState<{ user?: { id?: string } } | null>('auth-session', () => null)
 
 const cpaInitialized = useState('account-quota-cpa-initialized', () => false)
 const cpaLoadingAccounts = useState('account-quota-cpa-loading', () => true)
@@ -165,7 +166,8 @@ function subQuota(item: Sub2ApiAccountQuotaResult): CodexQuotaResult {
 
 const subCards = computed(() => subResults.value.map((item) => ({
   account: subAccount(item),
-  quota: subQuota(item)
+  quota: subQuota(item),
+  badge: item.personalPoolOwnerUserId ? (item.personalPoolOwnerUserId === authSession.value?.user?.id ? '我的号池' : `用户号池 · ${item.personalPoolOwnerName || '未知用户'}`) : ''
 })))
 
 const RADAR_EFFORT_ORDER = ['ultra', 'max', 'xhigh', 'high', 'medium', 'low']
@@ -443,6 +445,7 @@ onMounted(() => {
           :key="item.account.id"
           :account="item.account"
           :quota="item.quota"
+          :badge="item.badge"
           :loading="subLoadingIds.has(item.account.id) || subRefreshingAll"
           @refresh="refreshOneSub"
         />

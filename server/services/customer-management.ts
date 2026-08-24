@@ -1,7 +1,9 @@
 import { and, asc, count, desc, eq, gt, gte, isNull, lte, or, sql } from 'drizzle-orm'
 import type { H3Event } from 'h3'
-import { announcements, groupMemberships, groups, servicePlanVersions, servicePlans, usageRollups, userSubscriptions, users } from '../db/schema'
+import { announcements, groupMemberships, groups, servicePlanVersions, servicePlans, usageRollups, userPoolGroups, userSubscriptions, users } from '../db/schema'
 import { useDatabase } from '../db'
+import { getHubSettings } from './hub-settings'
+import { startOfZoned } from '../utils/time-zone'
 
 export const DEFAULT_GROUP_ID = '00000000-0000-4000-8000-000000000001'
 export const DEFAULT_PLAN_ID = '00000000-0000-4000-8000-000000000002'
@@ -236,10 +238,12 @@ export async function assignPlan(event: H3Event, userId: string, planId: string,
   if (Number.isNaN(startsAt.getTime())) throw createError({ statusCode: 400, message: '套餐开始时间不正确' })
   const expiresAt = planExpiry(plan.cycle, startsAt)
   const version = await ensureCurrentPlanVersion(event, plan, actorId)
-  await db.insert(userSubscriptions).values({ userId, planId, planVersionId: version?.id || null, entitlementSnapshot: snapshotForPlan(plan, version), startsAt, expiresAt, assignedBy: actorId, status: 'active' }).onConflictDoUpdate({
+  const entitlementSnapshot = snapshotForPlan(plan, version)
+  await db.insert(userSubscriptions).values({ userId, planId, planVersionId: version?.id || null, entitlementSnapshot, startsAt, expiresAt, assignedBy: actorId, status: 'active' }).onConflictDoUpdate({
     target: userSubscriptions.userId,
-    set: { planId, planVersionId: version?.id || null, entitlementSnapshot: snapshotForPlan(plan, version), startsAt, expiresAt, assignedBy: actorId, status: 'active', updatedAt: new Date() }
+    set: { planId, planVersionId: version?.id || null, entitlementSnapshot, startsAt, expiresAt, assignedBy: actorId, status: 'active', updatedAt: new Date() }
   })
+  await db.update(userPoolGroups).set({ maxAccounts: entitlementSnapshot.maxPoolAccounts, updatedAt: new Date() }).where(eq(userPoolGroups.ownerUserId, userId))
   return getUserPlan(event, userId)
 }
 
@@ -258,11 +262,21 @@ export async function getUserPlan(event: H3Event, userId: string) {
   if (!Object.keys(row.subscription.entitlementSnapshot || {}).length || row.subscription.planVersionId !== version?.id) {
     await db.update(userSubscriptions).set({ planVersionId: version?.id || null, entitlementSnapshot: snapshot, updatedAt: new Date() }).where(eq(userSubscriptions.id, row.subscription.id))
   }
+  const settings = await getHubSettings(event)
+  const today = startOfZoned(new Date(), 'day', settings.timezone)
   const [usage] = await db.select({
     tokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}), 0)`,
     cost: sql<string>`coalesce(sum(${usageRollups.cost}), 0)`,
-    requests: sql<number>`coalesce(sum(${usageRollups.admittedRequests}), 0)`
-  }).from(usageRollups).where(and(eq(usageRollups.userId, userId), eq(usageRollups.granularity, 'day'), gte(usageRollups.bucketStart, row.subscription.startsAt)))
+    requests: sql<number>`coalesce(sum(${usageRollups.admittedRequests}), 0)`,
+    todayTokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}) filter (where ${usageRollups.bucketStart} >= ${today.toISOString()}::timestamptz), 0)`,
+    todayCost: sql<string>`coalesce(sum(${usageRollups.cost}) filter (where ${usageRollups.bucketStart} >= ${today.toISOString()}::timestamptz), 0)`,
+    todayRequests: sql<number>`coalesce(sum(${usageRollups.admittedRequests}) filter (where ${usageRollups.bucketStart} >= ${today.toISOString()}::timestamptz), 0)`
+  }).from(usageRollups).where(and(
+    eq(usageRollups.userId, userId),
+    eq(usageRollups.granularity, 'day'),
+    eq(usageRollups.supplySource, 'platform'),
+    gte(usageRollups.bucketStart, row.subscription.startsAt)
+  ))
   const expired = row.subscription.expiresAt !== null && row.subscription.expiresAt <= new Date()
   return {
     id: row.subscription.id,
@@ -281,7 +295,16 @@ export async function getUserPlan(event: H3Event, userId: string) {
       version: version ? { ...version, price: Number(version.price), privateUsageRateMultiplier: Number(version.privateUsageRateMultiplier) } : null,
       entitlementSnapshot: snapshot
     },
-    usage: { requests: Number(usage?.requests || 0), tokens: Number(usage?.tokens || 0), cost: Number(usage?.cost || 0) }
+    usage: {
+      requests: Number(usage?.requests || 0),
+      tokens: Number(usage?.tokens || 0),
+      cost: Number(usage?.cost || 0),
+      today: {
+        requests: Number(usage?.todayRequests || 0),
+        tokens: Number(usage?.todayTokens || 0),
+        cost: Number(usage?.todayCost || 0)
+      }
+    }
   }
 }
 

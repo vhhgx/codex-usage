@@ -43,6 +43,9 @@ export interface SubAccountManagementView {
   expiresAt: number | null
   errorMessage: string | null
   updatedAt: number | null
+  isPersonalPool?: boolean
+  personalPoolOwnerUserId?: string | null
+  personalPoolOwnerName?: string | null
 }
 
 export type SubProxyProtocol = 'http' | 'https' | 'socks5' | 'socks5h'

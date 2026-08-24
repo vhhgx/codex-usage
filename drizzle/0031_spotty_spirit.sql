@@ -1,0 +1,3 @@
+ALTER TABLE "account_vault_entries" ADD COLUMN "owner_user_id" uuid;--> statement-breakpoint
+ALTER TABLE "account_vault_entries" ADD CONSTRAINT "account_vault_entries_owner_user_id_users_id_fk" FOREIGN KEY ("owner_user_id") REFERENCES "public"."users"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+CREATE INDEX "account_vault_owner_idx" ON "account_vault_entries" USING btree ("owner_user_id");

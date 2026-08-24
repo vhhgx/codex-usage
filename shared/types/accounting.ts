@@ -64,7 +64,7 @@ export interface SmsReceiverView {
   bindingCount: number
   availableSlots: number
   readyForDeletion: boolean
-  accounts: Array<{ bindingId: string; id: string; email: string; displayName: string | null; slot: number; deleted: boolean; manual: boolean }>
+  accounts: Array<{ bindingId: string; id: string; email: string; displayName: string | null; slot: number; deleted: boolean; manual: boolean; poolAccount: boolean }>
   lastFetchedAt: number | null
   lastFetchStatus: string | null
   lastFetchError: string | null
