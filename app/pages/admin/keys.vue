@@ -7,7 +7,6 @@ import {
   IconCopy,
   IconDotsVertical,
   IconEdit,
-  IconEye,
   IconKey,
   IconPlus,
   IconRefresh,
@@ -28,6 +27,7 @@ const { data, refresh } = await useFetch<{ keys: HubKeyView[] }>('/api/admin/key
 const { data: userData } = await useFetch<{ users: HubUserView[] }>('/api/admin/users')
 const { data: groupData } = await useFetch<{ groups: HubGroupView[] }>('/api/admin/groups')
 const { data: activity, refresh: refreshActivity } = await useFetch<KeyActivityResponse>('/api/admin/key-activity')
+const { show: showToast } = useAppToast()
 const search = ref('')
 const route = useRoute()
 const ownerFilter = ref(typeof route.query.owner === 'string' ? route.query.owner : '')
@@ -44,6 +44,7 @@ const saving = ref(false)
 const error = ref('')
 const revealedKey = ref('')
 const copied = ref(false)
+const copyingKeyId = ref<string | null>(null)
 const editing = ref<HubKeyView | null>(null)
 const detail = ref<HubKeyDetailView | null>(null)
 const detailLoading = ref(false)
@@ -93,6 +94,10 @@ function activityTime(value: number | null) {
 function activityValue(value: number) {
   if (activityMetric.value === 'cost') return money(value)
   return activityMetric.value === 'tokens' ? formatTokenCount(value) : compact(value)
+}
+function masked(value: string) {
+  if (value.length <= 10) return value
+  return `${value.slice(0, 6)}********${value.slice(-4)}`
 }
 function heatLevel(value: number) { return value <= 0 || activityMaximum.value <= 0 ? 0 : Math.max(1, Math.ceil(value / activityMaximum.value * 4)) }
 function successRate(requests: number, successes: number) { return requests ? `${(successes / requests * 100).toFixed(1)}%` : '—' }
@@ -149,7 +154,19 @@ async function save() {
 async function toggle(item: HubKeyView) { await $fetch(`/api/admin/keys/${item.id}`, { method: 'PATCH', body: { status: item.status === 'active' ? 'disabled' : 'active' } }); await Promise.all([refresh(), refreshActivity()]) }
 async function remove(item: HubKeyView) { if (!confirm(`确定永久删除 ${item.name}？历史日志会保留。`)) return; await $fetch(`/api/admin/keys/${item.id}`, { method: 'DELETE' }); await Promise.all([refresh(), refreshActivity()]) }
 async function copySecret(value: string) { await navigator.clipboard.writeText(value); copied.value = true; window.setTimeout(() => { copied.value = false }, 1800) }
-async function copyKey() { await copySecret(revealedKey.value) }
+async function copyCreatedKey() { await copySecret(revealedKey.value) }
+async function copyKey(item: HubKeyView) {
+  copyingKeyId.value = item.id
+  try {
+    const { key } = await $fetch<{ key: string }>(`/api/admin/keys/${item.id}/reveal`, { method: 'POST', body: {} })
+    await navigator.clipboard.writeText(key)
+    copied.value = true
+    window.setTimeout(() => { copied.value = false }, 1800)
+  } catch (value) {
+    const failure = value as { data?: { message?: string }; message?: string }
+    showToast(failure.data?.message || failure.message || '复制 Key 失败', 'error')
+  } finally { copyingKeyId.value = null }
+}
 function openSecret(item: HubKeyView, mode: 'reveal' | 'replace') {
   secretItem.value = item; secretMode.value = mode; secretPassword.value = ''; replacementKey.value = ''; secretValue.value = ''; secretError.value = ''
 }
@@ -242,7 +259,7 @@ function periodLimit(item: HubKeyView, period: HubKeyUsagePeriod, metric: 'Reque
           <td><code>{{ item.rpmLimit || '∞' }} RPM</code><small class="table-sub">{{ item.concurrencyLimit || '∞' }} 并发</small></td>
           <td><span class="table-date"><IconCalendarTime :size="15" />{{ timestamp(item.expiresAt) }}</span></td>
           <td>{{ timestamp(item.lastUsedAt) }}</td>
-          <td><div class="table-actions"><button class="icon-button" title="查看完整 Key" aria-label="查看完整 Key" :disabled="!item.revealable" @click="openSecret(item, 'reveal')"><IconEye :size="17" /></button><button class="icon-button" title="设置完整 Key" aria-label="设置完整 Key" @click="openSecret(item, 'replace')"><IconKey :size="16" /></button><button class="icon-button" title="用量详情" aria-label="用量详情" @click="openUsage(item)"><IconChartBar :size="17" /></button><button class="icon-button" :title="item.status === 'active' ? '停用' : '启用'" :aria-label="item.status === 'active' ? '停用 Key' : '启用 Key'" @click="toggle(item)"><IconDotsVertical :size="17" /></button><button class="icon-button" title="编辑策略" aria-label="编辑策略" @click="openEdit(item)"><IconEdit :size="16" /></button><button class="icon-button danger" title="删除" aria-label="删除 Key" @click="remove(item)"><IconTrash :size="16" /></button></div></td>
+          <td><div class="table-actions"><button class="icon-button" title="复制完整 Key" aria-label="复制完整 Key" :disabled="copyingKeyId === item.id || !item.revealable" @click="copyKey(item)"><IconCopy :size="17" /></button><button class="icon-button" title="设置完整 Key" aria-label="设置完整 Key" @click="openSecret(item, 'replace')"><IconKey :size="16" /></button><button class="icon-button" title="用量详情" aria-label="用量详情" @click="openUsage(item)"><IconChartBar :size="17" /></button><button class="icon-button" :title="item.status === 'active' ? '停用' : '启用'" :aria-label="item.status === 'active' ? '停用 Key' : '启用 Key'" @click="toggle(item)"><IconDotsVertical :size="17" /></button><button class="icon-button" title="编辑策略" aria-label="编辑策略" @click="openEdit(item)"><IconEdit :size="16" /></button><button class="icon-button danger" title="删除" aria-label="删除 Key" @click="remove(item)"><IconTrash :size="16" /></button></div></td>
         </tr><tr v-if="!filtered.length"><td colspan="8"><div class="admin-empty">没有匹配的 Hub Key</div></td></tr></tbody>
       </table>
     </section>
@@ -250,7 +267,7 @@ function periodLimit(item: HubKeyView, period: HubKeyUsagePeriod, metric: 'Reque
     <div v-if="showForm" class="admin-modal-backdrop" @click.self="showForm = false">
       <section class="admin-modal admin-modal--wide" role="dialog" aria-modal="true">
         <header><div><span>HUB KEY</span><h2>{{ editing ? '编辑访问策略' : '创建访问凭据' }}</h2></div><button class="icon-button" title="关闭" aria-label="关闭" @click="showForm = false"><IconX :size="18" /></button></header>
-        <div v-if="revealedKey" class="secret-reveal"><IconCheck :size="21" /><div><strong>Hub Key 已创建</strong><code>{{ revealedKey }}</code><small>以后仍可通过“查看完整 Key”获取。</small></div><button class="button button--secondary" @click="copyKey"><IconCheck v-if="copied" :size="17" /><IconCopy v-else :size="17" />{{ copied ? '已复制' : '复制' }}</button></div>
+        <div v-if="revealedKey" class="secret-reveal"><IconCheck :size="21" /><div><strong>Hub Key 已创建</strong><code>{{ masked(revealedKey) }}</code><small>页面仅展示掩码值，点击复制即可使用完整值。</small></div><button class="button button--secondary" @click="copyCreatedKey"><IconCheck v-if="copied" :size="17" /><IconCopy v-else :size="17" />{{ copied ? '已复制' : '复制' }}</button></div>
         <form v-else class="admin-form" @submit.prevent="save">
           <div class="form-grid"><label><span>名称 *</span><input v-model="form.name" required placeholder="例如：研发团队"></label><label><span>备注</span><input v-model="form.note" placeholder="用途或负责人"></label></div>
           <div class="form-grid"><label><span>所属用户 *</span><AppSelect v-model="form.ownerUserId" required><option value="" disabled>选择用户</option><option v-for="user in userData?.users || []" :key="user.id" :value="user.id">{{ user.displayName || user.username }}</option></AppSelect></label><label><span>所属分组 *</span><AppSelect v-model="form.groupId" required><option value="" disabled>选择该用户所属分组</option><option v-for="group in ownerGroups" :key="group.id" :value="group.id">{{ group.name }}</option></AppSelect></label></div>
@@ -268,7 +285,7 @@ function periodLimit(item: HubKeyView, period: HubKeyUsagePeriod, metric: 'Reque
       </section>
     </div>
 
-    <div v-if="secretItem" class="admin-modal-backdrop" @click.self="secretItem = null"><section class="admin-modal" role="dialog" aria-modal="true"><header><div><span>KEY SECRET</span><h2>{{ secretMode === 'reveal' ? '查看完整 Key' : '设置完整 Key 值' }}</h2></div><button class="icon-button" title="关闭" aria-label="关闭" @click="secretItem = null"><IconX :size="18" /></button></header><form class="admin-form" @submit.prevent="submitSecret"><p><strong>{{ secretItem.name }}</strong> · <code>{{ secretItem.maskedKey }}</code></p><label><span>当前管理员密码</span><input v-model="secretPassword" type="password" autocomplete="current-password" required></label><label v-if="secretMode === 'replace'"><span>新的完整 Key</span><input v-model="replacementKey" type="password" minlength="16" maxlength="512" autocomplete="off" required></label><div v-if="secretValue" class="credential-secret"><code>{{ secretValue }}</code><button type="button" class="button button--secondary button--small" @click="copySecret(secretValue)"><IconCopy :size="15" />{{ copied ? '已复制' : '复制' }}</button></div><p v-if="secretError" class="form-error">{{ secretError }}</p><footer><button type="button" class="button button--secondary" @click="secretItem = null">关闭</button><button v-if="!secretValue" class="button button--primary" :disabled="secretBusy">{{ secretBusy ? '处理中' : secretMode === 'reveal' ? '验证并查看' : '验证并设置' }}</button></footer></form></section></div>
+    <div v-if="secretItem" class="admin-modal-backdrop" @click.self="secretItem = null"><section class="admin-modal" role="dialog" aria-modal="true"><header><div><span>KEY SECRET</span><h2>{{ secretMode === 'reveal' ? '查看完整 Key' : '设置完整 Key 值' }}</h2></div><button class="icon-button" title="关闭" aria-label="关闭" @click="secretItem = null"><IconX :size="18" /></button></header><form class="admin-form" @submit.prevent="submitSecret"><p><strong>{{ secretItem.name }}</strong> · <code>{{ secretItem.maskedKey }}</code></p><label><span>当前管理员密码</span><input v-model="secretPassword" type="password" autocomplete="current-password" required></label><label v-if="secretMode === 'replace'"><span>新的完整 Key</span><input v-model="replacementKey" type="password" minlength="16" maxlength="512" autocomplete="off" required></label><div v-if="secretValue" class="credential-secret"><code>{{ masked(secretValue) }}</code><button type="button" class="button button--secondary button--small" @click="copySecret(secretValue)"><IconCopy :size="15" />{{ copied ? '已复制' : '复制' }}</button></div><p v-if="secretError" class="form-error">{{ secretError }}</p><footer><button type="button" class="button button--secondary" @click="secretItem = null">关闭</button><button v-if="!secretValue" class="button button--primary" :disabled="secretBusy">{{ secretBusy ? '处理中' : secretMode === 'reveal' ? '验证并查看' : '验证并设置' }}</button></footer></form></section></div>
 
     <div v-if="detail || detailLoading" class="log-drawer-backdrop" @click.self="detail = null">
       <aside class="log-drawer key-usage-drawer">
@@ -278,7 +295,7 @@ function periodLimit(item: HubKeyView, period: HubKeyUsagePeriod, metric: 'Reque
           <section class="key-usage-periods">
             <article v-for="period in detail.periods" :key="period.id"><header><strong>{{ periodLabel(period) }}</strong><span>{{ period.successRate === null ? '—' : `${period.successRate.toFixed(1)}%` }} 成功</span></header><dl><div><dt>准入请求</dt><dd>{{ compact(period.admittedRequests) }}<small v-if="periodLimit(detail.item, period, 'Request')"> / {{ compact(periodLimit(detail.item, period, 'Request')!) }}</small><small v-if="period.requests !== period.admittedRequests"> · 总计 {{ compact(period.requests) }}</small></dd></div><div><dt>Token</dt><dd>{{ formatTokenCount(period.tokens) }}<small v-if="periodLimit(detail.item, period, 'Token')"> / {{ formatTokenCount(periodLimit(detail.item, period, 'Token')!) }}</small></dd></div><div><dt>成本</dt><dd>{{ money(period.cost) }}<small v-if="periodLimit(detail.item, period, 'Cost')"> / {{ money(periodLimit(detail.item, period, 'Cost')!) }}</small></dd></div></dl></article>
           </section>
-          <section class="key-credentials"><header><div><h3>凭据版本</h3><span>{{ detail.credentials.length }} 个</span></div><div><AppSelect v-model.number="rotationGraceSeconds"><option :value="0">立即切换</option><option :value="3600">重叠 1 小时</option><option :value="86400">重叠 24 小时</option></AppSelect><button class="button button--secondary button--small" :disabled="rotating" @click="rotateCredential"><IconRefresh :class="{ 'is-spinning': rotating }" :size="15" />{{ rotating ? '轮换中' : '轮换 Key' }}</button></div></header><div v-if="rotatedKey" class="credential-secret"><code>{{ rotatedKey }}</code><button class="button button--quiet button--small" @click="copySecret(rotatedKey)"><IconCopy :size="15" />{{ copied ? '已复制' : '复制' }}</button></div><div v-for="credential in detail.credentials" :key="credential.id" class="credential-row"><div><code>{{ credential.maskedKey }}</code><small>{{ credential.current ? '当前凭据' : credential.expiresAt ? `有效至 ${timestamp(credential.expiresAt)}` : '有效' }} · {{ credential.lastUsedAt ? `最后使用 ${timestamp(credential.lastUsedAt)}` : '尚未使用' }}</small></div><span class="status-dot" :data-status="credential.status"><i />{{ credential.status }}</span><button v-if="!credential.current && credential.status === 'active'" class="icon-button danger" title="吊销凭据" aria-label="吊销凭据" @click="revokeCredential(credential.id)"><IconTrash :size="15" /></button></div></section>
+          <section class="key-credentials"><header><div><h3>凭据版本</h3><span>{{ detail.credentials.length }} 个</span></div><div><AppSelect v-model.number="rotationGraceSeconds"><option :value="0">立即切换</option><option :value="3600">重叠 1 小时</option><option :value="86400">重叠 24 小时</option></AppSelect><button class="button button--secondary button--small" :disabled="rotating" @click="rotateCredential"><IconRefresh :class="{ 'is-spinning': rotating }" :size="15" />{{ rotating ? '轮换中' : '轮换 Key' }}</button></div></header><div v-if="rotatedKey" class="credential-secret"><code>{{ masked(rotatedKey) }}</code><button class="button button--quiet button--small" @click="copySecret(rotatedKey)"><IconCopy :size="15" />{{ copied ? '已复制' : '复制' }}</button></div><div v-for="credential in detail.credentials" :key="credential.id" class="credential-row"><div><code>{{ credential.maskedKey }}</code><small>{{ credential.current ? '当前凭据' : credential.expiresAt ? `有效至 ${timestamp(credential.expiresAt)}` : '有效' }} · {{ credential.lastUsedAt ? `最后使用 ${timestamp(credential.lastUsedAt)}` : '尚未使用' }}</small></div><span class="status-dot" :data-status="credential.status"><i />{{ credential.status }}</span><button v-if="!credential.current && credential.status === 'active'" class="icon-button danger" title="吊销凭据" aria-label="吊销凭据" @click="revokeCredential(credential.id)"><IconTrash :size="15" /></button></div></section>
           <section class="key-usage-recent"><header><h3>最近请求</h3><span>{{ detail.recentRequests.length }} 条</span></header><div v-for="request in detail.recentRequests" :key="request.id"><code>{{ request.requestId }}</code><span>{{ request.requestedModel || '—' }}</span><strong :data-status="request.status">{{ request.httpStatus || '—' }}</strong><small>{{ request.durationMs === null ? '—' : `${request.durationMs}ms` }}</small></div><p v-if="!detail.recentRequests.length">尚无请求记录</p></section>
         </template>
       </aside>

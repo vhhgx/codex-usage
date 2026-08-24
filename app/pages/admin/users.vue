@@ -4,6 +4,7 @@ import {
   IconBraces,
   IconChartBar,
   IconCoin,
+  IconCopy,
   IconEdit,
   IconEye,
   IconEyeOff,
@@ -99,6 +100,7 @@ const detailUser = ref<HubUserView | null>(null)
 const detail = ref<UserDetailView | null>(null)
 const detailLoading = ref(false)
 const detailError = ref('')
+const copyingUserKeyId = ref<string | null>(null)
 const deletingUser = ref<HubUserView | null>(null)
 const deleting = ref(false)
 const selectedPlanId = ref('00000000-0000-4000-8000-000000000002')
@@ -125,6 +127,18 @@ function uiRole(value: UserRole | string) {
 
 function uiStatus(value: UserStatus | string) {
   return value === 'active' ? 'active' : 'disabled'
+}
+
+async function copyUserKey(key: UserKeyView) {
+  copyingUserKeyId.value = key.id
+  try {
+    const result = await $fetch<{ key: string }>(`/api/admin/keys/${key.id}/reveal`, { method: 'POST', body: {} })
+    await navigator.clipboard.writeText(result.key)
+    showToast('Key 已复制', 'success')
+  } catch (value) {
+    const failure = value as { data?: { message?: string }; message?: string }
+    showToast(failure.data?.message || failure.message || '复制 Key 失败', 'error')
+  } finally { copyingUserKeyId.value = null }
 }
 
 const filtered = computed(() => (data.value?.users || []).filter(user => {
@@ -155,12 +169,18 @@ const groupFilterOptions = computed(() => [
 ])
 const detailIdentity = computed(() => detail.value?.user || detailUser.value)
 
+function defaultPlanId() {
+  return activePlans.value.find(plan => plan.id === '00000000-0000-4000-8000-000000000002')?.id
+    || activePlans.value[0]?.id
+    || ''
+}
+
 function resetForm() {
   Object.assign(form, { username: '', displayName: '', email: '', password: '', role: 'user', status: 'active', groupIds: [] })
   resetPassword.value = ''
   showPassword.value = false
   formError.value = ''
-  selectedPlanId.value = '00000000-0000-4000-8000-000000000002'
+  selectedPlanId.value = defaultPlanId()
   originalPlanId.value = ''
   originalRole.value = 'user'
 }
@@ -193,12 +213,16 @@ function openEdit(user: ManagedUserView) {
   showPassword.value = false
   formError.value = ''
   const assigned = user.subscription
-  selectedPlanId.value = assigned?.planId || '00000000-0000-4000-8000-000000000002'
+  selectedPlanId.value = assigned?.planId || defaultPlanId()
   originalPlanId.value = assigned?.planId || ''
   showForm.value = true
 }
 
 async function save() {
+  if (form.role === 'user' && !selectedPlanId.value) {
+    formError.value = '请先创建或启用一个用户套餐'
+    return
+  }
   saving.value = true
   formError.value = ''
   try {
@@ -211,21 +235,16 @@ async function save() {
           email: form.email,
           role: form.role === 'user' ? 'user' : (originalRole.value === 'user' ? 'admin' : originalRole.value),
           status: form.status,
-          groupIds: form.groupIds
+          groupIds: form.groupIds,
+          planId: form.role === 'user' && selectedPlanId.value !== originalPlanId.value ? selectedPlanId.value : undefined
         }
       })
       if (resetPassword.value) {
         await $fetch(`/api/admin/users/${editing.value.id}/reset-password`, { method: 'POST', body: { password: resetPassword.value } })
       }
-      if (form.role === 'user' && selectedPlanId.value && selectedPlanId.value !== originalPlanId.value) {
-        await $fetch('/api/admin/plans/assign', { method: 'POST', body: { userId: editing.value.id, planId: selectedPlanId.value } })
-      }
       showToast('用户资料已保存', 'success')
     } else {
-      const result = await $fetch<{ user: HubUserView }>('/api/admin/users', { method: 'POST', body: form })
-      if (form.role === 'user' && selectedPlanId.value) {
-        await $fetch('/api/admin/plans/assign', { method: 'POST', body: { userId: result.user.id, planId: selectedPlanId.value } })
-      }
+      await $fetch<{ user: HubUserView }>('/api/admin/users', { method: 'POST', body: { ...form, planId: form.role === 'user' ? selectedPlanId.value : undefined } })
       showToast('用户已创建', 'success')
     }
     await Promise.all([refresh(), refreshGroups(), refreshPlans()])
@@ -380,7 +399,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleEscape))
               <td data-label="套餐"><span class="users-text-cell">{{ user.subscription?.planName || (user.role === 'user' ? '默认不限量' : '—') }}</span></td>
               <td data-label="Key"><NuxtLink :to="{ path: '/admin/keys', query: { owner: user.id } }" class="users-key-link"><IconKey :size="14" :stroke-width="1.8" />{{ user.keyCount }}</NuxtLink></td>
               <td data-label="最后登录"><span class="users-date">{{ date(user.lastLoginAt) }}</span></td>
-              <td data-label="操作"><div class="table-actions users-table-actions"><button class="icon-button" type="button" title="用户详情" aria-label="用户详情" @click="openDetail(user)"><IconChartBar :size="16" :stroke-width="1.8" /></button><button class="icon-button" type="button" title="编辑用户" aria-label="编辑用户" @click="openEdit(user)"><IconEdit :size="16" :stroke-width="1.8" /></button><button class="icon-button danger" type="button" title="删除用户" aria-label="删除用户" :disabled="user.keyCount > 0" @click="deletingUser = user"><IconTrash :size="16" :stroke-width="1.8" /></button></div></td>
+              <td data-label="操作"><div class="table-actions users-table-actions"><button class="icon-button" type="button" title="用户详情" aria-label="用户详情" @click="openDetail(user)"><IconChartBar :size="16" :stroke-width="1.8" /></button><button class="icon-button" type="button" title="重置密码" aria-label="重置密码" @click="openEdit(user)"><IconKey :size="16" :stroke-width="1.8" /></button><button class="icon-button" type="button" title="编辑用户" aria-label="编辑用户" @click="openEdit(user)"><IconEdit :size="16" :stroke-width="1.8" /></button><button class="icon-button danger" type="button" title="删除用户" aria-label="删除用户" :disabled="user.keyCount > 0" @click="deletingUser = user"><IconTrash :size="16" :stroke-width="1.8" /></button></div></td>
             </tr>
           </tbody>
         </table>
@@ -408,7 +427,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleEscape))
           <div v-if="detailLoading" class="users-drawer-loading"><span class="users-skeleton users-skeleton--wide" /><span class="users-skeleton" /><span class="users-skeleton" /></div>
           <div v-else-if="detailError" class="users-drawer-error"><IconShieldCheck :size="19" :stroke-width="1.7" /><strong>详情读取失败</strong><p>{{ detailError }}</p><AppButton size="small" @click="detailUser && openDetail(detailUser)">重新读取</AppButton></div>
           <template v-else-if="detail">
-            <section class="users-drawer-section"><header class="users-section-heading"><div><span class="users-section-icon"><IconKey :size="15" :stroke-width="1.7" /></span><div><h3>Hub Keys</h3><small>用户访问凭据</small></div></div><span>{{ detail.keys.length }} 个</span></header><div class="users-credential-list"><div v-for="key in detail.keys" :key="key.id" class="users-credential-row"><div><strong>{{ key.name }}</strong><code>{{ key.maskedKey }}</code><small>{{ key.lastUsedAt ? `最近使用 ${date(key.lastUsedAt)}` : '尚未使用' }}</small></div><span class="status-label" :data-status="statusTone(key.status)"><i />{{ keyStatusLabel(key.status) }}</span></div><div v-if="!detail.keys.length" class="users-inline-empty">尚未创建 Hub Key</div></div></section>
+            <section class="users-drawer-section"><header class="users-section-heading"><div><span class="users-section-icon"><IconKey :size="15" :stroke-width="1.7" /></span><div><h3>Hub Keys</h3><small>用户访问凭据</small></div></div><span>{{ detail.keys.length }} 个</span></header><div class="users-credential-list"><div v-for="key in detail.keys" :key="key.id" class="users-credential-row"><div><strong>{{ key.name }}</strong><code>{{ key.maskedKey }}</code><small>{{ key.lastUsedAt ? `最近使用 ${date(key.lastUsedAt)}` : '尚未使用' }}</small></div><span class="status-label" :data-status="statusTone(key.status)"><i />{{ keyStatusLabel(key.status) }}</span><button class="icon-button" type="button" title="复制完整 Key" aria-label="复制完整 Key" :disabled="copyingUserKeyId === key.id" @click="copyUserKey(key)"><IconCopy :size="15" :stroke-width="1.7" /></button></div><div v-if="!detail.keys.length" class="users-inline-empty">尚未创建 Hub Key</div></div></section>
             <section class="users-drawer-section users-activity-section"><header class="users-section-heading"><div><span class="users-section-icon"><IconChartBar :size="15" :stroke-width="1.7" /></span><div><h3>最近活动</h3><small>最新请求记录</small></div></div><span>{{ detail.recent.length }} 条</span></header><div class="users-activity-list"><div v-for="item in detail.recent" :key="item.id" class="users-activity-row" :data-tone="recentTone(item.status, item.httpStatus)"><code>{{ item.requestId }}</code><span>{{ item.model || '—' }}</span><strong>{{ recentStatus(item.status, item.httpStatus) }}</strong><small>{{ date(item.createdAt) }}</small></div><div v-if="!detail.recent.length" class="users-inline-empty">尚无请求记录</div></div></section>
           </template>
         </aside>
@@ -429,7 +448,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleEscape))
                 </div>
                 <div class="users-form-grid">
                   <label class="users-form-field"><span>邮箱</span><input v-model="form.email" type="email"><small /></label>
-                  <label class="users-form-field"><span>密码 <b v-if="!editing" class="users-required">*</b></span><span class="users-password-shell"><input v-if="editing" v-model="resetPassword" :type="showPassword ? 'text' : 'password'" minlength="8" autocomplete="new-password" placeholder="留空表示不修改"><input v-else v-model="form.password" :type="showPassword ? 'text' : 'password'" required minlength="8" autocomplete="new-password"><button class="icon-button users-password-toggle" type="button" :title="showPassword ? '隐藏密码' : '显示密码'" :aria-label="showPassword ? '隐藏密码' : '显示密码'" @click="showPassword = !showPassword"><IconEyeOff v-if="showPassword" :size="16" :stroke-width="1.8" /><IconEye v-else :size="16" :stroke-width="1.8" /></button></span><small>{{ editing ? '留空表示不修改密码' : '至少 8 位字符' }}</small></label>
+                  <label class="users-form-field"><span>{{ editing ? '重置密码' : '初始密码' }} <b v-if="!editing" class="users-required">*</b></span><span class="users-password-shell"><input v-if="editing" v-model="resetPassword" :type="showPassword ? 'text' : 'password'" minlength="8" autocomplete="new-password" placeholder="留空表示不修改"><input v-else v-model="form.password" :type="showPassword ? 'text' : 'password'" required minlength="8" autocomplete="new-password"><button class="icon-button users-password-toggle" type="button" :title="showPassword ? '隐藏密码' : '显示密码'" :aria-label="showPassword ? '隐藏密码' : '显示密码'" @click="showPassword = !showPassword"><IconEyeOff v-if="showPassword" :size="16" :stroke-width="1.8" /><IconEye v-else :size="16" :stroke-width="1.8" /></button></span><small>{{ editing ? '重置后该用户下次登录必须修改密码' : '至少 8 位字符；用户首次登录必须修改' }}</small></label>
                 </div>
                 <div class="users-role-controls">
                   <AppRadioGroup v-model="form.role" name="user-role" label="角色" legend="角色" :options="roleOptions" :columns="2" class="users-role-group" />

@@ -80,7 +80,9 @@ async function login() {
     phase.value = 'redirecting'
     await paintPendingState()
 
-    const requested = typeof route.query.redirect === 'string' ? route.query.redirect : ''
+    const requested = result.user.mustChangePassword
+      ? '/console/password?required=1'
+      : typeof route.query.redirect === 'string' ? route.query.redirect : ''
     const allowedPrefix = result.user.role === 'user' ? '/console' : '/admin'
     const redirect = requested.startsWith(allowedPrefix) ? requested : result.home
     await navigateTo(redirect, { replace: true })

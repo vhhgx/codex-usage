@@ -15,7 +15,8 @@ import {
   users
 } from '../db/schema'
 import { clearHubGroupState } from './hub-limits'
-import { assignDefaultGroup, DEFAULT_GROUP_ID, ensureDefaultSubscription } from './customer-management'
+import { assignDefaultGroup, assignPlan, DEFAULT_GROUP_ID, ensureDefaultSubscription } from './customer-management'
+import { maskHubKey } from '#shared/utils/key-display'
 
 type UnknownRecord = Record<string, unknown>
 const USER_ROLES = new Set<UserRole>(['super_admin', 'admin', 'operator', 'auditor', 'user'])
@@ -125,7 +126,7 @@ export async function getUserDetail(event: H3Event, id: string) {
   return {
     user,
     usage: { requests: Number(usage?.requests || 0), tokens: Number(usage?.tokens || 0), cost: Number(usage?.cost || 0) },
-    keys: keys.map(key => ({ ...key, maskedKey: `${key.keyPrefix}...${key.keyLastFour}`, lastUsedAt: key.lastUsedAt?.getTime() || null })),
+    keys: keys.map(key => ({ ...key, maskedKey: maskHubKey(key.keyPrefix, key.keyLastFour), lastUsedAt: key.lastUsedAt?.getTime() || null })),
     recent: recent.map(item => ({ ...item, createdAt: item.createdAt.getTime() }))
   }
 }
@@ -173,13 +174,15 @@ export async function createUserRecord(event: H3Event, body: UnknownRecord, acto
     passwordHash: await argon2.hash(password, { type: argon2.argon2id }),
     role,
     status: 'active',
-    mustChangePassword: false,
-    passwordChangedAt: new Date()
+    mustChangePassword: role === 'user',
+    passwordChangedAt: null
   }).returning({ id: users.id })
   if (!created) throw createError({ statusCode: 500, message: '创建用户失败' })
   if (role === 'user') {
     await assignDefaultGroup(event, created.id, actorId)
-    await ensureDefaultSubscription(event, created.id, actorId)
+    const planId = text(body.planId, 100)
+    if (planId) await assignPlan(event, created.id, planId, undefined, actorId)
+    else await ensureDefaultSubscription(event, created.id, actorId)
   } else {
     await syncUserGroups(event, created.id, idArray(body.groupIds), actorId)
   }
@@ -199,12 +202,13 @@ export async function updateUserRecord(event: H3Event, id: string, body: Unknown
     email,
     role,
     status,
-    mustChangePassword: false,
     updatedAt: new Date()
   }).where(eq(users.id, id))
   if (role === 'user') {
     await assignDefaultGroup(event, id, actorId)
-    await ensureDefaultSubscription(event, id, actorId)
+    const planId = text(body.planId, 100)
+    if (planId) await assignPlan(event, id, planId, undefined, actorId)
+    else await ensureDefaultSubscription(event, id, actorId)
   }
   else if ('groupIds' in body) await syncUserGroups(event, id, idArray(body.groupIds), actorId)
   return getUser(event, id)
@@ -212,11 +216,11 @@ export async function updateUserRecord(event: H3Event, id: string, body: Unknown
 
 export async function resetUserPassword(event: H3Event, id: string, password: string) {
   if (password.length < 8) throw createError({ statusCode: 400, message: '新密码至少 8 位' })
-  await getUser(event, id)
+  const current = await getUser(event, id)
   await useDatabase(event).update(users).set({
     passwordHash: await argon2.hash(password, { type: argon2.argon2id }),
     passwordChangedAt: new Date(),
-    mustChangePassword: false,
+    mustChangePassword: current.role === 'user',
     status: 'active',
     updatedAt: new Date()
   }).where(eq(users.id, id))
