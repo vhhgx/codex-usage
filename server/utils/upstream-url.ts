@@ -2,6 +2,7 @@ import { lookup } from 'node:dns/promises'
 import ipaddr from 'ipaddr.js'
 import { createError } from 'h3'
 import { Agent, fetch as undiciFetch } from 'undici'
+import { redactSensitiveText } from './upstream'
 
 const ALLOWED_RANGES = new Set(['unicast'])
 
@@ -38,27 +39,68 @@ export async function resolvePublicUpstream(raw: string) {
   if (!addresses.length || addresses.some(item => !isPublicUpstreamAddress(item.address))) {
     throw createError({ statusCode: 400, message: '中转地址解析到了不允许访问的网络' })
   }
-  return { normalized, url, addresses }
+  return { normalized, url, addresses: addresses.slice(0, 8) }
+}
+
+type ErrorRecord = { message?: unknown; code?: unknown; errno?: unknown; syscall?: unknown; cause?: unknown }
+
+export function upstreamNetworkError(error: unknown) {
+  const messages: string[] = []
+  const codes: string[] = []
+  const seen = new Set<unknown>()
+  let current: unknown = error
+  while (current && !seen.has(current)) {
+    seen.add(current)
+    const item = current as ErrorRecord
+    const message = redactSensitiveText(item.message)
+    const code = typeof item.code === 'string' ? item.code : typeof item.errno === 'string' ? item.errno : ''
+    const syscall = typeof item.syscall === 'string' ? item.syscall : ''
+    if (message && message.toLowerCase() !== 'fetch failed' && !messages.includes(message)) messages.push(message)
+    if (code && !codes.includes(code)) codes.push(code)
+    if (syscall && !messages.includes(syscall)) messages.push(syscall)
+    current = item.cause
+  }
+  const code = codes.join('/') || 'UPSTREAM_FETCH_FAILED'
+  const message = messages.join(': ') || '上游连接失败'
+  return { code: code.slice(0, 120), message: message.slice(0, 500) }
+}
+
+export function userUpstreamTarget(raw: string, path: string) {
+  const normalized = normalizeUserUpstreamUrl(raw)
+  return `${normalized.replace(/\/v1$/i, '')}${path.startsWith('/') ? path : `/${path}`}`
 }
 
 export async function pinnedUpstreamFetch(raw: string, path: string, init: Parameters<typeof undiciFetch>[1] = {}) {
   const resolved = await resolvePublicUpstream(raw)
-  const selected = resolved.addresses[0]!
-  const agent = new Agent({
-    connect: {
-      lookup: (_hostname, _options, callback) => callback(null, selected.address, selected.family)
-    }
-  })
-  const target = `${resolved.normalized.replace(/\/v1$/i, '')}${path.startsWith('/') ? path : `/${path}`}`
-  try {
-    const response = await undiciFetch(target, {
-      ...init,
-      dispatcher: agent,
-      redirect: 'manual'
+  const target = userUpstreamTarget(resolved.normalized, path)
+  const failures: Array<{ address: string; code: string; message: string }> = []
+  const candidates = [...resolved.addresses].sort((left, right) => left.family - right.family)
+  for (const selected of candidates) {
+    const agent = new Agent({
+      connect: {
+        timeout: 10_000,
+        lookup: (_hostname, options, callback) => {
+          if (options.all) callback(null, [selected])
+          else callback(null, selected.address, selected.family)
+        }
+      }
     })
-    return { response, close: () => agent.close() }
-  } catch (error) {
-    await agent.close().catch(() => {})
-    throw error
+    try {
+      const response = await undiciFetch(target, {
+        ...init,
+        dispatcher: agent,
+        redirect: 'manual'
+      })
+      return { response, close: () => agent.close(), address: selected.address, target }
+    } catch (error) {
+      await agent.close().catch(() => {})
+      const detail = upstreamNetworkError(error)
+      failures.push({ address: selected.address, ...detail })
+      if (init.signal?.aborted) break
+    }
   }
+  const summary = failures.map(item => `${item.address} [${item.code}] ${item.message}`).join('; ')
+  const failure = new Error(`所有已解析地址均连接失败：${summary || '没有可用地址'}`)
+  Object.assign(failure, { code: 'UPSTREAM_ALL_ADDRESSES_FAILED', failures, target })
+  throw failure
 }

@@ -13,7 +13,7 @@ import { pinnedUpstreamFetch } from '../utils/upstream-url'
 import { trustedClientIp } from '../utils/client-ip'
 import { acquireChannel, admitHubRequest, releaseChannel, settleHubRequest, type ChannelConcurrencyLease } from './hub-limits'
 import { authenticateHubRequest, calculateCost, enforceRequestProtection, estimateReservation, listAccessibleModels, readUpstreamChunk, sanitizeArchiveBody, storeBodySafe, storeFileSafe, touchKeyCredential, writeResponseChunk } from './hub-gateway'
-import { keyRouteSources, recordChannelFailure, recordChannelSuccess, rememberAffinitySelection, routeCandidates, selectSupplySource, type SupplyDecision } from './hub-routing'
+import { orderedRouteSourceNodes, recordChannelFailure, recordChannelSuccess, rememberAffinitySelection, routeCandidates, selectSupplySource, type SupplyDecision } from './hub-routing'
 import { recordUsageRollups } from './hub-rollups'
 import { effectivePriceMultiplier, policyAllows } from './group-policy'
 import { getHubSettings } from './hub-settings'
@@ -23,6 +23,7 @@ import { holdUserWallet, releaseUserWallet, settleUserWallet } from './user-wall
 import { anthropicToOpenAiChat, anthropicUsage, openAiChatToAnthropic, openAiUsage } from './protocols/anthropic-openai'
 import { pipeOpenAiChatAsAnthropic } from './protocols/anthropic-stream'
 import type { CanonicalUsage } from './protocols/canonical'
+import { getUserFailoverSourceIds } from './user-route-preferences'
 
 const MAX_BODY_BYTES = 50 * 1024 * 1024
 const USAGE_TAIL_BYTES = 4 * 1024 * 1024
@@ -148,18 +149,26 @@ export async function handleAnthropicMessages(event: H3Event) {
   if (keyModels.length && !keyModels.some(rule => rule.publicModel === requestedModel)) anthropicError(403, 'This Hub Key cannot use the requested model', 'permission_error')
   if (groupModels.length && !groupModels.some(rule => rule.publicModel === requestedModel)) anthropicError(403, 'This group cannot use the requested model', 'permission_error')
   const affinityKey = hashCacheAffinity(event, { scope: `${userId}:${key.id}`, protocol: 'anthropic_messages', model: requestedModel, system: body.system, tools: body.tools, sessionId: getHeader(event, 'x-zephyr-session-id') || null })
-  let source: 'platform' | 'user_relay' = key.routeMode === 'private_only' ? 'user_relay' : 'platform'
-  let candidates: Awaited<ReturnType<typeof routeCandidates>> = []
-  for (const candidateSource of keyRouteSources(key.routeMode)) {
-    const matching = await routeCandidates(event, requestedModel, endpoint, group.id, candidateSource, undefined, { userId, keyId: key.id, protocol: 'anthropic_messages', allowConversion: true, affinityKey })
-    if (matching.length) { source = candidateSource; candidates = matching; break }
-  }
-  if (!candidates.length) anthropicError(503, `No healthy channel supports model ${requestedModel}`, 'api_error')
-  const reservation = await estimateReservation(event, requestedModel, endpoint, body, raw.length, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Math.max(...candidates.map(candidate => Number(candidate.channel.priceMultiplier)))))
+  const routeOptions = { userId, keyId: key.id, protocol: 'anthropic_messages' as const, allowConversion: true, affinityKey }
+  const sourceIds = await getUserFailoverSourceIds(event, userId)
+  const sourceNodes = orderedRouteSourceNodes(key.routeMode, sourceIds)
+  const [privatePool] = await useDatabase(event).select().from(userPoolGroups).where(and(eq(userPoolGroups.ownerUserId, userId), eq(userPoolGroups.status, 'active'))).limit(1)
+  const privatePoolAvailable = Boolean(privatePool && (await useDatabase(event).select({ id: userPoolAccounts.id }).from(userPoolAccounts).where(and(eq(userPoolAccounts.poolGroupId, privatePool.id), eq(userPoolAccounts.status, 'active'), eq(userPoolAccounts.schedulable, true))).limit(1))[0])
+  const candidateBatches = await Promise.all(sourceNodes.map(async node => ({
+    node,
+    candidates: node.source === 'platform'
+      ? await routeCandidates(event, requestedModel, endpoint, group.id, 'platform', undefined, routeOptions)
+      : node.source === 'private_pool'
+        ? privatePoolAvailable ? await routeCandidates(event, requestedModel, endpoint, group.id, 'private_pool', privatePool!.id, routeOptions) : []
+        : await routeCandidates(event, requestedModel, endpoint, group.id, 'user_relay', undefined, { ...routeOptions, channelId: node.channelId })
+  })))
+  const initialCandidates = candidateBatches.flatMap(batch => batch.candidates)
+  if (!initialCandidates.length) anthropicError(503, `No healthy channel supports model ${requestedModel}`, 'api_error')
+  const reservation = await estimateReservation(event, requestedModel, endpoint, body, raw.length, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Math.max(...initialCandidates.map(candidate => Number(candidate.channel.priceMultiplier)))))
   const requestId = typeof event.context.hubRequestId === 'string' ? event.context.hubRequestId : `req_${crypto.randomUUID().replace(/-/g, '')}`
-  let supplyDecision: SupplyDecision = { source, subscriptionId: null, planVersionId: null, reservedTokens: source === 'user_relay' ? 0 : reservation.tokens }
+  let packageDecision: SupplyDecision | null = null
   let billingMode = 'unlimited'
-  if (source === 'platform') {
+  if (candidateBatches.some(batch => batch.node.source === 'platform')) {
     const activeSubscription = await getActiveSubscription(event, userId)
     const version = activeSubscription?.subscription.planVersionId
       ? (await useDatabase(event).select().from(servicePlanVersions).where(eq(servicePlanVersions.id, activeSubscription.subscription.planVersionId)).limit(1))[0]
@@ -171,23 +180,32 @@ export async function handleAnthropicMessages(event: H3Event) {
     const usedRow = activeSubscription && tokenLimit > 0
       ? (await useDatabase(event).select({ tokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}), 0)` }).from(usageRollups).where(and(eq(usageRollups.userId, userId), eq(usageRollups.granularity, 'day'), gte(usageRollups.bucketStart, activeSubscription.subscription.startsAt))))[0]
       : null
-    const [pool] = await useDatabase(event).select().from(userPoolGroups).where(and(eq(userPoolGroups.ownerUserId, userId), eq(userPoolGroups.status, 'active'))).limit(1)
-    const privatePoolAvailable = Boolean(pool && (await useDatabase(event).select({ id: userPoolAccounts.id }).from(userPoolAccounts).where(and(eq(userPoolAccounts.poolGroupId, pool.id), eq(userPoolAccounts.status, 'active'), eq(userPoolAccounts.schedulable, true))).limit(1))[0])
-    supplyDecision = selectSupplySource({
-      billingMode,
-      supplyMode,
-      estimatedTokens: reservation.tokens,
-      remainingTokens: tokenLimit > 0 ? Math.max(0, tokenLimit - Number(usedRow?.tokens || 0)) : null,
-      privatePoolAvailable,
-      subscriptionId: activeSubscription?.subscription.id,
-      planVersionId: version?.id || activeSubscription?.subscription.planVersionId,
-      poolGroupId: pool?.id
-    })
-    if (supplyDecision.source === 'private_pool') {
-      candidates = await routeCandidates(event, requestedModel, endpoint, group.id, 'private_pool', supplyDecision.poolGroupId, { userId, keyId: key.id, protocol: 'anthropic_messages', allowConversion: true, affinityKey })
-      if (!candidates.length) anthropicError(503, '专属号池当前没有可用的 Messages 或 Chat 模型', 'api_error')
+    try {
+      packageDecision = selectSupplySource({
+        billingMode,
+        supplyMode,
+        estimatedTokens: reservation.tokens,
+        remainingTokens: tokenLimit > 0 ? Math.max(0, tokenLimit - Number(usedRow?.tokens || 0)) : null,
+        privatePoolAvailable,
+        subscriptionId: activeSubscription?.subscription.id,
+        planVersionId: version?.id || activeSubscription?.subscription.planVersionId,
+        poolGroupId: privatePool?.id
+      })
+    } catch (error) {
+      if (!candidateBatches.some(batch => batch.node.source !== 'platform' && batch.candidates.length)) throw error
     }
   }
+  const candidates: Awaited<ReturnType<typeof routeCandidates>> = []
+  for (const batch of candidateBatches) {
+    if (batch.node.source === 'user_relay' || batch.node.source === 'private_pool') candidates.push(...batch.candidates)
+    else if (packageDecision?.source === 'platform') candidates.push(...batch.candidates)
+  }
+  if (!candidates.length) anthropicError(503, '没有可用来源支持当前模型', 'api_error')
+  const supplyDecision: SupplyDecision = candidates[0]!.supplySource === 'user_relay'
+    ? { source: 'user_relay', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
+    : candidates[0]!.supplySource === 'private_pool'
+      ? { source: 'private_pool', subscriptionId: null, planVersionId: null, reservedTokens: 0, poolGroupId: privatePool?.id }
+      : packageDecision || { source: 'platform', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
   const affinityWasReused = candidates[0]?.affinityReused === true
   event.context.hubSupplySource = supplyDecision.source
   event.context.hubPoolGroupId = supplyDecision.poolGroupId

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { anthropicToOpenAiChat, anthropicUsage, openAiChatToAnthropic } from '../server/services/protocols/anthropic-openai'
 import { pipeOpenAiChatAsAnthropic } from '../server/services/protocols/anthropic-stream'
-import { keyRouteSources } from '../server/services/hub-routing'
+import { compareRouteCandidates, keyRouteSources, orderedRouteSourceNodes } from '../server/services/hub-routing'
 
 describe('Anthropic and OpenAI protocol conversion', () => {
   it('maps system, tools, tool use and tool results to Chat Completions', () => {
@@ -51,9 +51,23 @@ describe('Anthropic and OpenAI protocol conversion', () => {
 
   it('orders platform and private relay routing according to the Key mode', () => {
     expect(keyRouteSources('platform_only')).toEqual(['platform'])
-    expect(keyRouteSources('private_only')).toEqual(['user_relay'])
-    expect(keyRouteSources('platform_then_private')).toEqual(['platform', 'user_relay'])
-    expect(keyRouteSources('private_then_platform')).toEqual(['user_relay', 'platform'])
+    expect(keyRouteSources('private_only')).toEqual(['private_pool', 'user_relay'])
+    expect(keyRouteSources('platform_then_private')).toEqual(['platform', 'private_pool', 'user_relay'])
+    expect(keyRouteSources('private_then_platform')).toEqual(['private_pool', 'user_relay', 'platform'])
+  })
+
+  it('filters the user failover sequence according to the Key route mode', () => {
+    const order = ['relay:first', 'private_pool', 'package', 'relay:last']
+    expect(orderedRouteSourceNodes('platform_then_private', order).map(item => item.id)).toEqual(order)
+    expect(orderedRouteSourceNodes('platform_only', order).map(item => item.id)).toEqual(['package'])
+    expect(orderedRouteSourceNodes('private_only', order).map(item => item.id)).toEqual(['relay:first', 'private_pool', 'relay:last'])
+  })
+
+  it('uses the dragged relay position before protocol conversion quality', () => {
+    const convertedFirst = { channel: { priority: 10, name: 'first' }, conversionMode: 'anthropic_to_openai' as const }
+    const directSecond = { channel: { priority: 20, name: 'second' }, conversionMode: 'passthrough' as const }
+    expect([directSecond, convertedFirst].sort((left, right) => compareRouteCandidates(left, right, 'user_relay'))).toEqual([convertedFirst, directSecond])
+    expect([convertedFirst, directSecond].sort((left, right) => compareRouteCandidates(left, right, 'platform'))).toEqual([directSecond, convertedFirst])
   })
 
   it('produces valid Anthropic SSE across arbitrary input chunks', async () => {

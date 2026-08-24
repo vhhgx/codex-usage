@@ -34,6 +34,7 @@ import { storeEncryptedBody, storeEncryptedStream } from '../utils/object-storag
 import {
   acquireChannel,
   admitHubRequest,
+  cancelHubAdmission,
   releaseChannel,
   releaseHubConcurrency,
   renewChannel,
@@ -42,7 +43,7 @@ import {
   type ChannelConcurrencyLease,
   type HubConcurrencyLease
 } from './hub-limits'
-import { keyRouteSources, recordChannelFailure, recordChannelSuccess, rememberAffinitySelection, routeCandidates, selectSupplySource, type SupplyDecision } from './hub-routing'
+import { orderedRouteSourceNodes, recordChannelFailure, recordChannelSuccess, rememberAffinitySelection, routeCandidates, selectSupplySource, type SupplyDecision } from './hub-routing'
 import { getHubSettings } from './hub-settings'
 import { recordUsageRollups } from './hub-rollups'
 import { acquireIdempotency, completeIdempotency, failIdempotency } from './hub-idempotency'
@@ -54,6 +55,7 @@ import { effectivePriceMultiplier, policyAllows } from './group-policy'
 import { getActiveSubscription } from './customer-management'
 import { holdUserWallet, releaseUserWallet, settleUserWallet } from './user-wallet'
 import { visibleChannels } from './channel-access'
+import { getUserFailoverSourceIds } from './user-route-preferences'
 
 const MAX_BODY_BYTES = 50 * 1024 * 1024
 const MAX_BUFFERED_BODY_BYTES = 256 * 1024 * 1024
@@ -688,8 +690,9 @@ export async function handleHubRequest(event: H3Event, path: string) {
   }
   let candidates: Awaited<ReturnType<typeof routeCandidates>>
   let supplyDecision: SupplyDecision = { source: 'platform', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
-  let selectedSupplyMode = 'platform_only'
-  let selectedPoolGroupId: string | undefined
+  let packageDecision: SupplyDecision | null = null
+  let packageBillingMode = 'unlimited'
+  let packageAdmissionLease: HubConcurrencyLease | null = null
   let walletHoldKey: string | null = null
   let walletHeld = false
   let affinityKey: string | undefined
@@ -707,12 +710,19 @@ export async function handleHubRequest(event: H3Event, path: string) {
       sessionId: getHeader(event, 'x-zephyr-session-id') || null
     })
     const routeOptions = { userId, keyId: key.id, protocol: inboundProtocol, affinityKey }
-    let requestedSource: 'platform' | 'user_relay' = key.routeMode === 'private_only' ? 'user_relay' : 'platform'
-    let initialCandidates: Awaited<ReturnType<typeof routeCandidates>> = []
-    for (const source of keyRouteSources(key.routeMode)) {
-      const matching = await routeCandidates(event, parsed.model, endpoint, group.id, source, undefined, routeOptions)
-      if (matching.length) { requestedSource = source; initialCandidates = matching; break }
-    }
+    const sourceIds = await getUserFailoverSourceIds(event, userId)
+    const sourceNodes = orderedRouteSourceNodes(key.routeMode, sourceIds)
+    const [privatePool] = await useDatabase(event).select().from(userPoolGroups).where(and(eq(userPoolGroups.ownerUserId, userId), eq(userPoolGroups.status, 'active'))).limit(1)
+    const privatePoolAvailable = Boolean(privatePool && (await useDatabase(event).select({ id: userPoolAccounts.id }).from(userPoolAccounts).where(and(eq(userPoolAccounts.poolGroupId, privatePool.id), eq(userPoolAccounts.status, 'active'), eq(userPoolAccounts.schedulable, true))).limit(1))[0])
+    const candidateBatches = await Promise.all(sourceNodes.map(async node => ({
+      node,
+      candidates: node.source === 'platform'
+        ? await routeCandidates(event, parsed.model, endpoint, group.id, 'platform', undefined, routeOptions)
+        : node.source === 'private_pool'
+          ? privatePoolAvailable ? await routeCandidates(event, parsed.model, endpoint, group.id, 'private_pool', privatePool!.id, routeOptions) : []
+          : await routeCandidates(event, parsed.model, endpoint, group.id, 'user_relay', undefined, { ...routeOptions, channelId: node.channelId })
+    })))
+    const initialCandidates = candidateBatches.flatMap(batch => batch.candidates)
     if (!initialCandidates.length) {
       const message = (await getHubSettings(event)).errorMessageOverrides['503'] || `No healthy channel supports model ${parsed.model}`
       openAiError(503, message, 'server_error', 'no_available_channel')
@@ -725,66 +735,54 @@ export async function handleHubRequest(event: H3Event, path: string) {
       requestBody.length,
       effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Math.max(...initialCandidates.map(candidate => Number(candidate.channel.priceMultiplier))))
     )
-    if (requestedSource === 'user_relay') {
-      candidates = initialCandidates
-      supplyDecision = { source: 'user_relay', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
-      event.context.hubSupplySource = 'user_relay'
-      enforceRequestProtection(key, reservation)
-      concurrencyLease = await admitHubRequest(event, key, group, reservation.tokens, 0, { skipSubscriptionQuota: true })
-    } else {
-    const activeSubscription = await getActiveSubscription(event, userId)
-    const version = activeSubscription?.subscription.planVersionId
-      ? (await useDatabase(event).select().from(servicePlanVersions).where(eq(servicePlanVersions.id, activeSubscription.subscription.planVersionId)).limit(1))[0]
-      : null
-    const snapshot = activeSubscription?.subscription.entitlementSnapshot || {}
-    const billingMode = String(version?.billingMode || snapshot.billingMode || (activeSubscription?.plan.mode === 'token' ? 'token_package' : activeSubscription?.plan.mode === 'cost' ? 'token_metered' : 'unlimited'))
-    const supplyMode = String(version?.supplyMode || snapshot.supplyMode || 'platform_only')
-    selectedSupplyMode = supplyMode
-    const tokenLimit = Number(version?.tokenLimit ?? snapshot.tokenLimit ?? activeSubscription?.plan.tokenLimit ?? 0)
-    const usedRow = activeSubscription && tokenLimit > 0
-      ? (await useDatabase(event).select({ tokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}), 0)` }).from(usageRollups).where(and(eq(usageRollups.userId, userId), eq(usageRollups.granularity, 'day'), gte(usageRollups.bucketStart, activeSubscription.subscription.startsAt))))[0]
-      : null
-    const pool = await useDatabase(event).select().from(userPoolGroups).where(and(eq(userPoolGroups.ownerUserId, userId), eq(userPoolGroups.status, 'active'))).limit(1)
-    selectedPoolGroupId = pool[0]?.id
-    const privatePoolAvailable = Boolean(pool[0] && (await useDatabase(event).select({ id: userPoolAccounts.id }).from(userPoolAccounts).where(and(eq(userPoolAccounts.poolGroupId, pool[0]!.id), eq(userPoolAccounts.status, 'active'), eq(userPoolAccounts.schedulable, true))).limit(1))[0])
-    supplyDecision = selectSupplySource({
-      billingMode,
-      supplyMode,
-      estimatedTokens: reservation.tokens,
-      remainingTokens: tokenLimit > 0 ? Math.max(0, tokenLimit - Number(usedRow?.tokens || 0)) : null,
-      privatePoolAvailable,
-      subscriptionId: activeSubscription?.subscription.id,
-      planVersionId: version?.id || activeSubscription?.subscription.planVersionId,
-      poolGroupId: pool[0]?.id
-    })
-    candidates = supplyDecision.source === 'private_pool'
-      ? await routeCandidates(event, parsed.model, endpoint, group.id, 'private_pool', supplyDecision.poolGroupId, routeOptions)
-      : initialCandidates
-    if (!candidates.length) openAiError(503, '专属号池当前没有可调度账号', 'server_error', 'private_pool_unavailable')
+    const hasPackageNode = candidateBatches.some(batch => batch.node.source === 'platform')
+    if (hasPackageNode) {
+      const activeSubscription = await getActiveSubscription(event, userId)
+      const version = activeSubscription?.subscription.planVersionId
+        ? (await useDatabase(event).select().from(servicePlanVersions).where(eq(servicePlanVersions.id, activeSubscription.subscription.planVersionId)).limit(1))[0]
+        : null
+      const snapshot = activeSubscription?.subscription.entitlementSnapshot || {}
+      packageBillingMode = String(version?.billingMode || snapshot.billingMode || (activeSubscription?.plan.mode === 'token' ? 'token_package' : activeSubscription?.plan.mode === 'cost' ? 'token_metered' : 'unlimited'))
+      const supplyMode = String(version?.supplyMode || snapshot.supplyMode || 'platform_only')
+      const tokenLimit = Number(version?.tokenLimit ?? snapshot.tokenLimit ?? activeSubscription?.plan.tokenLimit ?? 0)
+      const usedRow = activeSubscription && tokenLimit > 0
+        ? (await useDatabase(event).select({ tokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}), 0)` }).from(usageRollups).where(and(eq(usageRollups.userId, userId), eq(usageRollups.granularity, 'day'), gte(usageRollups.bucketStart, activeSubscription.subscription.startsAt))))[0]
+        : null
+      try {
+        packageDecision = selectSupplySource({
+          billingMode: packageBillingMode,
+          supplyMode,
+          estimatedTokens: reservation.tokens,
+          remainingTokens: tokenLimit > 0 ? Math.max(0, tokenLimit - Number(usedRow?.tokens || 0)) : null,
+          privatePoolAvailable,
+          subscriptionId: activeSubscription?.subscription.id,
+          planVersionId: version?.id || activeSubscription?.subscription.planVersionId,
+          poolGroupId: privatePool?.id
+        })
+      } catch (error) {
+        const hasRelayCandidates = candidateBatches.some(batch => batch.node.source === 'user_relay' && batch.candidates.length)
+        if (!hasRelayCandidates) throw error
+      }
+    }
+    const orderedCandidates: typeof initialCandidates = []
+    for (const batch of candidateBatches) {
+      if (batch.node.source === 'user_relay') orderedCandidates.push(...batch.candidates)
+      else if (batch.node.source === 'private_pool') orderedCandidates.push(...batch.candidates)
+      else if (packageDecision?.source === 'platform') orderedCandidates.push(...batch.candidates)
+    }
+    candidates = orderedCandidates
+    if (!candidates.length) openAiError(503, '没有可用来源支持当前模型', 'server_error', 'no_available_channel')
+    supplyDecision = candidates[0]!.supplySource === 'user_relay'
+      ? { source: 'user_relay', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
+      : candidates[0]!.supplySource === 'private_pool'
+        ? { source: 'private_pool', subscriptionId: null, planVersionId: null, reservedTokens: 0, poolGroupId: privatePool?.id }
+        : packageDecision || { source: 'platform', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
     event.context.hubSupplySource = supplyDecision.source
     event.context.hubPoolGroupId = supplyDecision.poolGroupId
     event.context.hubSubscriptionId = supplyDecision.subscriptionId
     event.context.hubPlanVersionId = supplyDecision.planVersionId
-    if (billingMode === 'token_metered' && reservation.cost > 0) {
-      walletHoldKey = `request:${requestId}:hold`
-      await holdUserWallet(event, userId, reservation.cost, walletHoldKey, requestId)
-      walletHeld = true
-    }
     enforceRequestProtection(key, reservation)
-    try {
-      concurrencyLease = await admitHubRequest(event, key, group, reservation.tokens, reservation.cost, { skipSubscriptionQuota: supplyDecision.source === 'private_pool' })
-    } catch (error) {
-      const failure = error as { statusCode?: number; message?: string }
-      const quotaExhausted = failure.statusCode === 429 && /当前套餐.*(?:Token|额度).*用尽|subscription:token_quota/i.test(String(failure.message || ''))
-      if (supplyDecision.source !== 'platform' || selectedSupplyMode !== 'platform_then_private' || !quotaExhausted || !selectedPoolGroupId || !privatePoolAvailable) throw error
-      supplyDecision = { source: 'private_pool', subscriptionId: supplyDecision.subscriptionId, planVersionId: supplyDecision.planVersionId, reservedTokens: 0, poolGroupId: selectedPoolGroupId }
-      candidates = await routeCandidates(event, parsed.model, endpoint, group.id, 'private_pool', selectedPoolGroupId, routeOptions)
-      if (!candidates.length) throw createError({ statusCode: 429, message: '套餐额度已用尽，专属号池当前不可用', data: { code: 'private_pool_unavailable' } })
-      event.context.hubSupplySource = supplyDecision.source
-      event.context.hubPoolGroupId = supplyDecision.poolGroupId
-      concurrencyLease = await admitHubRequest(event, key, group, reservation.tokens, reservation.cost, { skipSubscriptionQuota: true })
-    }
-    }
+    concurrencyLease = await admitHubRequest(event, key, group, reservation.tokens, 0, { scopeMode: 'base_only' })
     affinityWasReused = candidates[0]?.affinityReused === true
   } catch (error) {
     if (idempotency) await failIdempotency(event, idempotency.record.id, false).catch(() => {})
@@ -820,13 +818,13 @@ export async function handleHubRequest(event: H3Event, path: string) {
       bodyExpiresAt: new Date(Date.now() + settings.bodyRetentionDays * 24 * 60 * 60 * 1000)
     }).returning()
   } catch (error) {
-    await settleHubRequest(event, key, group, 0, 0, reservation.tokens, reservation.cost, concurrencyLease!)
+    await settleHubRequest(event, key, group, 0, 0, reservation.tokens, 0, concurrencyLease!)
     if (walletHeld && walletHoldKey) { await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {}); walletHeld = false }
     if (idempotency) await failIdempotency(event, idempotency.record.id, false).catch(() => {})
     throw error
   }
   if (!log) {
-    await settleHubRequest(event, key, group, 0, 0, reservation.tokens, reservation.cost, concurrencyLease!)
+    await settleHubRequest(event, key, group, 0, 0, reservation.tokens, 0, concurrencyLease!)
     if (walletHeld && walletHoldKey) { await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {}); walletHeld = false }
     throw createError({ statusCode: 500, message: 'Unable to initialize request log' })
   }
@@ -839,11 +837,76 @@ export async function handleHubRequest(event: H3Event, path: string) {
   let settled = false
   let responseStarted = false
   let upstreamRequestStarted = false
+  let packageAdmissionError: unknown = null
+
+  async function releasePackageReservation() {
+    if (packageAdmissionLease) {
+      await cancelHubAdmission(event, packageAdmissionLease, reservation.tokens, reservation.cost).catch(() => {})
+      packageAdmissionLease = null
+    }
+    if (walletHeld && walletHoldKey) {
+      await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {})
+      walletHeld = false
+    }
+  }
+
+  async function activateCandidateSupply(candidate: typeof candidates[number]) {
+    const nextDecision: SupplyDecision = candidate.supplySource === 'user_relay'
+      ? { source: 'user_relay', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
+      : packageDecision || { source: candidate.supplySource, subscriptionId: null, planVersionId: null, reservedTokens: 0 }
+    if (nextDecision.source === 'user_relay') {
+      await releasePackageReservation()
+    } else if (packageAdmissionError) {
+      return false
+    } else {
+      try {
+        if (nextDecision.source === 'platform' && !packageAdmissionLease) {
+          packageAdmissionLease = await admitHubRequest(event, key, group, reservation.tokens, reservation.cost, { scopeMode: 'subscription_only' })
+        }
+        if (packageBillingMode === 'token_metered' && reservation.cost > 0 && !walletHeld) {
+          walletHoldKey ||= `request:${requestId}:hold`
+          await holdUserWallet(event, userId, reservation.cost, walletHoldKey, requestId)
+          walletHeld = true
+        }
+      } catch (error) {
+        packageAdmissionError = error
+        await releasePackageReservation()
+        return false
+      }
+    }
+    supplyDecision = nextDecision
+    event.context.hubSupplySource = supplyDecision.source
+    event.context.hubPoolGroupId = supplyDecision.poolGroupId
+    event.context.hubSubscriptionId = supplyDecision.subscriptionId
+    event.context.hubPlanVersionId = supplyDecision.planVersionId
+    await useDatabase(event).update(requestLogs).set({
+      supplySource: supplyDecision.source,
+      poolGroupId: supplyDecision.poolGroupId || null,
+      subscriptionId: supplyDecision.subscriptionId,
+      planVersionId: supplyDecision.planVersionId,
+      billedAmount: String(supplyDecision.source === 'user_relay' ? 0 : reservation.cost)
+    }).where(eq(requestLogs.id, log!.id))
+    return true
+  }
+
+  async function settleAdmissions(totalTokens: number, cost: number) {
+    await settleHubRequest(event, key, group, totalTokens, cost, reservation.tokens, 0, concurrencyLease)
+    if (packageAdmissionLease) {
+      await settleHubRequest(event, key, group, totalTokens, cost, reservation.tokens, reservation.cost, packageAdmissionLease)
+      packageAdmissionLease = null
+    }
+  }
+
   try {
     for (let index = 0; index < candidates.length; index++) {
       const candidate = candidates[index]!
       const channelLease = await acquireChannel(event, candidate.channel.id, candidate.channel.maxConcurrency)
       if (!channelLease) continue
+      if (!await activateCandidateSupply(candidate)) {
+        await releaseChannel(event, channelLease)
+        continue
+      }
+      affinityWasReused = candidate.affinityReused === true
       lastCandidate = candidate
       attemptCount += 1
       admittedChannel = channelLease
@@ -932,6 +995,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
               }
               await Promise.all([
                 renewHubConcurrency(event, concurrencyLease),
+                ...(packageAdmissionLease ? [renewHubConcurrency(event, packageAdmissionLease)] : []),
                 renewChannel(event, channelLease)
               ])
             }
@@ -998,7 +1062,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
           }).where(eq(requestLogs.id, log.id))
           await touchKeyCredential(event, key.id)
           await recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, protocol: candidate.protocolBinding.protocol, model: parsed.model, endpoint, status: streamAborted ? 'stream_aborted' : 'success', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, affinityReused: affinityWasReused, affinityEligible: Boolean(affinityKey), totalTokens: usage.totalTokens, cost, durationMs: Date.now() - startedAt, failovers: Math.max(0, attemptCount - 1) })
-          await settleHubRequest(event, key, group, usage.totalTokens, cost, reservation.tokens, reservation.cost, concurrencyLease)
+          await settleAdmissions(usage.totalTokens, cost)
           if (walletHeld && walletHoldKey) { await settleUserWallet(event, userId, walletHoldKey, cost, `request:${requestId}:settle`, requestId); walletHeld = false }
           settled = true
           if (admittedChannel) {
@@ -1062,7 +1126,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
         }).where(eq(requestLogs.id, log.id))
         await touchKeyCredential(event, key.id)
         await recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, protocol: candidate.protocolBinding.protocol, model: parsed.model, endpoint, status: response.ok ? 'success' : 'error', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, affinityReused: affinityWasReused, affinityEligible: Boolean(affinityKey), totalTokens: usage.totalTokens, cost, durationMs: Date.now() - startedAt, failovers: Math.max(0, attemptCount - 1) })
-        await settleHubRequest(event, key, group, usage.totalTokens, cost, reservation.tokens, reservation.cost, concurrencyLease)
+        await settleAdmissions(usage.totalTokens, cost)
         if (walletHeld && walletHoldKey) { await settleUserWallet(event, userId, walletHoldKey, cost, `request:${requestId}:settle`, requestId); walletHeld = false }
         settled = true
         await releaseChannel(event, channelLease)
@@ -1098,16 +1162,22 @@ export async function handleHubRequest(event: H3Event, path: string) {
         if (index === candidates.length - 1) throw error
       }
     }
+    if (packageAdmissionError && attemptCount === 0) throw packageAdmissionError
     throw new Error('All matching channels are at their concurrency limit')
   } catch (error) {
     if (idempotency) await failIdempotency(event, idempotency.record.id, upstreamRequestStarted).catch(() => {})
     if (admittedChannel) await releaseChannel(event, admittedChannel)
-    if (!settled) await settleHubRequest(event, key, group, 0, 0, reservation.tokens, reservation.cost, concurrencyLease)
+    if (!settled) {
+      await settleHubRequest(event, key, group, 0, 0, reservation.tokens, 0, concurrencyLease)
+      await releasePackageReservation()
+    }
     if (walletHeld && walletHoldKey) { await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {}); walletHeld = false }
     const message = error instanceof Error ? error.message : 'All upstream channels failed'
     await useDatabase(event).update(requestLogs).set({ channelId: lastCandidate?.channel.id || null, upstreamModel: lastCandidate?.upstreamModel || null, status: 'error', httpStatus: 502, errorMessage: message.slice(0, 2000), durationMs: Date.now() - startedAt, failoverCount: Math.max(0, attemptCount - 1), completedAt: new Date() }).where(eq(requestLogs.id, log.id))
     if (lastCandidate) await recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: lastCandidate.channel.id, model: parsed.model, endpoint, status: 'error', inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0, durationMs: Date.now() - startedAt, failovers: Math.max(0, attemptCount - 1) })
     if (responseStarted) return
+    const failure = error as { statusCode?: number; message?: string }
+    if (failure.statusCode === 429) openAiError(429, failure.message || '当前套餐额度已用尽', 'rate_limit_error', 'rate_limit_exceeded')
     openAiError(502, settings.errorMessageOverrides['502'] || message, 'server_error', 'upstream_error')
   }
 }

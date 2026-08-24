@@ -1,5 +1,29 @@
-import { describe, expect, it } from 'vitest'
-import { isPublicUpstreamAddress, normalizeUserUpstreamUrl } from '../server/utils/upstream-url'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+const mocks = vi.hoisted(() => ({
+  lookup: vi.fn(),
+  fetch: vi.fn()
+}))
+
+vi.mock('node:dns/promises', () => ({ lookup: mocks.lookup }))
+vi.mock('undici', () => {
+  class Agent {
+    address = ''
+    family = 0
+    constructor(options: { connect: { lookup: (host: string, options: { all: boolean }, callback: (error: null, addresses: Array<{ address: string; family: number }>) => void) => void } }) {
+      options.connect.lookup('relay.test', { all: true }, (_error, addresses) => {
+        this.address = addresses[0]?.address || ''
+        this.family = addresses[0]?.family || 0
+      })
+    }
+    close() { return Promise.resolve() }
+  }
+  return { Agent, fetch: mocks.fetch }
+})
+
+import { isPublicUpstreamAddress, normalizeUserUpstreamUrl, pinnedUpstreamFetch, upstreamNetworkError } from '../server/utils/upstream-url'
+
+afterEach(() => vi.clearAllMocks())
 
 describe('private relay SSRF protection', () => {
   it('accepts only clean HTTPS base URLs', () => {
@@ -15,5 +39,38 @@ describe('private relay SSRF protection', () => {
     }
     expect(isPublicUpstreamAddress('1.1.1.1')).toBe(true)
     expect(isPublicUpstreamAddress('2606:4700:4700::1111')).toBe(true)
+  })
+})
+
+describe('pinned upstream fetch', () => {
+  it('falls back to the next validated DNS address after a connection failure', async () => {
+    mocks.lookup.mockResolvedValue([
+      { address: '1.1.1.1', family: 4 },
+      { address: '8.8.8.8', family: 4 }
+    ])
+    const response = { ok: true, status: 200 }
+    mocks.fetch.mockImplementation(async (_target, options) => {
+      const address = (options.dispatcher as { address: string }).address
+      if (address === '1.1.1.1') {
+        const cause = Object.assign(new Error('connect ECONNREFUSED 1.1.1.1:443'), { code: 'ECONNREFUSED', syscall: 'connect' })
+        throw Object.assign(new TypeError('fetch failed'), { cause })
+      }
+      return response
+    })
+
+    const result = await pinnedUpstreamFetch('https://relay.test/v1', '/v1/models')
+
+    expect(result.address).toBe('8.8.8.8')
+    expect(result.target).toBe('https://relay.test/v1/models')
+    expect(result.response).toBe(response)
+    expect(mocks.fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('expands the useful cause and code hidden behind fetch failed', () => {
+    const cause = Object.assign(new Error('getaddrinfo ENOTFOUND relay.test'), { code: 'ENOTFOUND', syscall: 'getaddrinfo' })
+    const detail = upstreamNetworkError(Object.assign(new TypeError('fetch failed'), { cause }))
+    expect(detail.code).toBe('ENOTFOUND')
+    expect(detail.message).toContain('getaddrinfo ENOTFOUND relay.test')
+    expect(detail.message).not.toBe('fetch failed')
   })
 })

@@ -10,6 +10,7 @@ import { getHubSettings } from './hub-settings'
 import { channelCircuitState } from './hub-routing'
 import { discoverUpstreamModelIds, mergeDiscoveredModelMappings } from './hub-model-discovery'
 import { invalidateChannelAccess } from './channel-access'
+import { maskHubKey } from '#shared/utils/key-display'
 
 type UnknownRecord = Record<string, unknown>
 
@@ -104,6 +105,13 @@ function channelView(
     circuitState,
     lastHealthCheckAt: row.lastHealthCheckAt?.getTime() || null,
     lastHealthError: row.lastHealthError,
+    checkinEnabled: row.checkinEnabled,
+    checkinConfigured: Boolean(row.encryptedCheckinToken),
+    checkinUserId: row.checkinUserId,
+    lastCheckinAt: row.lastCheckinAt?.getTime() || null,
+    lastCheckinStatus: row.lastCheckinStatus,
+    lastCheckinMessage: row.lastCheckinMessage,
+    balance: null,
     protocols,
     models,
     cache,
@@ -430,7 +438,7 @@ function keyView(row: typeof hubKeys.$inferSelect, models: string[], channelIds:
     id: row.id,
     name: row.name,
     note: row.note,
-    maskedKey: `${row.keyPrefix}...${row.keyLastFour}`,
+    maskedKey: maskHubKey(row.keyPrefix, row.keyLastFour),
     revealable: Boolean(row.encryptedKey),
     ownerUserId: row.ownerUserId,
     ownerUserName,
@@ -585,7 +593,7 @@ function credentialView(row: typeof hubKeyCredentials.$inferSelect, currentHash:
   const expired = row.expiresAt !== null && row.expiresAt <= new Date()
   return {
     id: row.id,
-    maskedKey: `${row.keyPrefix}...${row.keyLastFour}`,
+    maskedKey: maskHubKey(row.keyPrefix, row.keyLastFour),
     status: row.status === 'revoked' ? 'revoked' : expired || row.status === 'expired' ? 'expired' : 'active',
     expiresAt: row.expiresAt?.getTime() || null,
     lastUsedAt: row.lastUsedAt?.getTime() || null,
@@ -660,7 +668,7 @@ export async function revealHubKeySecret(event: H3Event, id: string) {
   )).limit(1)
   if (!credential?.encryptedKey) throw createError({ statusCode: 409, message: '旧 Key 没有可回显密文，请由管理员设置新的 Key 值' })
   try {
-    return { key: decryptHubKeySecret(credential.encryptedKey, id, credential.id, event), maskedKey: `${credential.keyPrefix}...${credential.keyLastFour}` }
+    return { key: decryptHubKeySecret(credential.encryptedKey, id, credential.id, event), maskedKey: maskHubKey(credential.keyPrefix, credential.keyLastFour) }
   } catch {
     throw createError({ statusCode: 500, message: 'Key 密文无法解密，请检查密钥版本配置' })
   }

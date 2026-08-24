@@ -490,10 +490,14 @@ async function main() {
       method: 'POST',
       body: JSON.stringify({ name: 'Tenant E2E', allowedEndpoints: ['/v1/models'], models: ['hub-test'], channelRules: [{ channelId: primaryChannel.id, enabled: true, priorityOverride: null, weightOverride: null }] })
     })).body.group
+    const tokenPlan = (await adminRequest('/api/admin/plans', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'E2E Token 周卡', mode: 'token', cycle: 'week', tokenLimit: 1, price: 1 })
+    })).body.plan
     const tenantPassword = 'tenant-e2e-password-2026'
     const tenantUser = (await adminRequest('/api/admin/users', {
       method: 'POST',
-      body: JSON.stringify({ username: 'tenant-e2e-user', displayName: 'Tenant E2E User', password: tenantPassword, role: 'user', mustChangePassword: false, groupIds: [tenantGroup.id] })
+      body: JSON.stringify({ username: 'tenant-e2e-user', displayName: 'Tenant E2E User', password: tenantPassword, role: 'user', mustChangePassword: false, groupIds: [tenantGroup.id], planId: tokenPlan.id })
     })).body.user
     assert.deepEqual(tenantUser.groupIds, [defaultGroup.id], 'ordinary users must remain in the default group')
     const tenantKey = (await adminRequest('/api/admin/keys', {
@@ -531,14 +535,6 @@ async function main() {
     await adminRequest(`/api/admin/keys/${tenantKey.item.id}`, {
       method: 'PATCH',
       body: JSON.stringify({ allowedEndpoints: ['/v1/models', '/v1/chat/completions'] })
-    })
-    const tokenPlan = (await adminRequest('/api/admin/plans', {
-      method: 'POST',
-      body: JSON.stringify({ name: 'E2E Token 周卡', mode: 'token', cycle: 'week', tokenLimit: 1, price: 1 })
-    })).body.plan
-    await adminRequest('/api/admin/plans/assign', {
-      method: 'POST',
-      body: JSON.stringify({ userId: tenantUser.id, planId: tokenPlan.id })
     })
     const planDenied = await fetch(`${appUrl}/v1/chat/completions`, {
       method: 'POST',

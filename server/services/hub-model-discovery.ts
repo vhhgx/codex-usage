@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm'
+import { and, eq, inArray } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { useDatabase } from '../db'
 import { channelModelBindings, channelModels, channelProtocolBindings, channels, modelPools } from '../db/schema'
@@ -99,16 +99,70 @@ export async function persistDiscoveredModels(event: H3Event | undefined, channe
   return { discovered: uniqueIds.length, added: added.length }
 }
 
+export function userDiscoveredModelPlan(
+  channelId: string,
+  ids: string[],
+  existing: Array<{ id: string; publicModel: string; upstreamModel: string; enabled: boolean }>
+) {
+  const available = new Set(ids)
+  const legacyPrefix = `relay/${channelId.slice(0, 8)}/`
+  const stale = existing.filter(model => !available.has(model.upstreamModel) || model.publicModel.startsWith(legacyPrefix))
+  const direct = existing.filter(model => available.has(model.publicModel) && model.publicModel === model.upstreamModel && !stale.includes(model))
+  return {
+    staleIds: stale.map(model => model.id),
+    reactivatedIds: direct.filter(model => !model.enabled).map(model => model.id)
+  }
+}
+
+async function reconcileUserDiscoveredModels(event: H3Event, channelId: string, ids: string[]) {
+  const db = useDatabase(event)
+  const available = new Set(ids)
+  const existing = await db.select().from(channelModels).where(eq(channelModels.channelId, channelId))
+  const plan = userDiscoveredModelPlan(channelId, ids, existing)
+  if (plan.staleIds.length) await db.delete(channelModels).where(inArray(channelModels.id, plan.staleIds))
+  const persisted = await persistDiscoveredModels(event, channelId, ids)
+  const [models, protocols] = await Promise.all([
+    db.select().from(channelModels).where(eq(channelModels.channelId, channelId)),
+    db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, channelId))
+  ])
+  const directModels = models.filter(model => available.has(model.publicModel) && model.publicModel === model.upstreamModel)
+  const reactivated = plan.reactivatedIds.length
+  if (directModels.length) {
+    const modelIds = directModels.map(model => model.id)
+    await db.update(channelModels).set({ enabled: true, updatedAt: new Date() }).where(inArray(channelModels.id, modelIds))
+    const enabledProtocols = protocols.filter(protocol => protocol.enabled).map(protocol => protocol.id)
+    const disabledProtocols = protocols.filter(protocol => !protocol.enabled).map(protocol => protocol.id)
+    if (enabledProtocols.length) await db.update(channelModelBindings).set({ enabled: true, updatedAt: new Date() }).where(and(
+      inArray(channelModelBindings.channelModelId, modelIds),
+      inArray(channelModelBindings.protocolBindingId, enabledProtocols)
+    ))
+    if (disabledProtocols.length) await db.update(channelModelBindings).set({ enabled: false, updatedAt: new Date() }).where(and(
+      inArray(channelModelBindings.channelModelId, modelIds),
+      inArray(channelModelBindings.protocolBindingId, disabledProtocols)
+    ))
+  }
+  return { ...persisted, removed: plan.staleIds.length, reactivated }
+}
+
 export async function syncChannelModelsFromUpstream(event: H3Event, channelId: string) {
   const db = useDatabase(event)
   const [channel] = await db.select().from(channels).where(eq(channels.id, channelId)).limit(1)
   if (!channel) throw createError({ statusCode: 404, message: '渠道不存在' })
-  const [protocol] = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, channelId)).limit(1)
+  const protocols = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, channelId))
+  const protocol = protocols.find(binding => binding.protocol === 'openai_responses')
+    || protocols.find(binding => binding.protocol === 'openai_chat')
+    || protocols[0]
   const ids = await discoverUpstreamModelIds(
     protocol?.baseUrlOverride || channel.baseUrl,
     decryptChannelSecret(channel.encryptedApiKey, channel.id, channel.ownerKind, event),
     channel.timeoutMs,
     { authScheme: protocol?.authScheme, apiVersion: protocol?.apiVersion, privateUrl: channel.ownerKind === 'user' }
   )
-  return { ...(await persistDiscoveredModels(event, channel.id, ids)), models: ids }
+  const persisted = channel.ownerKind === 'user'
+    ? await reconcileUserDiscoveredModels(event, channel.id, ids)
+    : { ...(await persistDiscoveredModels(event, channel.id, ids)), removed: 0, reactivated: 0 }
+  if (channel.ownerKind === 'user') {
+    await db.update(channelProtocolBindings).set({ verificationStatus: 'unknown', verifiedAt: null, lastError: null, updatedAt: new Date() }).where(eq(channelProtocolBindings.channelId, channel.id))
+  }
+  return { ...persisted, models: ids }
 }

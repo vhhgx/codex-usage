@@ -6,7 +6,7 @@ import { resolveAnalyticsRange } from '../server/services/hub-analytics'
 import { startOfZoned, zonedDateKey } from '../server/utils/time-zone'
 import { buildKeyActivityResponse, isKeyActivityRequest, keyActivityRange } from '../server/services/key-activity'
 import { activityLogQuery } from '../shared/utils/admin-log-query'
-import { discoverUpstreamModelIds, mergeDiscoveredModelMappings, modelIdsFromPayload } from '../server/services/hub-model-discovery'
+import { discoverUpstreamModelIds, mergeDiscoveredModelMappings, modelIdsFromPayload, userDiscoveredModelPlan } from '../server/services/hub-model-discovery'
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -95,6 +95,15 @@ describe('OpenAI gateway normalization', () => {
       { publicModel: 'model-b', upstreamModel: 'model-b', enabled: true, endpoints: [] },
       { publicModel: 'custom-alias', upstreamModel: 'model-b', enabled: true, endpoints: [] }
     ])
+  })
+
+  it('reconciles a private relay to the models currently visible to its API key', () => {
+    expect(userDiscoveredModelPlan('a9729e39-56bb-4a6e-8148-493e5f86a546', ['gpt-5.6', 'gpt-5.6-codex'], [
+      { id: 'stale', publicModel: 'gpt-5.6-sol', upstreamModel: 'gpt-5.6-sol', enabled: true },
+      { id: 'current', publicModel: 'gpt-5.6', upstreamModel: 'gpt-5.6', enabled: true },
+      { id: 'restored', publicModel: 'gpt-5.6-codex', upstreamModel: 'gpt-5.6-codex', enabled: false },
+      { id: 'legacy', publicModel: 'relay/a9729e39/gpt-5.6', upstreamModel: 'gpt-5.6', enabled: true }
+    ])).toEqual({ staleIds: ['stale', 'legacy'], reactivatedIds: ['restored'] })
   })
 
   it('accepts only the documented endpoint set', () => {

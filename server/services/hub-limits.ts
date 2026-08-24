@@ -266,10 +266,11 @@ end
 return 'ok'
 `
 
-export async function admitHubRequest(event: H3Event, key: HubKey, group: Group | null, reservedTokens: number, reservedCost: number, options: { skipSubscriptionQuota?: boolean } = {}) {
+export async function admitHubRequest(event: H3Event, key: HubKey, group: Group | null, reservedTokens: number, reservedCost: number, options: { skipSubscriptionQuota?: boolean; scopeMode?: 'all' | 'base_only' | 'subscription_only' } = {}) {
   const settings = await getHubSettings(event)
-  const scopes = admissionScopes(key, group, settings.timezone)
-  if (key.ownerUserId) {
+  const scopeMode = options.scopeMode || 'all'
+  const scopes = scopeMode === 'subscription_only' ? [] : admissionScopes(key, group, settings.timezone)
+  if (key.ownerUserId && scopeMode !== 'base_only' && !options.skipSubscriptionQuota) {
     const { subscription, plan } = await requireActiveSubscription(event, key.ownerUserId)
     const snapshot = subscription.entitlementSnapshot as { billingMode?: string; tokenLimit?: number | null } | null
     const planScope = subscriptionAdmissionScope(subscription, plan, snapshot || undefined)
@@ -359,6 +360,18 @@ export async function settleHubRequest(
   for (const counter of lease.usageCounters) {
     transaction.hincrby(counter.key, 'tokens', Math.round(totalTokens) - Math.round(reservedTokens))
     transaction.hincrbyfloat(counter.key, 'cost', cost - reservedCost)
+    if (counter.ttl) transaction.expire(counter.key, counter.ttl)
+  }
+  await transaction.exec()
+}
+
+export async function cancelHubAdmission(event: H3Event, lease: HubConcurrencyLease, reservedTokens: number, reservedCost: number) {
+  const transaction = useRedis(event).multi()
+  for (const prefix of lease.scopePrefixes) transaction.zrem(`${prefix}:concurrency:leases`, lease.id)
+  for (const counter of lease.usageCounters) {
+    transaction.hincrby(counter.key, 'requests', -1)
+    transaction.hincrby(counter.key, 'tokens', -Math.round(reservedTokens))
+    transaction.hincrbyfloat(counter.key, 'cost', -reservedCost)
     if (counter.ttl) transaction.expire(counter.key, counter.ttl)
   }
   await transaction.exec()

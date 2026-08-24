@@ -34,6 +34,13 @@ export interface ChannelView {
   circuitState: 'closed' | 'open' | 'half_open'
   lastHealthCheckAt: number | null
   lastHealthError: string | null
+  checkinEnabled: boolean
+  checkinConfigured: boolean
+  checkinUserId: string | null
+  lastCheckinAt: number | null
+  lastCheckinStatus: string | null
+  lastCheckinMessage: string | null
+  balance: { quota: number | null; usedQuota: number | null; remaining: number | null; currency: string | null; fetchedAt: number } | null
   protocols: ChannelProtocolBindingView[]
   models: ChannelModelView[]
   cache: ChannelCacheView

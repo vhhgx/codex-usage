@@ -5,6 +5,7 @@ import { createError } from 'h3'
 import { useDatabase } from '../db'
 import { channelModelBindings, channelModels, channelProtocolBindings, channels, groupChannelRules, modelPools, userPoolAccounts, userPoolGroups } from '../db/schema'
 import { decryptChannelSecret, decryptContextSecret } from '../utils/hub-crypto'
+import { redactSensitiveText } from '../utils/upstream'
 import { useRedis } from '../utils/redis'
 import { getHubSettings } from './hub-settings'
 import { applyGroupChannelPolicy } from './group-policy'
@@ -32,11 +33,36 @@ export interface SupplyDecision {
   poolGroupId?: string
 }
 
+type CandidateOrderValue = Pick<RouteCandidate, 'conversionMode'> & { channel: Pick<RouteCandidate['channel'], 'priority' | 'name'> }
+
+export function compareRouteCandidates(left: CandidateOrderValue, right: CandidateOrderValue, supplySource: RouteCandidate['supplySource']) {
+  const priority = left.channel.priority - right.channel.priority
+  const conversion = Number(left.conversionMode !== 'passthrough') - Number(right.conversionMode !== 'passthrough')
+  return supplySource === 'user_relay'
+    ? priority || conversion || left.channel.name.localeCompare(right.channel.name)
+    : conversion || priority || left.channel.name.localeCompare(right.channel.name)
+}
+
 export function keyRouteSources(mode: 'platform_only' | 'private_only' | 'platform_then_private' | 'private_then_platform') {
-  if (mode === 'private_only') return ['user_relay'] as const
-  if (mode === 'platform_then_private') return ['platform', 'user_relay'] as const
-  if (mode === 'private_then_platform') return ['user_relay', 'platform'] as const
+  if (mode === 'private_only') return ['private_pool', 'user_relay'] as const
+  if (mode === 'platform_then_private') return ['platform', 'private_pool', 'user_relay'] as const
+  if (mode === 'private_then_platform') return ['private_pool', 'user_relay', 'platform'] as const
   return ['platform'] as const
+}
+
+export function orderedRouteSourceNodes(
+  mode: 'platform_only' | 'private_only' | 'platform_then_private' | 'private_then_platform',
+  orderedSourceIds: string[]
+) {
+  const nodes: Array<{ id: string; source: 'platform' | 'private_pool' | 'user_relay'; channelId?: string }> = []
+  for (const id of orderedSourceIds) {
+    if (id === 'package') nodes.push({ id, source: 'platform' })
+    else if (id === 'private_pool') nodes.push({ id, source: 'private_pool' })
+    else if (id.startsWith('relay:') && id.length > 6) nodes.push({ id, source: 'user_relay', channelId: id.slice(6) })
+  }
+  if (mode === 'platform_only') return nodes.filter(node => node.source === 'platform')
+  if (mode === 'private_only') return nodes.filter(node => node.source === 'user_relay' || node.source === 'private_pool')
+  return nodes
 }
 
 export function selectSupplySource(input: {
@@ -117,7 +143,7 @@ export async function routeCandidates(
   groupId: string | null = null,
   supplySource: 'platform' | 'private_pool' | 'user_relay' = 'platform',
   poolGroupId?: string,
-  options: { userId?: string; keyId?: string; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat'; allowConversion?: boolean; affinityKey?: string } = {}
+  options: { userId?: string; keyId?: string; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat'; allowConversion?: boolean; affinityKey?: string; channelId?: string } = {}
 ) {
   const db = useDatabase(event)
   const requestedProtocol = options.protocol || endpointProtocol(endpoint)
@@ -153,6 +179,7 @@ export async function routeCandidates(
           : row.channel.ownerKind === 'platform' && row.channel.type === 'sub2api'
       return row.channel.healthStatus === 'healthy'
         && (!options.userId || visibleIds.has(row.channel.id) || supplySource === 'private_pool')
+        && (!options.channelId || row.channel.id === options.channelId)
         && sourceMatches
         && protocolMatches
         && (!row.model.endpoints.length || row.model.endpoints.includes(capabilityEndpoint))
@@ -185,7 +212,7 @@ export async function routeCandidates(
       affinityReused: false
     })
   }
-  available.sort((left, right) => Number(left.conversionMode !== 'passthrough') - Number(right.conversionMode !== 'passthrough') || left.channel.priority - right.channel.priority || left.channel.name.localeCompare(right.channel.name))
+  available.sort((left, right) => compareRouteCandidates(left, right, supplySource))
   const [pool] = await db.select().from(modelPools).where(eq(modelPools.publicModel, publicModel)).limit(1)
   if (pool?.enabled === false) return []
   if (halfOpen.size) {
@@ -212,13 +239,16 @@ async function applyPrivateCredential(event: H3Event, candidates: RouteCandidate
 export async function recordChannelFailure(event: H3Event, channelId: string, message: string) {
   const redis = useRedis(event)
   const settings = await getHubSettings(event)
+  const safeMessage = redactSensitiveText(message).slice(0, 2000) || '上游请求失败'
   const failureKey = `hub:circuit:${channelId}:failures`
   const failures = await redis.incr(failureKey)
   await redis.expire(failureKey, Math.ceil(settings.circuitCooldownMs / 1000) * 2)
   if (failures >= settings.circuitFailureThreshold) {
-    await redis.set(`hub:circuit:${channelId}:open`, message.slice(0, 500), 'PX', settings.circuitCooldownMs)
+    await redis.set(`hub:circuit:${channelId}:open`, safeMessage.slice(0, 500), 'PX', settings.circuitCooldownMs)
   }
   await redis.del(`hub:circuit:${channelId}:half-open`)
+  const now = new Date()
+  await useDatabase(event).update(channels).set({ lastHealthError: safeMessage, lastHealthCheckAt: now, updatedAt: now }).where(eq(channels.id, channelId))
 }
 
 export async function recordChannelSuccess(event: H3Event | undefined, channelId: string) {
