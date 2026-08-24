@@ -11,7 +11,7 @@ let userUsername = process.env.UI_SMOKE_USER_USERNAME || ''
 let userPassword = process.env.UI_SMOKE_USER_PASSWORD || ''
 const output = process.env.UI_SMOKE_OUTPUT || '/tmp/zephyr-ui-smoke'
 const pages = process.env.UI_SMOKE_PAGES?.split(',').filter(Boolean) || ['/admin/users', '/admin/channels', '/admin/keys', '/admin/models', '/admin/settings', '/admin/audits', '/admin/account-vault', '/admin/upstreams']
-const userPages = process.env.UI_SMOKE_USER_PAGES?.split(',').filter(Boolean) || ['/console', '/console/keys', '/console/groups', '/console/models', '/console/announcements', '/console/logs']
+const userPages = process.env.UI_SMOKE_USER_PAGES?.split(',').filter(Boolean) || ['/console', '/console/keys', '/console/resources', '/console/models', '/console/announcements', '/console/logs']
 const baseViewports = process.env.UI_SMOKE_VIEWPORTS
   ? process.env.UI_SMOKE_VIEWPORTS.split(',').filter(Boolean).map((value) => {
       const match = value.trim().match(/^(\d+)x(\d+)$/)
@@ -62,13 +62,20 @@ if (bootstrap) {
   const [admin] = await fixtureDb`insert into users (username, display_name, password_hash, role, status, must_change_password, password_changed_at) values (${username}, 'UI Smoke Admin', ${await argon2.hash(password)}, 'super_admin', 'active', false, now()) returning id`
   const [user] = await fixtureDb`insert into users (username, display_name, password_hash, role, status, must_change_password, password_changed_at) values (${userUsername}, 'UI Smoke User', ${await argon2.hash(userPassword)}, 'user', 'active', false, now()) returning id`
   fixtureIds = [admin.id, user.id]
+  const poolId = randomUUID()
+  const upstreamSeed = Date.now() + Math.floor(Math.random() * 100000)
+  await fixtureDb`insert into user_pool_groups (id, owner_user_id, upstream_user_id, upstream_group_id, upstream_api_key_id, encrypted_upstream_api_key, encryption_key_version, internal_name, display_name, status, max_accounts, created_by) values (${poolId}, ${user.id}, ${upstreamSeed}, ${upstreamSeed + 1}, ${upstreamSeed + 2}, 'ui-test-not-for-decryption', 'v2', ${`zh_pool_${poolId.replace(/-/g, '').slice(0, 12)}`}, 'UI Smoke 专属号池', 'active', 5, ${admin.id})`
   await fixtureDb`insert into group_memberships (group_id, user_id, role, created_by) values (${group.id}, ${admin.id}, 'manager', ${admin.id}), (${group.id}, ${user.id}, 'member', ${admin.id})`
+  await fixtureDb`insert into channels (name, type, base_url, encrypted_api_key, owner_kind, owner_user_id, access_scope, created_by, credential_key_version, enabled, priority, weight, max_concurrency, timeout_ms, health_status, last_health_check_at, last_health_error) values
+    ('UI Smoke Relay A', 'openai_compatible', 'https://relay-a.example.com', 'ui-test-not-for-decryption', 'user', ${user.id}, 'private', ${user.id}, 'v2', true, 10, 1, 5, 120000, 'healthy', now(), null),
+    ('UI Smoke Relay B', 'openai_compatible', 'https://relay-b.example.com', 'ui-test-not-for-decryption', 'user', ${user.id}, 'private', ${user.id}, 'v2', true, 20, 1, 5, 120000, 'unhealthy', now(), 'UI Smoke 上游连接失败')`
+  await fixtureDb`update channels set checkin_enabled = true, encrypted_checkin_token = 'ui-test-not-for-decryption' where owner_user_id = ${user.id} and name = 'UI Smoke Relay A'`
   const [announcement] = await fixtureDb`insert into announcements (title, content, tone, status, published_at, created_by) values ('UI Smoke 公告', '用户首页公告可见性检查', 'info', 'published', now(), ${admin.id}) returning id`
   fixtureAnnouncementIds = [announcement.id]
   const accountId = randomUUID()
   await fixtureDb`insert into account_vault_entries (id, email, display_name, status, encrypted_password, encrypted_totp_secret, purchase_date, warranty_status, remark, created_by, updated_by) values (${accountId}, ${`ui-account-${suffix}@example.com`}, 'UI Smoke Account', 'Codex', ${encryptedFixtureSecret(accountId, 'UI-Smoke-Account-Password')}, ${encryptedFixtureSecret(accountId, 'MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7', 'totp-secret')}, ${new Date().toISOString().slice(0, 10)}, '无质保', 'UI Smoke 账号备注', ${admin.id}, ${admin.id})`
   fixtureAccountIds = [accountId]
-  let receivers = await fixtureDb`select id from sms_receivers where status = 'active' order by created_at`
+  let receivers = await fixtureDb`select id from sms_receivers where owner_user_id is null and status = 'active' order by created_at`
   if (!receivers.length) {
     const receiverId = randomUUID()
     await fixtureDb`insert into sms_receivers (id, phone, phone_key, provider_host, encrypted_fetch_url, note, status, created_by, updated_by) values (${receiverId}, '+1(202)5550100', '12025550100', 'sms-ui.example.com', 'ui-test-not-for-decryption', 'UI Smoke Receiver', 'active', ${admin.id}, ${admin.id})`
@@ -103,7 +110,7 @@ try {
   browser = await chromium.launch({ headless: true, executablePath: process.env.UI_SMOKE_BROWSER || undefined })
   for (const viewport of viewports) {
     const targets = [
-      { name: 'admin', username, password, login: '/api/auth/login', logout: '/api/auth/logout', pages },
+      ...(pages.length ? [{ name: 'admin', username, password, login: '/api/auth/login', logout: '/api/auth/logout', pages }] : []),
       ...(!skipUser && userUsername && userPassword ? [{ name: 'user', username: userUsername, password: userPassword, login: '/api/auth/login', logout: '/api/auth/logout', pages: userPages }] : [])
     ]
     for (const target of targets) {
@@ -274,7 +281,14 @@ try {
           if (unstyledTablists) throw new Error(`${path} has ${unstyledTablists} tablist(s) without the shared admin page tab style`)
         }
         if (bootstrap && target.name === 'user' && path === '/console/keys') {
-          await page.getByRole('button', { name: '创建 Key', exact: true }).click()
+          if (!await page.locator('.workspace-nav').getByText('Keys 与用量', { exact: true }).count()) throw new Error('combined keys navigation label is missing')
+          if (await page.locator('.keys-page [role="tablist"]').count()) throw new Error('keys page still separates Key and usage into tabs')
+          const keysContent = page.locator('.keys-content')
+          if (!await keysContent.locator('.usage-panel').count() || !await keysContent.locator('.console-table').count()) throw new Error('usage panel or key table is missing')
+          const usageTop = await keysContent.locator('.usage-panel').boundingBox()
+          const tableTop = await keysContent.locator('.console-table').boundingBox()
+          if (!usageTop || !tableTop || usageTop.y >= tableTop.y) throw new Error('usage panel is not above the key table')
+          await page.locator('.admin-page__header').getByRole('button', { name: '创建 Key', exact: true }).click()
           const createDialog = page.getByRole('dialog').filter({ hasText: '创建 Hub Key' })
           await createDialog.getByLabel('名称').fill(`UI Key ${viewport.name}`)
           const createResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/console/keys' && response.request().method() === 'POST')
@@ -284,12 +298,11 @@ try {
           await page.getByTitle('停用 Key').click()
           await page.getByTitle('启用 Key').waitFor()
           await page.getByTitle('查看和编辑').click()
-          const editDialog = page.locator('.admin-modal').filter({ hasText: `UI Key ${viewport.name}` })
-          await editDialog.getByLabel('当前密码').fill(target.password)
+          const editDialog = page.locator('.app-drawer').filter({ hasText: `UI Key ${viewport.name}` })
           const revealResponse = page.waitForResponse(response => /\/api\/console\/keys\/[^/]+\/reveal$/.test(new URL(response.url()).pathname))
-          await editDialog.getByRole('button', { name: '查看完整值' }).click()
+          await editDialog.getByRole('button', { name: '复制', exact: true }).click()
           if (!(await revealResponse).ok()) throw new Error('ordinary user could not reveal their Hub Key')
-          if (!await editDialog.locator('.console-secret code').textContent()) throw new Error('revealed Hub Key was blank')
+          if (!await editDialog.locator('.credential-mask code').textContent()) throw new Error('masked Hub Key was blank')
           await editDialog.getByTitle('关闭').click()
           await page.getByTitle('删除 Key').click()
           const deleteDialog = page.getByRole('alertdialog')
@@ -297,6 +310,72 @@ try {
           await deleteDialog.getByRole('button', { name: '确认删除' }).click()
           if (!(await deleteResponse).ok()) throw new Error('ordinary user could not delete their Hub Key')
           await page.getByText('还没有 Hub Key', { exact: true }).waitFor()
+        }
+        if (target.name === 'user' && path === '/console/resources') {
+          if (!await page.locator('.workspace-nav').getByText('套餐与资源', { exact: true }).count()) throw new Error('combined resource navigation label is missing')
+          if (await page.getByRole('tab', { name: '权限与额度', exact: true }).count()) throw new Error('redundant access and quota tab is still visible')
+          const relayOrderItems = page.locator('.relay-order__item')
+          if (await relayOrderItems.count() !== 3) throw new Error('failover order did not render the package and all user relays')
+          if (await page.locator('.relay-order__item[data-source-type="package"]').count() !== 1) throw new Error('failover order did not render exactly one package source')
+          if (await page.locator('.relay-order').getByText('UI Smoke 上游连接失败', { exact: true }).count()) throw new Error('failover order still exposes channel error details')
+          if (!await page.getByRole('button', { name: '一键签到', exact: true }).isEnabled()) throw new Error('bulk check-in is not available for a configured relay')
+          if (!await page.getByRole('button', { name: 'UI Smoke Relay A 签到', exact: true }).count()) throw new Error('configured relay does not expose its check-in action')
+          const nextRelayName = (await relayOrderItems.nth(1).locator('strong').innerText()).trim()
+          const dragHandle = relayOrderItems.first().locator('.relay-order__grip')
+          await dragHandle.scrollIntoViewIfNeeded()
+          const [handleBox, targetBox] = await Promise.all([dragHandle.boundingBox(), relayOrderItems.nth(1).boundingBox()])
+          if (!handleBox || !targetBox) throw new Error('relay drag handles are not visible')
+          const targetPoint = { x: targetBox.x + Math.min(32, targetBox.width / 4), y: targetBox.y + targetBox.height / 2 }
+          await page.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y + handleBox.height / 2)
+          await page.mouse.down()
+          if (await page.locator('.relay-order__item.is-dragging').count() !== 1) throw new Error('relay pointer drag did not start')
+          await page.mouse.move(targetPoint.x, targetPoint.y, { steps: 8 })
+          if (!(await relayOrderItems.first().getByText(nextRelayName, { exact: true }).count())) {
+            const hit = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.closest('[data-relay-order-id]')?.getAttribute('aria-label') || null, targetPoint)
+            throw new Error(`relay pointer drag did not reorder at target ${JSON.stringify({ targetPoint, hit })}`)
+          }
+          const reorderResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/console/relay-order' && response.request().method() === 'PUT')
+          await page.mouse.up()
+          if (!(await reorderResponse).ok()) throw new Error('relay failover order could not be saved')
+          await relayOrderItems.first().getByText(nextRelayName, { exact: true }).waitFor()
+          await page.getByRole('button', { name: '添加中转', exact: true }).click()
+          const relayDrawer = page.getByRole('dialog', { name: '添加中转' })
+          await relayDrawer.waitFor()
+          if (!await relayDrawer.locator('input').count()) throw new Error('relay create form did not open in a drawer')
+          await relayDrawer.getByRole('button', { name: '关闭' }).click()
+          for (const tabName of ['我的中转', '专属号池']) {
+            if (!await page.getByRole('tab', { name: tabName, exact: true }).count()) throw new Error(`combined user resource tab is missing: ${tabName}`)
+            await page.getByRole('tab', { name: tabName, exact: true }).click()
+          }
+          await page.waitForURL(`${baseUrl}/console/resources?tab=pool`)
+          await page.locator('.pool-page').waitFor({ state: 'attached', timeout: 5000 })
+          const poolImport = page.getByRole('button', { name: '导入账号', exact: true })
+          if (!await poolImport.count()) throw new Error('user pool import action is missing')
+          if (await poolImport.isDisabled()) throw new Error('user pool import should be enabled after the pool exists')
+          await poolImport.click()
+          const importDrawer = page.getByRole('dialog', { name: '新增账号' })
+          await importDrawer.waitFor()
+          for (const mode of ['手动', '上传', '批量导入', '凭据转换']) {
+            if (!await importDrawer.getByRole('tab', { name: mode, exact: true }).count()) throw new Error(`user pool import mode is missing: ${mode}`)
+          }
+          await importDrawer.getByRole('tab', { name: '批量导入', exact: true }).click()
+          await importDrawer.getByLabel('来源 *').selectOption('ldxp')
+          await importDrawer.getByText('2FA 密钥', { exact: true }).click()
+          const privateDeliveryEmail = `user-pool-${viewport.name}@example.com`
+          await importDrawer.locator('textarea').fill(`${privateDeliveryEmail}----secret-password----MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7`)
+          await importDrawer.locator('.vault-delivery-preview').getByText('账号 + 密码 + 2FA 密钥', { exact: true }).waitFor()
+          const userPoolPreview = await importDrawer.locator('.vault-delivery-preview').innerText()
+          if (userPoolPreview.includes('secret-password') || userPoolPreview.includes('MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7')) {
+            throw new Error('user pool delivery preview exposes imported credentials')
+          }
+          await page.screenshot({ path: `${output}/${viewport.name}-user-pool-batch-import.png`, fullPage: true })
+          const privateDeliveryResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/console/pool/account-vault/delivery-import' && response.request().method() === 'POST')
+          await importDrawer.getByRole('button', { name: '确认导入', exact: true }).click()
+          if (!(await privateDeliveryResponse).ok()) throw new Error('user pool batch import request failed')
+          await page.locator('.pool-vault-section').getByText(privateDeliveryEmail, { exact: true }).first().waitFor()
+          await page.getByRole('tab', { name: '接码管理', exact: true }).click()
+          await page.getByRole('button', { name: '新增接码', exact: true }).waitFor()
+          await page.screenshot({ path: `${output}/${viewport.name}-user-pool-receivers.png`, fullPage: true })
         }
         if (target.name === 'admin' && path === '/admin/channels') {
           if (!await page.locator('.workspace-nav').getByText('资源管理', { exact: true }).count()) throw new Error('combined resource navigation label is missing')

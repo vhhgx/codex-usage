@@ -1,7 +1,7 @@
 import { and, asc, count, desc, eq, gte, inArray, lte, sql } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { useDatabase } from '../db'
-import { channelModels, channels, groupChannelRules, groupMemberships, groupModelRules, groups, hubKeys, modelPrices, requestLogs, usageRollups } from '../db/schema'
+import { channelModels, channels, groupChannelRules, groupMemberships, groupModelRules, groups, hubKeys, modelPrices, requestLogs, usageRollups, userPoolAccounts, userPoolGroups } from '../db/schema'
 import { hubKeyUsageDetail, requestLogDetail } from './hub-analytics'
 import { createHubKeyRecord, listHubKeys, revealHubKeySecret, updateHubKeyRecord } from './hub-admin'
 import { getHubSettings } from './hub-settings'
@@ -10,6 +10,7 @@ import { beginHubKeyDeletion, cancelHubKeyDeletion } from './hub-limits'
 import { deleteHubKeyPreservingRollups } from './hub-deletion'
 import { assignDefaultGroup, DEFAULT_GROUP_ID, ensureDefaultSubscription, getUserPlan, listAnnouncements } from './customer-management'
 import { assertUserChannelAccess, visibleChannels } from './channel-access'
+import type { KeyRouteMode } from '#shared/types/hub'
 
 function number(value: unknown) { return Number(value || 0) }
 
@@ -25,7 +26,9 @@ export async function createUserKey(event: H3Event, userId: string, body: Record
   await ensureDefaultSubscription(event, userId)
   const channelIds = Array.isArray(body.channelIds) ? [...new Set(body.channelIds.filter((id): id is string => typeof id === 'string'))] : []
   await assertUserChannelAccess(event, userId, channelIds)
-  const routeMode = body.routeMode === 'private_only' ? 'private_only' : 'platform_only'
+  const routeMode: KeyRouteMode = body.routeMode === 'private_only' || body.routeMode === 'platform_only' || body.routeMode === 'private_then_platform'
+    ? body.routeMode
+    : 'platform_then_private'
   return createHubKeyRecord(event, { name: body.name, note: body.note, key: body.key, routeMode, channelIds, ownerUserId: userId, groupId: DEFAULT_GROUP_ID }, userId)
 }
 
@@ -43,7 +46,7 @@ export async function updateUserKey(event: H3Event, userId: string, id: string, 
   const invalid = Object.keys(body).filter(key => !allowed.has(key))
   if (invalid.length) throw createError({ statusCode: 400, message: `用户不能修改字段：${invalid.join(', ')}` })
   if ('status' in body && body.status !== 'active' && body.status !== 'disabled') throw createError({ statusCode: 400, message: 'Key 状态不正确' })
-  if ('routeMode' in body && body.routeMode !== 'platform_only' && body.routeMode !== 'private_only') throw createError({ statusCode: 400, message: '用户只能选择平台或私有中转路由' })
+  if ('routeMode' in body && !['platform_only', 'private_only', 'platform_then_private', 'private_then_platform'].includes(String(body.routeMode))) throw createError({ statusCode: 400, message: 'Key 路由模式不正确' })
   if ('channelIds' in body) {
     const channelIds = Array.isArray(body.channelIds) ? [...new Set(body.channelIds.filter((channelId): channelId is string => typeof channelId === 'string'))] : []
     await assertUserChannelAccess(event, userId, channelIds)
@@ -52,7 +55,7 @@ export async function updateUserKey(event: H3Event, userId: string, id: string, 
   return updateHubKeyRecord(event, id, body)
 }
 
-export async function updateUserKeyChannels(event: H3Event, userId: string, id: string, channelIds: string[], routeMode: 'platform_only' | 'private_only') {
+export async function updateUserKeyChannels(event: H3Event, userId: string, id: string, channelIds: string[], routeMode: KeyRouteMode) {
   await getUserKey(event, userId, id)
   const uniqueIds = [...new Set(channelIds)]
   await assertUserChannelAccess(event, userId, uniqueIds)
@@ -166,19 +169,38 @@ export async function getUserModels(event: H3Event, userId: string) {
   const db = useDatabase(event)
   const visible = await visibleChannels(event, userId)
   const visibleIds = visible.map(channel => channel.id)
-  if (!visibleIds.length) return []
   const memberships = await db.select({ groupId: groups.id, groupEndpoints: groups.allowedEndpoints }).from(groupMemberships)
     .innerJoin(groups, and(eq(groupMemberships.groupId, groups.id), eq(groups.status, 'active')))
     .where(eq(groupMemberships.userId, userId))
   if (!memberships.length) return []
   const groupIds = memberships.map(item => item.groupId)
-  const [modelRules, channelRules, modelRows, priceRows] = await Promise.all([
+  const [modelRules, channelRules, modelRows, priceRows, poolRows] = await Promise.all([
     db.select().from(groupModelRules).where(inArray(groupModelRules.groupId, groupIds)),
     db.select().from(groupChannelRules).where(inArray(groupChannelRules.groupId, groupIds)),
-    db.select({ publicModel: channelModels.publicModel, endpoints: channelModels.endpoints, channelId: channels.id }).from(channelModels).innerJoin(channels, eq(channelModels.channelId, channels.id)).where(and(eq(channelModels.enabled, true), eq(channels.enabled, true), eq(channels.healthStatus, 'healthy'), inArray(channels.id, visibleIds))),
-    db.select().from(modelPrices).where(lte(modelPrices.effectiveAt, new Date())).orderBy(desc(modelPrices.effectiveAt))
+    db.select({
+      publicModel: channelModels.publicModel,
+      endpoints: channelModels.endpoints,
+      channelId: channels.id,
+      channelName: channels.name,
+      channelType: channels.type,
+      ownerKind: channels.ownerKind,
+      ownerUserId: channels.ownerUserId
+    }).from(channelModels).innerJoin(channels, eq(channelModels.channelId, channels.id)).where(and(eq(channelModels.enabled, true), eq(channels.enabled, true), eq(channels.healthStatus, 'healthy'))),
+    db.select().from(modelPrices).where(lte(modelPrices.effectiveAt, new Date())).orderBy(desc(modelPrices.effectiveAt)),
+    db.select({ poolId: userPoolGroups.id, poolName: userPoolGroups.displayName })
+      .from(userPoolGroups)
+      .innerJoin(userPoolAccounts, and(
+        eq(userPoolAccounts.poolGroupId, userPoolGroups.id),
+        eq(userPoolAccounts.status, 'active'),
+        eq(userPoolAccounts.schedulable, true)
+      ))
+      .where(and(eq(userPoolGroups.ownerUserId, userId), eq(userPoolGroups.status, 'active')))
+      .limit(1)
   ])
   const result = new Map<string, Set<string>>()
+  const sources = new Map<string, Map<string, { type: 'plan' | 'relay' | 'pool'; id: string; name: string }>>()
+  const visibleSet = new Set(visibleIds)
+  const pool = poolRows[0]
   const endpointUniverse = ['/v1/models', '/v1/messages', '/v1/chat/completions', '/v1/responses', '/v1/embeddings', '/v1/images/generations', '/v1/images/edits']
   for (const membership of memberships) {
     const groupId = membership.groupId
@@ -188,18 +210,34 @@ export async function getUserModels(event: H3Event, userId: string) {
     for (const row of modelRows) {
       if (allowedModels.size && !allowedModels.has(row.publicModel)) continue
       if (groupChannels.length && !allowedChannels.has(row.channelId)) continue
+      const channelVisible = visibleSet.has(row.channelId)
+      const poolEligible = Boolean(pool && row.ownerKind === 'platform' && row.channelType === 'sub2api')
+      if (!channelVisible && !poolEligible) continue
       if (!result.has(row.publicModel)) result.set(row.publicModel, new Set())
       const candidateEndpoints = row.endpoints.length ? row.endpoints : endpointUniverse
-      candidateEndpoints
+      const endpoints = candidateEndpoints
         .filter(endpoint => !membership.groupEndpoints.length || membership.groupEndpoints.includes(endpoint))
-        .forEach(endpoint => result.get(row.publicModel)!.add(endpoint))
+      endpoints.forEach(endpoint => result.get(row.publicModel)!.add(endpoint))
+      if (!endpoints.length) continue
+      if (!sources.has(row.publicModel)) sources.set(row.publicModel, new Map())
+      const modelSources = sources.get(row.publicModel)!
+      if (channelVisible) {
+        const type = row.ownerKind === 'user' && row.ownerUserId === userId ? 'relay' : 'plan'
+        modelSources.set(`${type}:${row.channelId}`, { type, id: row.channelId, name: row.channelName })
+      }
+      if (poolEligible && pool) modelSources.set(`pool:${pool.poolId}`, { type: 'pool', id: pool.poolId, name: pool.poolName })
     }
   }
   const latestPrices = new Map<string, typeof priceRows[number]>()
   priceRows.forEach(price => { if (!latestPrices.has(price.publicModel)) latestPrices.set(price.publicModel, price) })
   return [...result.entries()].filter(([, endpoints]) => endpoints.size > 0).sort(([left], [right]) => left.localeCompare(right)).map(([id, endpoints]) => {
     const price = latestPrices.get(id)
-    return { id, endpoints: [...endpoints], pricing: price ? { inputPerMillion: Number(price.inputPerMillion), outputPerMillion: Number(price.outputPerMillion), cachedPerMillion: Number(price.cachedPerMillion), reasoningPerMillion: Number(price.reasoningPerMillion), imagePrices: price.imagePrices } : null }
+    return {
+      id,
+      endpoints: [...endpoints],
+      sources: [...(sources.get(id)?.values() || [])],
+      pricing: price ? { inputPerMillion: Number(price.inputPerMillion), outputPerMillion: Number(price.outputPerMillion), cachedPerMillion: Number(price.cachedPerMillion), reasoningPerMillion: Number(price.reasoningPerMillion), imagePrices: price.imagePrices } : null
+    }
   })
 }
 

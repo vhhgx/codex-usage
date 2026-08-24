@@ -6,6 +6,7 @@ import {
   IconGauge,
   IconKey,
   IconRoute,
+  IconUserShield,
   IconReceipt2,
   IconSpeakerphone,
   IconShieldCheck,
@@ -23,6 +24,7 @@ const navigation = [
   { to: '/admin/announcements', label: '公告管理', icon: IconSpeakerphone },
   { to: '/admin/keys', label: 'Hub Keys', icon: IconKey },
   { to: '/admin/channels', label: '资源管理', icon: IconRoute },
+  { to: '/admin/resources', label: '我的资源', icon: IconUserShield, roles: ['super_admin', 'admin'] },
   { to: '/admin/account-vault', label: '账号管理', icon: IconAddressBook, roles: ['super_admin', 'admin'] },
   { to: '/admin/upstreams', label: '号池配置', icon: IconServerCog },
   { to: '/admin/ledger', label: '收支台账', icon: IconReceipt2, roles: ['super_admin', 'admin'] },
@@ -40,8 +42,8 @@ const navigationGroups = computed(() => {
   const items = visibleNavigation.value
   return [
     { label: '工作区', items: items.slice(0, 4) },
-    { label: '资源', items: items.slice(4, 7) },
-    { label: '运维', items: items.slice(7) }
+    { label: '资源', items: items.slice(4, 8) },
+    { label: '运维', items: items.slice(8) }
   ].filter(group => group.items.length)
 })
 
