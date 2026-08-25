@@ -514,7 +514,7 @@ export async function listAccessibleModels(event: H3Event, key: typeof hubKeys.$
     db.select().from(groupModelRules).where(eq(groupModelRules.groupId, group.id)),
     db.select().from(groupChannelRules).where(eq(groupChannelRules.groupId, group.id))
   ])
-  const rows = await db.select({ publicModel: channelModels.publicModel, channelId: channels.id, healthStatus: channels.healthStatus, protocol: channelProtocolBindings.protocol })
+  const rows = await db.select({ publicModel: channelModels.publicModel, channelId: channels.id, healthStatus: channels.healthStatus, clientIdentityMode: channels.clientIdentityMode, modelDiscoveryEnabled: channels.modelDiscoveryEnabled, protocol: channelProtocolBindings.protocol })
     .from(channelModelBindings)
     .innerJoin(channelModels, eq(channelModelBindings.channelModelId, channelModels.id))
     .innerJoin(channelProtocolBindings, eq(channelModelBindings.protocolBindingId, channelProtocolBindings.id))
@@ -528,7 +528,8 @@ export async function listAccessibleModels(event: H3Event, key: typeof hubKeys.$
   const restrictedChannels = channelRules.length > 0
   const enabledChannels = new Set(channelRules.filter(rule => rule.enabled).map(rule => rule.channelId))
   for (const row of rows) {
-    if (!protocols.includes(row.protocol) || !visibleIds.has(row.channelId) || row.healthStatus !== 'healthy' || disabledPools.has(row.publicModel)) continue
+    const routable = row.healthStatus === 'healthy' || row.healthStatus === 'unknown' && row.clientIdentityMode === 'passthrough' && row.modelDiscoveryEnabled === false
+    if (!protocols.includes(row.protocol) || !visibleIds.has(row.channelId) || !routable || disabledPools.has(row.publicModel)) continue
     if (restrictedChannels && !enabledChannels.has(row.channelId)) continue
     if (!await redis.exists(`hub:circuit:${row.channelId}:open`)) usableRows.push(row)
   }

@@ -4,11 +4,19 @@ import { useDatabase } from '../db'
 import { channelProtocolBindings, channels } from '../db/schema'
 import { decryptChannelSecret } from '../utils/hub-crypto'
 import { pinnedUpstreamFetch } from '../utils/upstream-url'
+import { probeAuthSchemes, upstreamAuthHeaders } from '../utils/upstream-auth'
 import { recordChannelSuccess } from './hub-routing'
 import { modelIdsFromPayload, persistDiscoveredModels } from './hub-model-discovery'
 
 export async function checkChannelHealth(event: H3Event | undefined, channel: typeof channels.$inferSelect) {
   const started = Date.now()
+  if (!channel.modelDiscoveryEnabled) {
+    const message = channel.clientIdentityMode === 'passthrough'
+      ? '已关闭服务端模型发现；等待真实客户端请求验证'
+      : '已关闭服务端模型发现'
+    await useDatabase(event).update(channels).set({ healthStatus: 'unknown', lastHealthCheckAt: new Date(), lastHealthError: message, updatedAt: new Date() }).where(eq(channels.id, channel.id))
+    return { healthy: false, pending: true, latencyMs: Date.now() - started, message }
+  }
   let healthy = false
   let message = ''
   try {
@@ -19,30 +27,33 @@ export async function checkChannelHealth(event: H3Event | undefined, channel: ty
     const apiKey = decryptChannelSecret(channel.encryptedApiKey, channel.id, channel.ownerKind, event)
     for (const protocol of candidates) {
       const base = (protocol.baseUrlOverride || channel.baseUrl).replace(/\/+$/, '').replace(/\/v1$/i, '')
-      const headers: Record<string, string> = protocol.authScheme === 'x_api_key'
-        ? { 'x-api-key': apiKey, 'anthropic-version': protocol.apiVersion || '2023-06-01' }
-        : { authorization: `Bearer ${apiKey}` }
-      let response: Response
-      let close: (() => Promise<void>) | null = null
       try {
-        if (channel.ownerKind === 'user') {
-          const result = await pinnedUpstreamFetch(base, '/v1/models', { headers, signal: AbortSignal.timeout(Math.min(channel.timeoutMs, 15000)) })
-          response = result.response as unknown as Response
-          close = result.close
-        } else response = await fetch(`${base}/v1/models`, { headers, redirect: 'manual', signal: AbortSignal.timeout(Math.min(channel.timeoutMs, 15000)) })
-        const body = await response.text()
-        if (close) await close().catch(() => {})
-        if (!response.ok) {
-          errors.push(`${protocol.protocol}: HTTP ${response.status}: ${body.slice(0, 300)}`)
+        const probe = await probeAuthSchemes(protocol.authScheme, async (authScheme) => {
+          const headers = upstreamAuthHeaders(authScheme, apiKey, protocol.apiVersion)
+          if (channel.ownerKind === 'user') {
+            const result = await pinnedUpstreamFetch(base, '/v1/models', { headers, signal: AbortSignal.timeout(Math.min(channel.timeoutMs, 15000)) })
+            const body = await result.response.text()
+            const response = { ok: result.response.ok, status: result.response.status, body }
+            await result.close().catch(() => {})
+            return response
+          }
+          const response = await fetch(`${base}/v1/models`, { headers, redirect: 'manual', signal: AbortSignal.timeout(Math.min(channel.timeoutMs, 15000)) })
+          return { ok: response.ok, status: response.status, body: await response.text() }
+        })
+        const final = probe.attempts.at(-1)!
+        if (!probe.ok) {
+          errors.push(`${protocol.protocol}: HTTP ${final.status}: ${final.body.slice(0, 300)}`)
           continue
+        }
+        if (probe.changed && probe.selectedAuthScheme && protocol.id) {
+          await db.update(channelProtocolBindings).set({ authScheme: probe.selectedAuthScheme, updatedAt: new Date() }).where(eq(channelProtocolBindings.id, protocol.id))
         }
         healthy = true
         let payload: unknown
-        try { payload = JSON.parse(body) } catch { payload = null }
+        try { payload = JSON.parse(final.body) } catch { payload = null }
         const ids = modelIdsFromPayload(payload)
         if (ids.length) await persistDiscoveredModels(event, channel.id, ids)
       } catch (error) {
-        if (close) await close().catch(() => {})
         errors.push(`${protocol.protocol}: ${error instanceof Error ? error.message : '无法连接上游'}`)
       }
     }

@@ -11,6 +11,7 @@ import { groupModelRules, keyModelRules, requestAttempts, requestLogs, servicePl
 import { contentHash, decryptChannelSecret, hashCacheAffinity, hashClientIp } from '../utils/hub-crypto'
 import { pinnedUpstreamFetch } from '../utils/upstream-url'
 import { trustedClientIp } from '../utils/client-ip'
+import { copyUpstreamClientIdentity } from '../utils/upstream-client-identity'
 import { acquireChannel, admitHubRequest, releaseChannel, settleHubRequest, type ChannelConcurrencyLease } from './hub-limits'
 import { authenticateHubRequest, calculateCost, enforceRequestProtection, estimateReservation, listAccessibleModels, readUpstreamChunk, sanitizeArchiveBody, storeBodySafe, storeFileSafe, touchKeyCredential, writeResponseChunk } from './hub-gateway'
 import { orderedRouteSourceNodes, recordChannelFailure, recordChannelSuccess, rememberAffinitySelection, routeCandidates, selectSupplySource, type SupplyDecision } from './hub-routing'
@@ -45,7 +46,7 @@ function parseBody(raw: Buffer): Record<string, unknown> & { model: string } {
   }
 }
 
-function upstreamHeaders(event: H3Event, apiKey: string, authScheme: 'bearer' | 'x_api_key', apiVersion: string | null, directAnthropic: boolean) {
+function upstreamHeaders(event: H3Event, apiKey: string, authScheme: 'bearer' | 'x_api_key', apiVersion: string | null, directAnthropic: boolean, clientIdentityMode: string) {
   const headers = new Headers({ 'content-type': 'application/json', accept: getHeader(event, 'accept') || 'application/json' })
   if (authScheme === 'x_api_key') {
     headers.set('x-api-key', apiKey)
@@ -53,6 +54,7 @@ function upstreamHeaders(event: H3Event, apiKey: string, authScheme: 'bearer' | 
   } else headers.set('authorization', `Bearer ${apiKey}`)
   const beta = getHeader(event, 'anthropic-beta')
   if (directAnthropic && beta && /^[a-z0-9,_-]+$/i.test(beta) && beta.length <= 500) headers.set('anthropic-beta', beta)
+  if (clientIdentityMode === 'passthrough') copyUpstreamClientIdentity(event, headers)
   return headers
 }
 
@@ -279,7 +281,7 @@ export async function handleAnthropicMessages(event: H3Event) {
         const path = direct ? '/v1/messages' : '/v1/chat/completions'
         const base = candidate.protocolBinding.baseUrlOverride || candidate.channel.baseUrl
         const credential = candidate.credential || decryptChannelSecret(candidate.channel.encryptedApiKey, candidate.channel.id, candidate.channel.ownerKind, event)
-        const headers = upstreamHeaders(event, credential, candidate.protocolBinding.authScheme, candidate.protocolBinding.apiVersion, direct)
+        const headers = upstreamHeaders(event, credential, candidate.protocolBinding.authScheme, candidate.protocolBinding.apiVersion, direct, candidate.channel.clientIdentityMode)
         const requestController = new AbortController()
         controller = requestController
         event.node.res.once('close', abortUpstream)

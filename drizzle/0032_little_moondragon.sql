@@ -1,0 +1,2 @@
+ALTER TABLE "channels" ADD COLUMN "model_discovery_enabled" boolean DEFAULT true NOT NULL;--> statement-breakpoint
+ALTER TABLE "channels" ADD COLUMN "client_identity_mode" text DEFAULT 'standard' NOT NULL;

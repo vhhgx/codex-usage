@@ -8,7 +8,7 @@ const toast = useAppToast()
 const busy = ref(false)
 const testing = ref<string | null>(null)
 const testingCandidate = ref<ChannelView | null>(null)
-interface RelayTestResult { protocol: ChannelProtocol; endpoint: string; ok: boolean; status: number | null; latencyMs: number; errorCode: string | null; message: string | null }
+interface RelayTestResult { protocol: ChannelProtocol; endpoint: string; ok: boolean; status: number | null; latencyMs: number; errorCode: string | null; message: string | null; authScheme: 'bearer' | 'x_api_key'; attemptedAuthSchemes: Array<'bearer' | 'x_api_key'>; clientIdentityRejected: boolean }
 const testReport = ref<{ relayName: string; healthy: boolean; results: RelayTestResult[] } | null>(null)
 const syncing = ref<string | null>(null)
 const checkingIn = ref<string | null>(null)
@@ -33,32 +33,55 @@ const protocolOptions: Array<{ id: ChannelProtocol; label: string; detail: strin
   { id: 'openai_responses', label: 'OpenAI Responses', detail: 'Codex 原生' },
   { id: 'openai_chat', label: 'OpenAI Chat', detail: '通用兼容 / 转换' }
 ]
-const form = reactive({ name: '', baseUrl: '', apiKey: '', protocols: ['anthropic_messages'] as ChannelProtocol[], models: [] as ChannelModelView[], enabled: true, weight: 1, maxConcurrency: 5, timeoutMs: 120000, checkinEnabled: false, checkinToken: '', checkinUserId: '' })
+const form = reactive({ name: '', baseUrl: '', apiKey: '', protocols: [binding('anthropic_messages')] as ChannelProtocolBindingView[], models: [] as ChannelModelView[], enabled: true, weight: 1, maxConcurrency: 5, timeoutMs: 120000, checkinEnabled: false, checkinToken: '', checkinUserId: '', modelDiscoveryEnabled: true, clientIdentityMode: 'standard' as 'standard' | 'passthrough' })
 const checkinCount = computed(() => data.value?.relays.filter(item => item.checkinEnabled && item.checkinConfigured).length || 0)
 
 function binding(protocol: ChannelProtocol): ChannelProtocolBindingView {
   return { protocol, enabled: true, baseUrlOverride: null, authScheme: protocol === 'anthropic_messages' ? 'x_api_key' : 'bearer', apiVersion: protocol === 'anthropic_messages' ? '2023-06-01' : null, verificationStatus: 'unknown', verifiedAt: null, lastError: null }
 }
 function emptyModel(): ChannelModelView { return { publicModel: '', upstreamModel: '', enabled: true, endpoints: [] } }
-function reset() { Object.assign(form, { name: '', baseUrl: '', apiKey: '', protocols: ['anthropic_messages'], models: [emptyModel()], enabled: true, weight: 1, maxConcurrency: 5, timeoutMs: 120000, checkinEnabled: false, checkinToken: '', checkinUserId: '' }) }
+function modelProtocolEnabled(model: ChannelModelView, protocol: ChannelProtocol) {
+  return model.protocolBindings?.length
+    ? model.protocolBindings.some(binding => binding.protocol === protocol && binding.enabled)
+    : Boolean(selectedProtocol(protocol))
+}
+function toggleModelProtocol(model: ChannelModelView, protocol: ChannelProtocol) {
+  const enabledProtocols = form.protocols.map(item => item.protocol)
+  const current = model.protocolBindings?.length
+    ? model.protocolBindings.map(item => ({ ...item, capabilities: { ...item.capabilities } }))
+    : enabledProtocols.map(item => ({ protocol: item, upstreamModel: model.upstreamModel.trim(), enabled: true, capabilities: { streaming: true, tools: true } }))
+  const index = current.findIndex(item => item.protocol === protocol)
+  if (index >= 0) current.splice(index, 1)
+  else current.push({ protocol, upstreamModel: model.upstreamModel.trim(), enabled: true, capabilities: { streaming: true, tools: true } })
+  model.protocolBindings = current
+}
+function reset() { Object.assign(form, { name: '', baseUrl: '', apiKey: '', protocols: [binding('anthropic_messages')], models: [emptyModel()], enabled: true, weight: 1, maxConcurrency: 5, timeoutMs: 120000, checkinEnabled: false, checkinToken: '', checkinUserId: '', modelDiscoveryEnabled: true, clientIdentityMode: 'standard' }) }
 function create() { editing.value = null; reset(); error.value = ''; showForm.value = true }
 function edit(item: ChannelView) {
   editing.value = item
-  Object.assign(form, { name: item.name, baseUrl: item.baseUrl, apiKey: '', protocols: item.protocols.map(protocol => protocol.protocol), models: item.models.length ? item.models.map(model => ({ ...model, endpoints: [...model.endpoints], protocolBindings: model.protocolBindings?.map(protocol => ({ ...protocol, capabilities: { ...protocol.capabilities } })) })) : [emptyModel()], enabled: item.enabled, weight: item.weight, maxConcurrency: item.maxConcurrency, timeoutMs: item.timeoutMs, checkinEnabled: item.checkinEnabled, checkinToken: '', checkinUserId: item.checkinUserId || '' })
+  Object.assign(form, { name: item.name, baseUrl: item.baseUrl, apiKey: '', protocols: item.protocols.map(protocol => ({ ...protocol })), models: item.models.length ? item.models.map(model => ({ ...model, endpoints: [...model.endpoints], protocolBindings: model.protocolBindings?.map(protocol => ({ ...protocol, capabilities: { ...protocol.capabilities } })) })) : [emptyModel()], enabled: item.enabled, weight: item.weight, maxConcurrency: item.maxConcurrency, timeoutMs: item.timeoutMs, checkinEnabled: item.checkinEnabled, checkinToken: '', checkinUserId: item.checkinUserId || '', modelDiscoveryEnabled: item.modelDiscoveryEnabled, clientIdentityMode: item.clientIdentityMode })
   error.value = ''; showForm.value = true
 }
 function toggleProtocol(protocol: ChannelProtocol) {
-  form.protocols = form.protocols.includes(protocol) ? form.protocols.filter(value => value !== protocol) : [...form.protocols, protocol]
+  const index = form.protocols.findIndex(value => value.protocol === protocol)
+  if (index >= 0) form.protocols.splice(index, 1)
+  else form.protocols.push(binding(protocol))
+}
+function selectedProtocol(protocol: ChannelProtocol) { return form.protocols.find(item => item.protocol === protocol) }
+function setAuthScheme(protocol: ChannelProtocol, value: unknown) {
+  const item = selectedProtocol(protocol)
+  if (item) item.authScheme = value === 'x_api_key' ? 'x_api_key' : 'bearer'
 }
 function body() {
-  const protocols = form.protocols.map(binding)
+  const protocols = form.protocols.map(protocol => ({ ...protocol, id: undefined }))
   const models: ChannelModelView[] = form.models.filter(model => model.upstreamModel.trim()).map(model => ({
     ...model,
     publicModel: model.publicModel.trim() || model.upstreamModel.trim(),
     upstreamModel: model.upstreamModel.trim(),
-    protocolBindings: protocols.map(item => {
+    protocolBindings: protocols.flatMap(item => {
       const existing = model.protocolBindings?.find(protocol => protocol.protocol === item.protocol)
-      return existing || { protocol: item.protocol, upstreamModel: model.upstreamModel.trim(), enabled: true, capabilities: { streaming: true, tools: true } }
+      if (model.protocolBindings?.length && !existing) return []
+      return [existing || { protocol: item.protocol, upstreamModel: model.upstreamModel.trim(), enabled: true, capabilities: { streaming: true, tools: true } }]
     })
   }))
   return { ...form, protocols, models }
@@ -148,7 +171,8 @@ const configText = computed(() => {
   if (!configuring.value || !configModel.value) return ''
   const key = generatedKey.value || 'YOUR_HUB_KEY'
   if (configMode.value === 'claude') return JSON.stringify({ env: { ANTHROPIC_BASE_URL: `${location.origin}/anthropic`, ANTHROPIC_AUTH_TOKEN: key, ANTHROPIC_MODEL: configModel.value } }, null, 2)
-  return `model_provider = "Zephyr"\nmodel = "${configModel.value}"\n\n[model_providers.Zephyr]\nname = "Zephyr Hub"\nbase_url = "${location.origin}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nenv_key = "ZEPHYR_HUB_KEY"\n\n# ZEPHYR_HUB_KEY=${key}`
+  const wireApi = configuring.value.protocols.some(protocol => protocol.protocol === 'openai_responses') ? 'responses' : 'chat'
+  return `model_provider = "Zephyr"\nmodel = "${configModel.value}"\n\n[model_providers.Zephyr]\nname = "Zephyr Hub"\nbase_url = "${location.origin}/v1"\nwire_api = "${wireApi}"\nrequires_openai_auth = false\nenv_key = "ZEPHYR_HUB_KEY"\n\n# ZEPHYR_HUB_KEY=${key}`
 })
 async function copyConfig() { await navigator.clipboard.writeText(configText.value); toast.show('配置已复制', 'success') }
 const protocolLabel = (protocol: ChannelProtocol) => ({ anthropic_messages: 'Messages', openai_responses: 'Responses', openai_chat: 'Chat' })[protocol]
@@ -189,22 +213,23 @@ onMounted(() => { void refreshBalances() })
       <div class="form-grid"><label><span>名称 *</span><input v-model="form.name" required placeholder="例如：我的多协议站"></label><label><span>Base URL *</span><input v-model="form.baseUrl" type="url" required placeholder="https://relay.example.com"></label></div>
       <label><span>上游 API Key {{ editing ? '（留空保持不变）' : '*' }}</span><input v-model="form.apiKey" type="password" :required="!editing" autocomplete="off"></label>
       <section class="form-section relay-checkin"><header><div><h3>NewAPI 签到</h3><span>{{ editing?.checkinConfigured ? '访问令牌已保存' : '可选' }}</span></div><label class="switch"><input v-model="form.checkinEnabled" type="checkbox"><span />启用签到</label></header><div v-if="form.checkinEnabled" class="form-grid"><label><span>控制台访问令牌 {{ editing?.checkinConfigured ? '（留空保持不变）' : '*' }}</span><input v-model="form.checkinToken" type="password" :required="!editing?.checkinConfigured" autocomplete="off" placeholder="NewAPI access token"></label><label><span>旧版用户 ID（可选）</span><input v-model="form.checkinUserId" autocomplete="off" placeholder="用于 New-Api-User"></label></div></section>
-      <section class="form-section"><header><div><h3>上游协议</h3><span>可以多选</span></div></header><div class="protocol-picker"><button v-for="option in protocolOptions" :key="option.id" type="button" :class="{ active: form.protocols.includes(option.id) }" @click="toggleProtocol(option.id)"><IconCheck :size="15" /><span><strong>{{ option.label }}</strong><small>{{ option.detail }}</small></span></button></div></section>
-      <section class="form-section"><header><div><h3>模型映射</h3><span>留空时保存后自动获取该 Key 的全部模型</span></div><button type="button" class="button button--quiet button--small" @click="addModel"><IconPlus :size="15" />添加模型</button></header><div class="relay-model-list"><div v-for="(model, index) in form.models" :key="model.id || index" class="relay-model-row"><input v-model="model.publicModel" placeholder="Hub 模型名（留空自动同名）"><span>→</span><input v-model="model.upstreamModel" placeholder="上游模型名"><button type="button" class="icon-button danger" title="移除模型" aria-label="移除模型" @click="removeModel(index)"><IconX :size="15" /></button></div></div></section>
+      <section class="form-section"><header><div><h3>上游协议</h3><span>检测时会自动尝试两种认证</span></div></header><div class="protocol-picker"><div v-for="option in protocolOptions" :key="option.id" class="protocol-option" :class="{ active: selectedProtocol(option.id) }"><button type="button" @click="toggleProtocol(option.id)"><IconCheck :size="15" /><span><strong>{{ option.label }}</strong><small>{{ option.detail }}</small></span></button><label v-if="selectedProtocol(option.id)"><span>默认认证</span><AppSelect :model-value="selectedProtocol(option.id)?.authScheme" @update:model-value="setAuthScheme(option.id, $event)"><option value="bearer">Bearer</option><option value="x_api_key">x-api-key</option></AppSelect></label></div></div></section>
+      <section class="form-section relay-compat-settings"><header><div><h3>兼容设置</h3><span>客户端限定站点可关闭模型发现</span></div></header><label class="switch"><input v-model="form.modelDiscoveryEnabled" type="checkbox"><span />保存和健康检查时自动读取模型</label><label class="switch"><input v-model="form.clientIdentityMode" type="checkbox" true-value="passthrough" false-value="standard"><span />透传真实 Claude Code / Codex 客户端身份</label></section>
+      <section class="form-section"><header><div><h3>模型映射</h3><span>{{ form.modelDiscoveryEnabled ? '留空时保存后自动获取该 Key 的全部模型' : '已关闭自动发现，请至少手工添加一个模型' }}</span></div><button type="button" class="button button--quiet button--small" @click="addModel"><IconPlus :size="15" />添加模型</button></header><div class="relay-model-list"><div v-for="(model, index) in form.models" :key="model.id || index" class="relay-model-entry"><div class="relay-model-row"><input v-model="model.publicModel" placeholder="Hub 模型名（留空自动同名）"><span>→</span><input v-model="model.upstreamModel" placeholder="上游模型名"><button type="button" class="icon-button danger" title="移除模型" aria-label="移除模型" @click="removeModel(index)"><IconX :size="15" /></button></div><div class="relay-model-protocols"><button v-for="protocol in form.protocols" :key="protocol.protocol" type="button" :class="{ active: modelProtocolEnabled(model, protocol.protocol) }" @click="toggleModelProtocol(model, protocol.protocol)"><IconCheck :size="12" />{{ protocolLabel(protocol.protocol) }}</button></div></div></div></section>
       <div class="form-grid relay-settings-grid"><label><span>权重</span><input v-model.number="form.weight" type="number" min="1"></label><label><span>最大并发</span><input v-model.number="form.maxConcurrency" type="number" min="1"></label><label><span>超时（毫秒）</span><input v-model.number="form.timeoutMs" type="number" min="1000"></label></div>
       <p v-if="error" class="form-error">{{ error }}</p><footer><label class="switch"><input v-model="form.enabled" type="checkbox"><span />启用中转</label><div><button type="button" class="button button--secondary" @click="showForm = false">取消</button><button class="button button--primary" :disabled="busy">{{ busy ? '保存中' : '保存中转' }}</button></div></footer>
     </form></AppDrawer>
 
     <AppDrawer v-if="configuring" :open="Boolean(configuring)" kicker="CLIENT SETUP" :title="`连接 ${configuring.name}`" @close="configuring = null"><div class="config-builder">
-      <div class="config-tabs"><button :class="{ active: configMode === 'claude' }" :disabled="!configuring.protocols.some(item => item.protocol === 'anthropic_messages' || item.protocol === 'openai_chat')" @click="configMode = 'claude'">Claude Code</button><button :class="{ active: configMode === 'codex' }" :disabled="!configuring.protocols.some(item => item.protocol === 'openai_responses')" @click="configMode = 'codex'">Codex</button></div>
+      <div class="config-tabs"><button :class="{ active: configMode === 'claude' }" :disabled="!configuring.protocols.some(item => item.protocol === 'anthropic_messages' || item.protocol === 'openai_chat')" @click="configMode = 'claude'">Claude Code</button><button :class="{ active: configMode === 'codex' }" :disabled="!configuring.protocols.some(item => item.protocol === 'openai_responses' || item.protocol === 'openai_chat')" @click="configMode = 'codex'">Codex</button></div>
       <label><span>模型</span><AppSelect v-model="configModel"><option v-for="model in configuring.models.filter(item => item.enabled)" :key="model.id || model.publicModel" :value="model.publicModel">{{ model.publicModel }}</option></AppSelect></label>
       <div class="key-choice"><label><span>Hub Key</span><AppSelect v-model="selectedKeyId"><option value="new">新建专用 Key</option><option v-for="key in keyData?.keys.filter(item => item.status === 'active') || []" :key="key.id" :value="key.id">{{ key.name }} · {{ key.maskedKey }}</option></AppSelect></label></div>
       <div class="key-provision"><div><IconKey :size="18" /><span><strong>专用 Hub Key</strong><small>按故障转移顺序使用所有支持该模型的私有中转。</small></span></div><button class="button button--secondary button--small" :disabled="busy || !configModel" @click="useExistingKey">{{ generatedKey ? '重新绑定' : selectedKeyId === 'new' ? '生成专用 Key' : '绑定并读取 Key' }}</button></div>
       <pre><code>{{ configText }}</code></pre><button class="button button--primary" :disabled="!configText" @click="copyConfig"><IconCopy :size="16" />复制配置</button><p v-if="error" class="form-error">{{ error }}</p>
     </div></AppDrawer>
     <AppDrawer v-if="modelRelay" :open="Boolean(modelRelay)" wide kicker="RELAY MODELS" :title="`${modelRelay.name} · 模型`" @close="modelRelay = null"><section class="relay-model-drawer"><header><div><strong>{{ modelRelay.baseUrl }}</strong><small>{{ modelRelay.models.length }} 个模型 · {{ modelRelay.models.filter(model => model.enabled).length }} 个已启用</small></div><a class="button button--quiet button--small" :href="modelRelay.baseUrl" target="_blank" rel="noopener noreferrer"><IconExternalLink :size="14" />打开官网</a></header><div v-if="modelRelay.models.length" class="relay-model-catalog"><article v-for="model in modelRelay.models" :key="model.id || model.publicModel" :data-disabled="!model.enabled"><div><strong>{{ model.publicModel }}</strong><small v-if="model.upstreamModel !== model.publicModel">上游：{{ model.upstreamModel }}</small></div><div class="relay-model-meta"><span>{{ model.enabled ? '已启用' : '已停用' }}</span><code>{{ model.endpoints.length ? model.endpoints.map(endpoint => endpoint.replace('/v1/', '')).join(' · ') : '按协议支持' }}</code></div></article></div><div v-else class="admin-empty">该中转暂无模型</div></section></AppDrawer>
-    <AppConfirmDialog :open="Boolean(testingCandidate)" title="执行协议检测" :message="`将对“${testingCandidate?.name || ''}”的每个协议发送一次最小推理请求，上游可能计费。是否继续？`" :busy="Boolean(testing)" @close="testingCandidate = null" @confirm="confirmTest" />
-    <AppDrawer v-if="testReport" :open="Boolean(testReport)" kicker="PROTOCOL DIAGNOSTICS" :title="testReport.relayName" @close="testReport = null"><div class="relay-test-results"><article v-for="result in testReport.results" :key="result.protocol" :data-ok="result.ok"><div><strong>{{ protocolLabel(result.protocol) }}</strong><span>{{ result.ok ? '通过' : '失败' }} · {{ result.latencyMs }} ms</span></div><code>{{ result.endpoint }}</code><p v-if="result.errorCode || result.message"><b v-if="result.errorCode">{{ result.errorCode }}</b>{{ result.message }}</p></article></div></AppDrawer>
+    <AppConfirmDialog :open="Boolean(testingCandidate)" title="执行协议检测" :message="`将对“${testingCandidate?.name || ''}”的每个协议发送最小推理请求；认证失败时会自动补测另一种认证，每个协议最多两次，上游可能计费。是否继续？`" :busy="Boolean(testing)" @close="testingCandidate = null" @confirm="confirmTest" />
+    <AppDrawer v-if="testReport" :open="Boolean(testReport)" kicker="PROTOCOL DIAGNOSTICS" :title="testReport.relayName" @close="testReport = null"><div class="relay-test-results"><article v-for="result in testReport.results" :key="result.protocol" :data-ok="result.ok"><div><strong>{{ protocolLabel(result.protocol) }}</strong><span>{{ result.ok ? '通过' : '失败' }} · {{ result.latencyMs }} ms</span></div><code>{{ result.endpoint }}</code><small>采用 {{ result.authScheme === 'bearer' ? 'Bearer' : 'x-api-key' }}<template v-if="result.attemptedAuthSchemes.length > 1"> · 已自动测试 Bearer 与 x-api-key</template></small><p v-if="result.clientIdentityRejected">上游拒绝当前检测客户端身份；认证方式未据此覆盖，请开启真实客户端身份透传后用 Claude Code / Codex 发起实际请求。</p><p v-else-if="result.errorCode || result.message"><b v-if="result.errorCode">{{ result.errorCode }}</b>{{ result.message }}</p></article></div></AppDrawer>
     <AppConfirmDialog :open="Boolean(deleting)" title="删除中转" :message="`删除“${deleting?.name || ''}”后，绑定它的专用 Key 将不再有可用渠道。`" :busy="busy" @close="deleting = null" @confirm="remove" />
   </div>
 </template>
@@ -240,15 +265,24 @@ onMounted(() => { void refreshBalances() })
 .relay-empty { min-height:260px; display:grid; place-items:center; align-content:center; gap:.55rem; text-align:center; }
 .relay-empty p { margin:0; color:var(--text-muted); }
 .protocol-picker { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.55rem; }
-.protocol-picker button { min-height:64px; display:flex; align-items:center; gap:.55rem; padding:.65rem; text-align:left; color:var(--text); border:1px solid var(--line-strong); background:var(--surface-soft); }
-.protocol-picker button > svg { flex:none; opacity:0; }
-.protocol-picker button.active { border-color:var(--accent); background:color-mix(in srgb,var(--accent) 8%,var(--surface)); }
-.protocol-picker button.active > svg { opacity:1; color:var(--accent); }
-.protocol-picker button span { display:grid; gap:.15rem; }
+.protocol-option { min-width:0; border:1px solid var(--line-strong); background:var(--surface-soft); }
+.protocol-option > button { width:100%; min-height:64px; display:flex; align-items:center; gap:.55rem; padding:.65rem; text-align:left; color:var(--text); border:0; background:transparent; }
+.protocol-option > button > svg { flex:none; opacity:0; }
+.protocol-option.active { border-color:var(--accent); background:color-mix(in srgb,var(--accent) 8%,var(--surface)); }
+.protocol-option.active > button > svg { opacity:1; color:var(--accent); }
+.protocol-option > button span { display:grid; gap:.15rem; }
+.protocol-option > label { padding:.55rem .65rem; border-top:1px solid var(--line-subtle); display:grid; gap:.35rem; color:var(--text-muted); font-size:.68rem; }
+.relay-compat-settings { display:grid; gap:.75rem; }
 .protocol-picker small { color:var(--text-muted); font-size:.68rem; }
 .relay-model-list { display:grid; gap:.5rem; }
+.relay-model-entry { display:grid; gap:.4rem; padding:.55rem; border:1px solid var(--line-subtle); background:var(--surface-soft); }
 .relay-model-row { display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) auto; gap:.5rem; align-items:center; }
 .relay-model-row > span { color:var(--text-muted); }
+.relay-model-protocols { display:flex; flex-wrap:wrap; gap:.35rem; }
+.relay-model-protocols button { min-height:28px; padding:0 .5rem; border:1px solid var(--line-strong); color:var(--text-muted); background:var(--surface); font-size:.66rem; }
+.relay-model-protocols button svg { opacity:0; }
+.relay-model-protocols button.active { border-color:var(--accent); color:var(--accent); background:color-mix(in srgb,var(--accent) 7%,var(--surface)); }
+.relay-model-protocols button.active svg { opacity:1; }
 .relay-settings-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
 .config-builder { display:grid; gap:1rem; padding:1.1rem; }
 .config-builder > label { display:grid; gap:.4rem; color:var(--text-muted); font-size:.75rem; }

@@ -3,6 +3,7 @@ export type ChannelOwnerKind = 'platform' | 'user'
 export type ChannelAccessScope = 'all' | 'restricted' | 'private'
 export type ChannelProtocol = 'anthropic_messages' | 'openai_responses' | 'openai_chat'
 export type ChannelAuthScheme = 'bearer' | 'x_api_key'
+export type ChannelClientIdentityMode = 'standard' | 'passthrough'
 export type ProtocolVerificationStatus = 'unknown' | 'verified' | 'failed'
 export type KeyRouteMode = 'platform_only' | 'private_only' | 'platform_then_private' | 'private_then_platform'
 export type RoutingStrategy = 'priority' | 'weighted_round_robin'
@@ -35,6 +36,8 @@ export interface ChannelView {
   lastHealthCheckAt: number | null
   lastHealthError: string | null
   checkinEnabled: boolean
+  modelDiscoveryEnabled: boolean
+  clientIdentityMode: ChannelClientIdentityMode
   checkinConfigured: boolean
   checkinUserId: string | null
   lastCheckinAt: number | null

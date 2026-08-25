@@ -148,6 +148,7 @@ export async function syncChannelModelsFromUpstream(event: H3Event, channelId: s
   const db = useDatabase(event)
   const [channel] = await db.select().from(channels).where(eq(channels.id, channelId)).limit(1)
   if (!channel) throw createError({ statusCode: 404, message: '渠道不存在' })
+  if (!channel.modelDiscoveryEnabled) throw createError({ statusCode: 409, message: '该渠道已关闭自动模型发现，请手工维护模型' })
   const protocols = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, channelId))
   const protocol = protocols.find(binding => binding.protocol === 'openai_responses')
     || protocols.find(binding => binding.protocol === 'openai_chat')

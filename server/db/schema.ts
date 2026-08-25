@@ -119,6 +119,8 @@ export const channels = pgTable('channels', {
   lastHealthCheckAt: timestamp('last_health_check_at', { withTimezone: true }),
   lastHealthError: text('last_health_error'),
   checkinEnabled: boolean('checkin_enabled').notNull().default(false),
+  modelDiscoveryEnabled: boolean('model_discovery_enabled').notNull().default(true),
+  clientIdentityMode: text('client_identity_mode').notNull().default('standard'),
   encryptedCheckinToken: text('encrypted_checkin_token'),
   checkinUserId: text('checkin_user_id'),
   lastCheckinAt: timestamp('last_checkin_at', { withTimezone: true }),

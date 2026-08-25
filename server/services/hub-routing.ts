@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { and, asc, eq } from 'drizzle-orm'
+import { and, asc, eq, ne } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { createError } from 'h3'
 import { useDatabase } from '../db'
@@ -31,6 +31,11 @@ export interface SupplyDecision {
   reservedTokens: number
   walletHoldId?: string
   poolGroupId?: string
+}
+
+export function channelHealthAllowsRouting(channel: Pick<typeof channels.$inferSelect, 'healthStatus' | 'clientIdentityMode' | 'modelDiscoveryEnabled'>) {
+  return channel.healthStatus === 'healthy'
+    || channel.healthStatus === 'unknown' && channel.clientIdentityMode === 'passthrough' && channel.modelDiscoveryEnabled === false
 }
 
 type CandidateOrderValue = Pick<RouteCandidate, 'conversionMode'> & { channel: Pick<RouteCandidate['channel'], 'priority' | 'name'> }
@@ -177,7 +182,7 @@ export async function routeCandidates(
         : supplySource === 'user_relay'
           ? row.channel.ownerKind === 'user' && row.channel.ownerUserId === options.userId
           : row.channel.ownerKind === 'platform' && row.channel.type === 'sub2api'
-      return row.channel.healthStatus === 'healthy'
+      return channelHealthAllowsRouting(row.channel)
         && (!options.userId || visibleIds.has(row.channel.id) || supplySource === 'private_pool')
         && (!options.channelId || row.channel.id === options.channelId)
         && sourceMatches
@@ -252,9 +257,12 @@ export async function recordChannelFailure(event: H3Event, channelId: string, me
 }
 
 export async function recordChannelSuccess(event: H3Event | undefined, channelId: string) {
-  await useRedis(event).del(
-    `hub:circuit:${channelId}:failures`,
-    `hub:circuit:${channelId}:open`,
-    `hub:circuit:${channelId}:half-open`
-  )
+  await Promise.all([
+    useRedis(event).del(
+      `hub:circuit:${channelId}:failures`,
+      `hub:circuit:${channelId}:open`,
+      `hub:circuit:${channelId}:half-open`
+    ),
+    useDatabase(event).update(channels).set({ healthStatus: 'healthy', lastHealthCheckAt: new Date(), lastHealthError: null, updatedAt: new Date() }).where(and(eq(channels.id, channelId), ne(channels.healthStatus, 'healthy')))
+  ])
 }
