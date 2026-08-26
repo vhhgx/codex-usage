@@ -3,7 +3,7 @@ import { and, asc, eq, ne } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { createError } from 'h3'
 import { useDatabase } from '../db'
-import { channelModelBindings, channelModels, channelProtocolBindings, channels, groupChannelRules, modelPools, userPoolAccounts, userPoolGroups } from '../db/schema'
+import { channelModelBindings, channelModels, channelProtocolBindings, channels, groupChannelRules, modelPools, userPoolAccounts, userPoolGroups, userRelayAccountStates, userRelayGroups } from '../db/schema'
 import { decryptChannelSecret, decryptContextSecret } from '../utils/hub-crypto'
 import { redactSensitiveText } from '../utils/upstream'
 import { useRedis } from '../utils/redis'
@@ -22,6 +22,9 @@ export interface RouteCandidate {
   credentialSource: 'channel' | 'user_pool' | 'user_relay'
   credentialRef?: string
   credential?: string
+  relayGroupId?: string
+  relayGroupMaxConcurrency?: number
+  accountOrder?: number
 }
 
 export interface SupplyDecision {
@@ -33,9 +36,8 @@ export interface SupplyDecision {
   poolGroupId?: string
 }
 
-export function channelHealthAllowsRouting(channel: Pick<typeof channels.$inferSelect, 'healthStatus' | 'clientIdentityMode' | 'modelDiscoveryEnabled'>) {
+export function channelHealthAllowsRouting(channel: Pick<typeof channels.$inferSelect, 'healthStatus'>) {
   return channel.healthStatus === 'healthy'
-    || channel.healthStatus === 'unknown' && channel.clientIdentityMode === 'passthrough' && channel.modelDiscoveryEnabled === false
 }
 
 function channelCanRoute(channel: typeof channels.$inferSelect) {
@@ -66,10 +68,11 @@ export function orderedRouteSourceNodes(
   mode: 'platform_only' | 'private_only' | 'platform_then_private' | 'private_then_platform',
   orderedSourceIds: string[]
 ) {
-  const nodes: Array<{ id: string; source: 'platform' | 'private_pool' | 'user_relay'; channelId?: string }> = []
+  const nodes: Array<{ id: string; source: 'platform' | 'private_pool' | 'user_relay'; channelId?: string; relayGroupId?: string }> = []
   for (const id of orderedSourceIds) {
     if (id === 'package') nodes.push({ id, source: 'platform' })
     else if (id === 'private_pool') nodes.push({ id, source: 'private_pool' })
+    else if (id.startsWith('relay_group:') && id.length > 12) nodes.push({ id, source: 'user_relay', relayGroupId: id.slice(12) })
     else if (id.startsWith('relay:') && id.length > 6) nodes.push({ id, source: 'user_relay', channelId: id.slice(6) })
   }
   if (mode === 'platform_only') return nodes.filter(node => node.source === 'platform')
@@ -155,15 +158,17 @@ export async function routeCandidates(
   groupId: string | null = null,
   supplySource: 'platform' | 'private_pool' | 'user_relay' = 'platform',
   poolGroupId?: string,
-  options: { userId?: string; keyId?: string; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat'; allowConversion?: boolean; affinityKey?: string; channelId?: string } = {}
+  options: { userId?: string; keyId?: string; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat'; allowConversion?: boolean; affinityKey?: string; channelId?: string; relayGroupId?: string } = {}
 ) {
   const db = useDatabase(event)
   const requestedProtocol = options.protocol || endpointProtocol(endpoint)
-  const rows = await db.select({ channel: channels, model: channelModels, modelBinding: channelModelBindings, protocolBinding: channelProtocolBindings })
+  const rows = await db.select({ channel: channels, model: channelModels, modelBinding: channelModelBindings, protocolBinding: channelProtocolBindings, relayGroup: userRelayGroups, accountState: userRelayAccountStates })
     .from(channelModelBindings)
     .innerJoin(channelModels, eq(channelModelBindings.channelModelId, channelModels.id))
     .innerJoin(channelProtocolBindings, eq(channelModelBindings.protocolBindingId, channelProtocolBindings.id))
     .innerJoin(channels, eq(channelModels.channelId, channels.id))
+    .leftJoin(userRelayGroups, eq(channels.userRelayGroupId, userRelayGroups.id))
+    .leftJoin(userRelayAccountStates, eq(channels.id, userRelayAccountStates.channelId))
     .where(and(
       eq(channelModels.publicModel, publicModel),
       eq(channelModels.enabled, true),
@@ -190,8 +195,12 @@ export async function routeCandidates(
           ? row.channel.ownerKind === 'user' && row.channel.ownerUserId === options.userId
           : row.channel.ownerKind === 'platform' && row.channel.type === 'sub2api'
       return channelCanRoute(row.channel)
+        && (supplySource !== 'user_relay' || row.protocolBinding.verificationStatus !== 'failed')
+        && (supplySource !== 'user_relay' || row.accountState?.routingState === undefined || row.accountState.routingState === 'active')
+        && (supplySource !== 'user_relay' || row.relayGroup?.enabled !== false)
         && (!options.userId || visibleIds.has(row.channel.id) || supplySource === 'private_pool')
         && (!options.channelId || row.channel.id === options.channelId)
+        && (!options.relayGroupId || row.channel.userRelayGroupId === options.relayGroupId)
         && sourceMatches
         && protocolMatches
         && (!row.model.endpoints.length || row.model.endpoints.includes(capabilityEndpoint))
@@ -220,18 +229,41 @@ export async function routeCandidates(
       credentialSource: row.channel.ownerKind === 'user' ? 'user_relay' : 'channel',
       credentialRef: row.channel.ownerKind === 'user' ? row.channel.id : undefined,
       credential: row.channel.ownerKind === 'user' ? decryptChannelSecret(row.channel.encryptedApiKey, row.channel.id, 'user', event) : undefined,
+      relayGroupId: row.channel.userRelayGroupId || undefined,
+      relayGroupMaxConcurrency: row.relayGroup?.maxConcurrency || undefined,
+      accountOrder: row.channel.accountRank,
       conversionMode: requestedProtocol === row.protocolBinding.protocol ? 'passthrough' : requestedProtocol === 'anthropic_messages' ? 'anthropic_to_openai' : 'openai_to_anthropic',
       affinityReused: false
     })
   }
-  available.sort((left, right) => compareRouteCandidates(left, right, supplySource))
+  if (supplySource === 'user_relay') {
+    const rowByChannel = new Map(rows.map(row => [row.channel.id, row]))
+    available.sort((left, right) => {
+      const leftRow = rowByChannel.get(left.channel.id)
+      const rightRow = rowByChannel.get(right.channel.id)
+      const mode = leftRow?.relayGroup?.accountOrderMode || rightRow?.relayGroup?.accountOrderMode || 'manual'
+      if (mode !== 'manual') {
+        const leftBalance = leftRow?.accountState?.remainingBalance === null || leftRow?.accountState?.remainingBalance === undefined ? null : Number(leftRow.accountState.remainingBalance)
+        const rightBalance = rightRow?.accountState?.remainingBalance === null || rightRow?.accountState?.remainingBalance === undefined ? null : Number(rightRow.accountState.remainingBalance)
+        if (leftBalance !== null || rightBalance !== null) {
+          if (leftBalance === null) return 1
+          if (rightBalance === null) return -1
+          const balance = mode === 'balance_asc' ? leftBalance - rightBalance : rightBalance - leftBalance
+          if (balance) return balance
+        }
+      }
+      return left.channel.accountRank - right.channel.accountRank || compareRouteCandidates(left, right, supplySource)
+    })
+  } else available.sort((left, right) => compareRouteCandidates(left, right, supplySource))
   const [pool] = await db.select().from(modelPools).where(eq(modelPools.publicModel, publicModel)).limit(1)
   if (pool?.enabled === false) return []
   if (halfOpen.size) {
     const credentialed = await applyPrivateCredential(event, [...available].sort((left, right) => Number(halfOpen.has(right.channel.id)) - Number(halfOpen.has(left.channel.id))), supplySource, poolGroupId)
+    if (supplySource === 'user_relay') return credentialed
     return applyAffinity(event, credentialed, options.affinityKey)
   }
   const credentialed = await applyPrivateCredential(event, available, supplySource, poolGroupId)
+  if (supplySource === 'user_relay') return credentialed
   if (pool?.strategy !== 'weighted_round_robin' || credentialed.length < 2) return applyAffinity(event, credentialed, options.affinityKey)
   return applyAffinity(event, credentialed, options.affinityKey || `${publicModel}:${Date.now()}:${Math.random()}`)
 }
@@ -263,13 +295,28 @@ export async function recordChannelFailure(event: H3Event, channelId: string, me
   await useDatabase(event).update(channels).set({ lastHealthError: safeMessage, lastHealthCheckAt: now, updatedAt: now }).where(eq(channels.id, channelId))
 }
 
-export async function recordChannelSuccess(event: H3Event | undefined, channelId: string) {
+export async function recordChannelSuccess(event: H3Event | undefined, channelId: string, protocolBindingId?: string) {
+  const now = new Date()
   await Promise.all([
     useRedis(event).del(
       `hub:circuit:${channelId}:failures`,
       `hub:circuit:${channelId}:open`,
       `hub:circuit:${channelId}:half-open`
     ),
-    useDatabase(event).update(channels).set({ healthStatus: 'healthy', lastHealthCheckAt: new Date(), lastHealthError: null, updatedAt: new Date() }).where(and(eq(channels.id, channelId), ne(channels.healthStatus, 'healthy')))
+    useDatabase(event).update(channels).set({ healthStatus: 'healthy', lastHealthCheckAt: now, lastHealthError: null, updatedAt: now }).where(and(eq(channels.id, channelId), ne(channels.healthStatus, 'healthy'))),
+    ...(protocolBindingId ? [useDatabase(event).update(channelProtocolBindings).set({ verificationStatus: 'verified', verifiedAt: now, lastError: null, updatedAt: now }).where(and(eq(channelProtocolBindings.id, protocolBindingId), eq(channelProtocolBindings.channelId, channelId)))] : [])
   ])
+}
+
+export async function userRelayAccountAllowsRouting(event: H3Event, channelId: string) {
+  const [row] = await useDatabase(event).select({
+    enabled: channels.enabled,
+    routingState: userRelayAccountStates.routingState,
+    groupEnabled: userRelayGroups.enabled
+  }).from(channels)
+    .leftJoin(userRelayAccountStates, eq(channels.id, userRelayAccountStates.channelId))
+    .leftJoin(userRelayGroups, eq(channels.userRelayGroupId, userRelayGroups.id))
+    .where(and(eq(channels.id, channelId), eq(channels.ownerKind, 'user')))
+    .limit(1)
+  return Boolean(row?.enabled && row.groupEnabled !== false && (!row.routingState || row.routingState === 'active'))
 }

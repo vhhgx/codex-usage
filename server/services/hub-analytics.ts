@@ -10,11 +10,14 @@ import { channelCircuitState } from './hub-routing'
 
 const ANALYTICS_RANGES = new Set(['today', '24h', 'week', 'month', 'year', 'all', 'custom'])
 const REQUEST_STATUSES = new Set(['pending', 'success', 'error', 'stream_aborted'])
+const REQUEST_RESOURCE_TYPES = new Set(['subscription', 'user_relay', 'private_pool', 'unresolved'])
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 function validateDimensionFilters(query: Record<string, string | undefined>) {
   if (query.keyId && !UUID_PATTERN.test(query.keyId)) throw createError({ statusCode: 400, message: 'Hub Key 筛选值格式不正确' })
   if (query.channelId && !UUID_PATTERN.test(query.channelId)) throw createError({ statusCode: 400, message: '渠道筛选值格式不正确' })
+  if (query.resourceId && !UUID_PATTERN.test(query.resourceId)) throw createError({ statusCode: 400, message: '资源筛选值格式不正确' })
+  if (query.resourceType && !REQUEST_RESOURCE_TYPES.has(query.resourceType)) throw createError({ statusCode: 400, message: '资源类型筛选值不正确' })
   if (query.status && !REQUEST_STATUSES.has(query.status)) throw createError({ statusCode: 400, message: '请求状态筛选值不正确' })
 }
 
@@ -47,6 +50,13 @@ export function resolveAnalyticsRange(query: Record<string, string | undefined>,
 function number(value: unknown) {
   const result = Number(value)
   return Number.isFinite(result) ? result : 0
+}
+
+function requestResourceFallback(type: 'subscription' | 'user_relay' | 'private_pool' | 'unresolved') {
+  if (type === 'subscription') return '当前套餐'
+  if (type === 'user_relay') return '个人中转'
+  if (type === 'private_pool') return '我的专属号池'
+  return '未选路'
 }
 
 function rollupP95(value: Record<string, unknown> | undefined) {
@@ -354,6 +364,8 @@ export async function listRequestLogs(event: H3Event, query: Record<string, stri
   const conditions = []
   if (query.keyId) conditions.push(eq(requestLogs.keyId, query.keyId))
   if (query.channelId) conditions.push(eq(requestLogs.channelId, query.channelId))
+  if (query.resourceType) conditions.push(eq(requestLogs.resourceType, query.resourceType as 'subscription' | 'user_relay' | 'private_pool' | 'unresolved'))
+  if (query.resourceId) conditions.push(eq(requestLogs.resourceId, query.resourceId))
   if (query.model) conditions.push(eq(requestLogs.requestedModel, query.model))
   if (query.endpoint) conditions.push(eq(requestLogs.endpoint, query.endpoint))
   if (query.status) conditions.push(eq(requestLogs.status, query.status as 'pending' | 'success' | 'error' | 'stream_aborted'))
@@ -369,7 +381,11 @@ export async function listRequestLogs(event: H3Event, query: Record<string, stri
     .leftJoin(hubKeys, eq(requestLogs.keyId, hubKeys.id))
     .leftJoin(channels, eq(requestLogs.channelId, channels.id))
     .where(where).orderBy(desc(requestLogs.createdAt)).limit(pageSize).offset((page - 1) * pageSize)
-  const [total] = await db.select({ value: count() }).from(requestLogs).where(where)
+  const [[total], resourceStats, executionStats] = await Promise.all([
+    db.select({ value: count() }).from(requestLogs).where(where),
+    db.select({ type: requestLogs.resourceType, id: requestLogs.resourceId, name: requestLogs.resourceNameSnapshot, requests: count(), tokens: sql<number>`coalesce(sum(${requestLogs.totalTokens}), 0)`, cost: sql<string>`coalesce(sum(${requestLogs.cost}), 0)` }).from(requestLogs).where(where).groupBy(requestLogs.resourceType, requestLogs.resourceId, requestLogs.resourceNameSnapshot).orderBy(desc(count())).limit(50),
+    db.select({ channelId: requestLogs.channelId, name: requestLogs.executionNameSnapshot, requests: count(), tokens: sql<number>`coalesce(sum(${requestLogs.totalTokens}), 0)`, cost: sql<string>`coalesce(sum(${requestLogs.cost}), 0)` }).from(requestLogs).where(where).groupBy(requestLogs.channelId, requestLogs.executionNameSnapshot).orderBy(desc(count())).limit(50)
+  ])
   const items: RequestLogView[] = rows.map(({ log, keyName, channelName }) => ({
     id: log.id,
     requestId: log.requestId,
@@ -380,6 +396,11 @@ export async function listRequestLogs(event: H3Event, query: Record<string, stri
     upstreamModel: log.upstreamModel,
     channelId: log.channelId,
     channelName,
+    resourceType: log.resourceType,
+    resourceId: log.resourceId,
+    resourceName: log.resourceNameSnapshot || requestResourceFallback(log.resourceType),
+    executionName: log.executionNameSnapshot || channelName,
+    userRelayGroupId: log.userRelayGroupId,
     status: log.status,
     httpStatus: log.httpStatus,
     totalTokens: log.totalTokens,
@@ -390,7 +411,11 @@ export async function listRequestLogs(event: H3Event, query: Record<string, stri
     errorMessage: log.errorMessage,
     createdAt: log.createdAt.getTime()
   }))
-  return { items, page, pageSize, total: number(total?.value) }
+  return {
+    items, page, pageSize, total: number(total?.value),
+    resourceStats: resourceStats.map(row => ({ type: row.type, id: row.id, name: row.name || requestResourceFallback(row.type), requests: number(row.requests), tokens: number(row.tokens), cost: number(row.cost) })),
+    executionStats: executionStats.map(row => ({ channelId: row.channelId, name: row.name || '未执行', requests: number(row.requests), tokens: number(row.tokens), cost: number(row.cost) }))
+  }
 }
 
 export async function requestLogDetail(event: H3Event, id: string) {

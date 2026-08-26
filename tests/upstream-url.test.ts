@@ -29,9 +29,9 @@ afterEach(() => {
 })
 
 describe('private relay SSRF protection', () => {
-  it('accepts only clean HTTPS base URLs', () => {
+  it('accepts clean HTTP and HTTPS base URLs', () => {
     expect(normalizeUserUpstreamUrl('https://relay.example.com/v1/')).toBe('https://relay.example.com/v1')
-    expect(() => normalizeUserUpstreamUrl('http://relay.example.com')).toThrow('只允许使用 HTTPS')
+    expect(normalizeUserUpstreamUrl('http://relay.example.com')).toBe('http://relay.example.com')
     expect(() => normalizeUserUpstreamUrl('https://user:pass@relay.example.com')).toThrow('不能包含凭据')
     expect(() => normalizeUserUpstreamUrl('https://relay.example.com?target=x')).toThrow('不能包含凭据')
   })

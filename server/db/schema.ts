@@ -22,13 +22,18 @@ export const channelOwnerKindEnum = pgEnum('channel_owner_kind', ['platform', 'u
 export const channelAccessScopeEnum = pgEnum('channel_access_scope', ['all', 'restricted', 'private'])
 export const channelProtocolEnum = pgEnum('channel_protocol', ['anthropic_messages', 'openai_responses', 'openai_chat'])
 export const channelAuthSchemeEnum = pgEnum('channel_auth_scheme', ['bearer', 'x_api_key'])
-export const protocolVerificationStatusEnum = pgEnum('protocol_verification_status', ['unknown', 'verified', 'failed'])
+export const protocolVerificationStatusEnum = pgEnum('protocol_verification_status', ['unknown', 'verified', 'pending_real_client', 'failed'])
 export const keyRouteModeEnum = pgEnum('key_route_mode', ['platform_only', 'private_only', 'platform_then_private', 'private_then_platform'])
 export const protocolConversionModeEnum = pgEnum('protocol_conversion_mode', ['passthrough', 'anthropic_to_openai', 'openai_to_anthropic'])
 export const routingStrategyEnum = pgEnum('routing_strategy', ['priority', 'weighted_round_robin'])
 export const keyStatusEnum = pgEnum('hub_key_status', ['active', 'disabled', 'expired'])
 export const requestStatusEnum = pgEnum('request_status', ['pending', 'success', 'error', 'stream_aborted'])
 export const supplySourceEnum = pgEnum('supply_source', ['platform', 'private_pool', 'user_relay'])
+export const relayPlatformTypeEnum = pgEnum('relay_platform_type', ['generic', 'newapi', 'sub2api'])
+export const relayAccountOrderModeEnum = pgEnum('relay_account_order_mode', ['manual', 'balance_asc', 'balance_desc'])
+export const relayAccountRoutingStateEnum = pgEnum('relay_account_routing_state', ['active', 'depleted', 'credential_error', 'manual_disabled'])
+export const relayBalanceStatusEnum = pgEnum('relay_balance_status', ['unknown', 'success', 'error'])
+export const requestResourceTypeEnum = pgEnum('request_resource_type', ['subscription', 'user_relay', 'private_pool', 'unresolved'])
 export const userPoolStatusEnum = pgEnum('user_pool_status', ['provisioning', 'active', 'disabled', 'error'])
 export const walletTransactionTypeEnum = pgEnum('wallet_transaction_type', ['recharge', 'hold', 'settle', 'release', 'refund', 'manual_adjustment'])
 export const userRoleEnum = pgEnum('user_role', ['super_admin', 'admin', 'operator', 'auditor', 'user'])
@@ -99,6 +104,22 @@ export const groupMemberships = pgTable('group_memberships', {
   index('group_memberships_user_idx').on(table.userId)
 ])
 
+export const userRelayGroups = pgTable('user_relay_groups', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  ownerUserId: uuid('owner_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  homepageUrl: text('homepage_url'),
+  normalizedOrigin: text('normalized_origin'),
+  platformType: relayPlatformTypeEnum('platform_type').notNull().default('generic'),
+  enabled: boolean('enabled').notNull().default(true),
+  accountOrderMode: relayAccountOrderModeEnum('account_order_mode').notNull().default('manual'),
+  maxConcurrency: integer('max_concurrency'),
+  ...timestamps
+}, table => [
+  index('user_relay_groups_owner_idx').on(table.ownerUserId),
+  index('user_relay_groups_owner_enabled_idx').on(table.ownerUserId, table.enabled)
+])
+
 export const channels = pgTable('channels', {
   id: uuid('id').primaryKey().defaultRandom(),
   name: text('name').notNull(),
@@ -107,6 +128,9 @@ export const channels = pgTable('channels', {
   encryptedApiKey: text('encrypted_api_key').notNull(),
   ownerKind: channelOwnerKindEnum('owner_kind').notNull().default('platform'),
   ownerUserId: uuid('owner_user_id').references(() => users.id, { onDelete: 'cascade' }),
+  userRelayGroupId: uuid('user_relay_group_id').references(() => userRelayGroups.id, { onDelete: 'cascade' }),
+  accountLabel: text('account_label'),
+  accountRank: integer('account_rank').notNull().default(100),
   accessScope: channelAccessScopeEnum('access_scope').notNull().default('all'),
   createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
   credentialKeyVersion: text('credential_key_version'),
@@ -120,8 +144,8 @@ export const channels = pgTable('channels', {
   lastHealthCheckAt: timestamp('last_health_check_at', { withTimezone: true }),
   lastHealthError: text('last_health_error'),
   checkinEnabled: boolean('checkin_enabled').notNull().default(false),
-  modelDiscoveryEnabled: boolean('model_discovery_enabled').notNull().default(true),
   clientIdentityMode: text('client_identity_mode').notNull().default('standard'),
+  insecureHttpAcknowledgedAt: timestamp('insecure_http_acknowledged_at', { withTimezone: true }),
   encryptedCheckinToken: text('encrypted_checkin_token'),
   checkinUserId: text('checkin_user_id'),
   lastCheckinAt: timestamp('last_checkin_at', { withTimezone: true }),
@@ -131,11 +155,35 @@ export const channels = pgTable('channels', {
 }, table => [
   index('channels_enabled_priority_idx').on(table.enabled, table.priority),
   index('channels_owner_idx').on(table.ownerKind, table.ownerUserId),
+  index('channels_relay_group_rank_idx').on(table.userRelayGroupId, table.accountRank),
   check('channels_owner_scope_check', sql`(
     (${table.ownerKind} = 'platform' AND ${table.ownerUserId} IS NULL AND ${table.accessScope} IN ('all', 'restricted'))
     OR
     (${table.ownerKind} = 'user' AND ${table.ownerUserId} IS NOT NULL AND ${table.accessScope} = 'private')
   )`)
+])
+
+export const userRelayAccountStates = pgTable('user_relay_account_states', {
+  channelId: uuid('channel_id').primaryKey().references(() => channels.id, { onDelete: 'cascade' }),
+  routingState: relayAccountRoutingStateEnum('routing_state').notNull().default('active'),
+  stateReasonCode: text('state_reason_code'),
+  stateReasonMessage: text('state_reason_message'),
+  stateChangedAt: timestamp('state_changed_at', { withTimezone: true }).notNull().defaultNow(),
+  totalQuota: numeric('total_quota', { precision: 20, scale: 8 }),
+  purchasedQuota: numeric('purchased_quota', { precision: 20, scale: 8 }),
+  giftQuota: numeric('gift_quota', { precision: 20, scale: 8 }),
+  usedQuota: numeric('used_quota', { precision: 20, scale: 8 }),
+  remainingBalance: numeric('remaining_balance', { precision: 20, scale: 8 }),
+  currency: text('currency'),
+  balanceSource: text('balance_source'),
+  balanceStatus: relayBalanceStatusEnum('balance_status').notNull().default('unknown'),
+  balanceFetchedAt: timestamp('balance_fetched_at', { withTimezone: true }),
+  balanceError: text('balance_error'),
+  version: integer('version').notNull().default(1),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+}, table => [
+  index('user_relay_account_states_routing_idx').on(table.routingState),
+  index('user_relay_account_states_balance_idx').on(table.balanceStatus, table.remainingBalance)
 ])
 
 export const channelProtocolBindings = pgTable('channel_protocol_bindings', {
@@ -343,6 +391,11 @@ export const requestLogs = pgTable('request_logs', {
   sourceOwnerKind: channelOwnerKindEnum('source_owner_kind'),
   sourceOwnerUserId: uuid('source_owner_user_id').references(() => users.id, { onDelete: 'set null' }),
   supplySource: supplySourceEnum('supply_source').notNull().default('platform'),
+  resourceType: requestResourceTypeEnum('resource_type').notNull().default('unresolved'),
+  resourceId: uuid('resource_id'),
+  resourceNameSnapshot: text('resource_name_snapshot'),
+  executionNameSnapshot: text('execution_name_snapshot'),
+  userRelayGroupId: uuid('user_relay_group_id').references(() => userRelayGroups.id, { onDelete: 'set null' }),
   poolGroupId: uuid('pool_group_id'),
   subscriptionId: uuid('subscription_id'),
   planVersionId: uuid('plan_version_id'),
@@ -388,6 +441,12 @@ export const requestAttempts = pgTable('request_attempts', {
   requestLogId: uuid('request_log_id').notNull().references(() => requestLogs.id, { onDelete: 'cascade' }),
   channelId: uuid('channel_id').references(() => channels.id, { onDelete: 'set null' }),
   protocolBindingId: uuid('protocol_binding_id').references(() => channelProtocolBindings.id, { onDelete: 'set null' }),
+  userRelayGroupId: uuid('user_relay_group_id').references(() => userRelayGroups.id, { onDelete: 'set null' }),
+  resourceType: requestResourceTypeEnum('resource_type'),
+  resourceId: uuid('resource_id'),
+  resourceNameSnapshot: text('resource_name_snapshot'),
+  executionNameSnapshot: text('execution_name_snapshot'),
+  failureClass: text('failure_class'),
   attempt: integer('attempt').notNull(),
   status: text('status').notNull(),
   httpStatus: integer('http_status'),

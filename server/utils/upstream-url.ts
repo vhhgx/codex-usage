@@ -31,7 +31,7 @@ function allowTunFakeIpForHostname(hostname: string) {
 export function normalizeUserUpstreamUrl(raw: string) {
   let url: URL
   try { url = new URL(raw.trim()) } catch { throw createError({ statusCode: 400, message: '中转地址格式不正确' }) }
-  if (url.protocol !== 'https:') throw createError({ statusCode: 400, message: '用户中转只允许使用 HTTPS' })
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw createError({ statusCode: 400, message: '用户中转只允许使用 HTTP 或 HTTPS' })
   if (url.username || url.password || url.search || url.hash) throw createError({ statusCode: 400, message: '中转地址不能包含凭据、查询参数或片段' })
   url.pathname = url.pathname.replace(/\/+$/, '')
   return url.toString().replace(/\/$/, '')

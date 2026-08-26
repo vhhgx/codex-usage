@@ -8,7 +8,6 @@ import { channelGroupGrants, channelModelBindings, channelModels, channelProtoco
 import { createHubKey, decryptChannelSecret, decryptHubKeySecret, encryptChannelSecret, encryptHubKeySecret, encryptSecret, hashHubKey, validateHubKeySecret } from '../utils/hub-crypto'
 import { getHubSettings } from './hub-settings'
 import { channelCircuitState } from './hub-routing'
-import { discoverUpstreamModelIds, mergeDiscoveredModelMappings } from './hub-model-discovery'
 import { invalidateChannelAccess } from './channel-access'
 import { maskHubKey } from '#shared/utils/key-display'
 
@@ -91,6 +90,9 @@ function channelView(
     ownerKind: row.ownerKind,
     ownerUserId: row.ownerUserId,
     ownerUserName,
+    userRelayGroupId: row.userRelayGroupId,
+    accountLabel: row.accountLabel,
+    accountRank: row.accountRank,
     accessScope: row.accessScope,
     grantedUserIds,
     grantedGroupIds,
@@ -106,8 +108,8 @@ function channelView(
     lastHealthCheckAt: row.lastHealthCheckAt?.getTime() || null,
     lastHealthError: row.lastHealthError,
     checkinEnabled: row.checkinEnabled,
-    modelDiscoveryEnabled: row.modelDiscoveryEnabled,
     clientIdentityMode: row.clientIdentityMode === 'passthrough' ? 'passthrough' : 'standard',
+    insecureHttpAcknowledgedAt: row.insecureHttpAcknowledgedAt?.getTime() || null,
     checkinConfigured: Boolean(row.encryptedCheckinToken),
     checkinUserId: row.checkinUserId,
     lastCheckinAt: row.lastCheckinAt?.getTime() || null,
@@ -352,17 +354,8 @@ export async function createChannelRecord(event: H3Event, body: UnknownRecord, a
   try { new URL(baseUrl) } catch { throw createError({ statusCode: 400, message: '渠道地址格式不正确' }) }
   const protocols = parseChannelProtocols(body.protocols, type)
   if (!protocols.length) throw createError({ statusCode: 400, message: '请至少选择一种上游协议' })
-  let models = parseChannelModels(body.models)
-  const modelDiscoveryEnabled = body.modelDiscoveryEnabled !== false
-  if (modelDiscoveryEnabled && (type === 'sub2api' || type === 'openai_compatible')) {
-    try {
-      const discovered = await discoverUpstreamModelIds(baseUrl, apiKey, integer(body.timeoutMs, 1000, 600000, 15000))
-      models = mergeDiscoveredModelMappings(discovered, models)
-    } catch (error) {
-      if (!models.length) throw error
-    }
-  }
-  if (!models.length) throw createError({ statusCode: 400, message: modelDiscoveryEnabled ? '请至少配置一个模型，或确认上游支持模型发现' : '关闭自动模型发现时，请至少手工添加一个模型' })
+  const models = parseChannelModels(body.models)
+  if (!models.length) throw createError({ statusCode: 400, message: '请先获取模型或至少手工添加一个模型' })
   const db = useDatabase(event)
   const defaultTimeoutMs = (await getHubSettings(event)).defaultTimeoutMs
   const accessScope = body.accessScope === 'restricted' ? 'restricted' : 'all'
@@ -379,7 +372,6 @@ export async function createChannelRecord(event: H3Event, body: UnknownRecord, a
     weight: integer(body.weight, 1, 1000, 1),
     maxConcurrency: integer(body.maxConcurrency, 1, 10000, 20),
     timeoutMs: integer(body.timeoutMs, 1000, 600000, defaultTimeoutMs),
-    modelDiscoveryEnabled,
     clientIdentityMode: body.clientIdentityMode === 'passthrough' ? 'passthrough' : 'standard',
     priceMultiplier: String(nonnegativeNumber(body.priceMultiplier, 1))
   }).returning()
@@ -408,9 +400,8 @@ export async function updateChannelRecord(event: H3Event, id: string, body: Unkn
   if ('maxConcurrency' in body) patch.maxConcurrency = integer(body.maxConcurrency, 1, 10000, existing.maxConcurrency)
   if ('timeoutMs' in body) patch.timeoutMs = integer(body.timeoutMs, 1000, 600000, existing.timeoutMs)
   if ('priceMultiplier' in body) patch.priceMultiplier = String(nonnegativeNumber(body.priceMultiplier, Number(existing.priceMultiplier)))
-  if ('modelDiscoveryEnabled' in body) patch.modelDiscoveryEnabled = body.modelDiscoveryEnabled !== false
   if ('clientIdentityMode' in body) patch.clientIdentityMode = body.clientIdentityMode === 'passthrough' ? 'passthrough' : 'standard'
-  if ('modelDiscoveryEnabled' in body || 'clientIdentityMode' in body) {
+  if ('clientIdentityMode' in body) {
     patch.healthStatus = 'unknown'
     patch.lastHealthError = null
   }
@@ -419,18 +410,8 @@ export async function updateChannelRecord(event: H3Event, id: string, body: Unkn
   let protocolRows = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, id))
   if ('protocols' in body) protocolRows = await replaceChannelProtocols(event, id, parseChannelProtocols(body.protocols, existing.type))
   if ('models' in body) {
-    let models = parseChannelModels(body.models)
-    const discoveryEnabled = patch.modelDiscoveryEnabled ?? existing.modelDiscoveryEnabled
-    if (discoveryEnabled && (existing.type === 'sub2api' || existing.type === 'openai_compatible') && !models.length) {
-      const apiKey = text(body.apiKey, 2000) || decryptChannelSecret(existing.encryptedApiKey, existing.id, existing.ownerKind, event)
-      const discovered = await discoverUpstreamModelIds(
-        String(patch.baseUrl || existing.baseUrl),
-        apiKey,
-        Number(patch.timeoutMs || existing.timeoutMs)
-      )
-      models = discovered.map(publicModel => ({ publicModel, upstreamModel: publicModel, enabled: true, endpoints: [] }))
-    }
-    if (!models.length) throw createError({ statusCode: 400, message: '关闭自动模型发现时，请至少手工添加一个模型' })
+    const models = parseChannelModels(body.models)
+    if (!models.length) throw createError({ statusCode: 400, message: '请先获取模型或至少手工添加一个模型' })
     await replaceChannelModels(event, id, models, protocolRows)
   } else if ('protocols' in body) {
     const currentModels = await db.select().from(channelModels).where(eq(channelModels.channelId, id))

@@ -6,17 +6,10 @@ import { decryptChannelSecret } from '../utils/hub-crypto'
 import { pinnedUpstreamFetch } from '../utils/upstream-url'
 import { probeAuthSchemes, upstreamAuthHeaders } from '../utils/upstream-auth'
 import { recordChannelSuccess } from './hub-routing'
-import { modelIdsFromPayload, persistDiscoveredModels } from './hub-model-discovery'
 
 export async function checkChannelHealth(event: H3Event | undefined, channel: typeof channels.$inferSelect) {
   const started = Date.now()
-  if (!channel.modelDiscoveryEnabled) {
-    const message = channel.clientIdentityMode === 'passthrough'
-      ? '已关闭服务端模型发现；等待真实客户端请求验证'
-      : '已关闭服务端模型发现'
-    await useDatabase(event).update(channels).set({ healthStatus: 'unknown', lastHealthCheckAt: new Date(), lastHealthError: message, updatedAt: new Date() }).where(eq(channels.id, channel.id))
-    return { healthy: false, pending: true, latencyMs: Date.now() - started, message }
-  }
+  if (channel.ownerKind === 'user') return { healthy: channel.healthStatus === 'healthy', pending: channel.healthStatus === 'unknown', latencyMs: 0, message: channel.lastHealthError }
   let healthy = false
   let message = ''
   try {
@@ -49,10 +42,6 @@ export async function checkChannelHealth(event: H3Event | undefined, channel: ty
           await db.update(channelProtocolBindings).set({ authScheme: probe.selectedAuthScheme, updatedAt: new Date() }).where(eq(channelProtocolBindings.id, protocol.id))
         }
         healthy = true
-        let payload: unknown
-        try { payload = JSON.parse(final.body) } catch { payload = null }
-        const ids = modelIdsFromPayload(payload)
-        if (ids.length) await persistDiscoveredModels(event, channel.id, ids)
       } catch (error) {
         errors.push(`${protocol.protocol}: ${error instanceof Error ? error.message : '无法连接上游'}`)
       }

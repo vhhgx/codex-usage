@@ -239,6 +239,13 @@
       "when": 1787707844513,
       "tag": "0033_mushy_princess_powerful",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1787737955454,
+      "tag": "0034_tired_sage",
+      "breakpoints": true
     }
   ]
 }

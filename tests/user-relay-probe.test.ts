@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { interpretRelayCheckinResponse, newApiBalanceQuotaValues, normalizeUserRelayOrder } from '../server/services/user-relays'
+import { interpretRelayCheckinResponse, newApiBalanceQuotaValues, normalizeUserRelayOrder, sortRelayAccounts } from '../server/services/user-relays'
 import { parseChannelProtocols } from '../server/services/hub-admin'
 import { mergeUserFailoverSourceIds } from '../server/services/user-route-preferences'
+import { classifyRelayFailure, relayFailureAffectsAccount, relayFailureAllowsFailover } from '../server/services/relay-platform'
 
 describe('private relay protocol settings', () => {
   it('preserves the probe model explicitly selected for each protocol', () => {
@@ -22,11 +23,11 @@ describe('private relay protocol settings', () => {
   })
 
   it('keeps saved sources and appends newly available relays', () => {
-    expect(mergeUserFailoverSourceIds(['relay:b', 'package', 'relay:removed'], ['a', 'b'])).toEqual(['relay:b', 'package', 'relay:a'])
+    expect(mergeUserFailoverSourceIds(['relay:b', 'package', 'relay:removed'], ['a', 'b'])).toEqual(['relay_group:b', 'package', 'relay_group:a'])
   })
 
   it('adds a provisioned private pool as a draggable failover source', () => {
-    expect(mergeUserFailoverSourceIds(['relay:b', 'package'], ['a', 'b'], true, true)).toEqual(['relay:b', 'package', 'relay:a', 'private_pool'])
+    expect(mergeUserFailoverSourceIds(['relay:b', 'package'], ['a', 'b'], true, true)).toEqual(['relay_group:b', 'package', 'relay_group:a', 'private_pool'])
   })
 
   it('understands current and legacy NewAPI check-in responses', () => {
@@ -44,5 +45,37 @@ describe('private relay protocol settings', () => {
     })
     expect(newApiBalanceQuotaValues({ quota: 100, gift_quota: 20 })).toMatchObject({ quota: 120 })
     expect(newApiBalanceQuotaValues({ quota: 100, used_quota: 25 })).toMatchObject({ quota: 100, giftQuota: null, usedQuota: 25 })
+  })
+
+  it('sorts relay accounts by balance and always puts depleted accounts last', () => {
+    const account = (id: string, balance: number | null, routingState: 'active' | 'depleted', accountRank: number) => ({
+      id, accountRank, createdAt: accountRank, state: { remainingBalance: balance, routingState }
+    }) as never
+    const accounts = [account('a', 20, 'active', 20), account('b', 80, 'active', 10), account('c', 100, 'depleted', 5)]
+    expect(sortRelayAccounts(accounts, 'balance_desc').map(item => item.id)).toEqual(['b', 'a', 'c'])
+    expect(sortRelayAccounts(accounts, 'balance_asc').map(item => item.id)).toEqual(['a', 'b', 'c'])
+    expect(sortRelayAccounts(accounts, 'manual').map(item => item.id)).toEqual(['b', 'a', 'c'])
+  })
+
+  it('distinguishes exhausted quota from temporary rate limits', () => {
+    expect(classifyRelayFailure(429, JSON.stringify({ error: { code: 'insufficient_quota' } }))).toBe('quota_exhausted')
+    expect(classifyRelayFailure(429, JSON.stringify({ error: { code: 'rate_limit_exceeded' } }))).toBe('rate_limited')
+    expect(classifyRelayFailure(401, 'invalid api key')).toBe('credential_error')
+    expect(classifyRelayFailure(404, 'model does not exist')).toBe('model_missing')
+  })
+
+  it('fails over private relay accounts by classified upstream error', () => {
+    expect(relayFailureAllowsFailover(400, 'quota_exhausted', true)).toBe(true)
+    expect(relayFailureAllowsFailover(402, 'quota_exhausted', true)).toBe(true)
+    expect(relayFailureAllowsFailover(400, 'client_error', true)).toBe(false)
+    expect(relayFailureAllowsFailover(404, 'model_missing', true)).toBe(true)
+    expect(relayFailureAllowsFailover(404, 'model_missing', false)).toBe(false)
+  })
+
+  it('does not open an account-wide circuit for model-specific failures', () => {
+    expect(relayFailureAffectsAccount('quota_exhausted')).toBe(true)
+    expect(relayFailureAffectsAccount('rate_limited')).toBe(true)
+    expect(relayFailureAffectsAccount('model_missing')).toBe(false)
+    expect(relayFailureAffectsAccount('model_denied')).toBe(false)
   })
 })

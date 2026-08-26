@@ -4,7 +4,11 @@ export type ChannelAccessScope = 'all' | 'restricted' | 'private'
 export type ChannelProtocol = 'anthropic_messages' | 'openai_responses' | 'openai_chat'
 export type ChannelAuthScheme = 'bearer' | 'x_api_key'
 export type ChannelClientIdentityMode = 'standard' | 'passthrough'
-export type ProtocolVerificationStatus = 'unknown' | 'verified' | 'failed'
+export type ProtocolVerificationStatus = 'unknown' | 'verified' | 'pending_real_client' | 'failed'
+export type RelayPlatformType = 'generic' | 'newapi' | 'sub2api'
+export type RelayAccountOrderMode = 'manual' | 'balance_asc' | 'balance_desc'
+export type RelayAccountRoutingState = 'active' | 'depleted' | 'credential_error' | 'manual_disabled'
+export type RequestResourceType = 'subscription' | 'user_relay' | 'private_pool' | 'unresolved'
 export type KeyRouteMode = 'platform_only' | 'private_only' | 'platform_then_private' | 'private_then_platform'
 export type RoutingStrategy = 'priority' | 'weighted_round_robin'
 export type HubKeyStatus = 'active' | 'disabled' | 'expired'
@@ -21,6 +25,9 @@ export interface ChannelView {
   ownerKind: ChannelOwnerKind
   ownerUserId: string | null
   ownerUserName: string | null
+  userRelayGroupId: string | null
+  accountLabel: string | null
+  accountRank: number
   accessScope: ChannelAccessScope
   grantedUserIds: string[]
   grantedGroupIds: string[]
@@ -36,8 +43,8 @@ export interface ChannelView {
   lastHealthCheckAt: number | null
   lastHealthError: string | null
   checkinEnabled: boolean
-  modelDiscoveryEnabled: boolean
   clientIdentityMode: ChannelClientIdentityMode
+  insecureHttpAcknowledgedAt: number | null
   checkinConfigured: boolean
   checkinUserId: string | null
   lastCheckinAt: number | null
@@ -47,6 +54,42 @@ export interface ChannelView {
   protocols: ChannelProtocolBindingView[]
   models: ChannelModelView[]
   cache: ChannelCacheView
+  createdAt: number
+  updatedAt: number
+}
+
+export interface RelayAccountStateView {
+  routingState: RelayAccountRoutingState
+  stateReasonCode: string | null
+  stateReasonMessage: string | null
+  stateChangedAt: number | null
+  totalQuota: number | null
+  purchasedQuota: number | null
+  giftQuota: number | null
+  usedQuota: number | null
+  remainingBalance: number | null
+  currency: string | null
+  balanceSource: string | null
+  balanceStatus: 'unknown' | 'success' | 'error'
+  balanceFetchedAt: number | null
+  balanceError: string | null
+}
+
+export interface UserRelayAccountView extends ChannelView {
+  state: RelayAccountStateView
+}
+
+export interface UserRelayGroupView {
+  id: string
+  ownerUserId: string
+  name: string
+  homepageUrl: string | null
+  normalizedOrigin: string | null
+  platformType: RelayPlatformType
+  enabled: boolean
+  accountOrderMode: RelayAccountOrderMode
+  maxConcurrency: number | null
+  accounts: UserRelayAccountView[]
   createdAt: number
   updatedAt: number
 }
@@ -244,6 +287,11 @@ export interface RequestLogView {
   upstreamModel: string | null
   channelId: string | null
   channelName: string | null
+  resourceType: RequestResourceType
+  resourceId: string | null
+  resourceName: string | null
+  executionName: string | null
+  userRelayGroupId: string | null
   status: string
   httpStatus: number | null
   totalTokens: number

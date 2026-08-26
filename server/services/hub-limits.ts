@@ -23,6 +23,7 @@ export interface HubConcurrencyLease {
 export interface ChannelConcurrencyLease {
   id: string
   channelId: string
+  relayGroupId?: string
   renewAfter: number
 }
 
@@ -399,28 +400,39 @@ export async function releaseHubConcurrency(event: H3Event, lease: HubConcurrenc
 
 const ACQUIRE_CHANNEL_SCRIPT = `
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
-redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[3])
 if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[1]) then return 0 end
-redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
-redis.call('PEXPIRE', KEYS[2], ARGV[3] - ARGV[2] + 60000)
+local groupMax = tonumber(ARGV[2])
+if groupMax > 0 then
+  redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', ARGV[3])
+  if redis.call('ZCARD', KEYS[3]) >= groupMax then return 0 end
+end
+redis.call('ZADD', KEYS[2], ARGV[4], ARGV[5])
+redis.call('PEXPIRE', KEYS[2], ARGV[4] - ARGV[3] + 60000)
+if groupMax > 0 then
+  redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
+  redis.call('PEXPIRE', KEYS[3], ARGV[4] - ARGV[3] + 60000)
+end
 return 1
 `
 
-export async function acquireChannel(event: H3Event, channelId: string, max: number) {
+export async function acquireChannel(event: H3Event, channelId: string, max: number, relayGroup?: { id: string; max: number | null }) {
   const redis = useRedis(event)
   const now = Date.now()
   const leaseId = crypto.randomUUID()
   const acquired = Number(await redis.eval(
     ACQUIRE_CHANNEL_SCRIPT,
-    2,
+    3,
     `hub:channel:${channelId}:deleting`,
     `hub:channel:${channelId}:concurrency:leases`,
+    `hub:relay-group:${relayGroup?.id || 'none'}:concurrency:leases`,
     max,
+    relayGroup?.max || 0,
     now,
     now + CONCURRENCY_LEASE_TTL_MS,
     leaseId
   )) === 1
-  return acquired ? { id: leaseId, channelId, renewAfter: now + CONCURRENCY_LEASE_RENEW_MS } : null
+  return acquired ? { id: leaseId, channelId, relayGroupId: relayGroup?.max ? relayGroup.id : undefined, renewAfter: now + CONCURRENCY_LEASE_RENEW_MS } : null
 }
 
 export async function renewChannel(event: H3Event, lease: ChannelConcurrencyLease) {
@@ -430,12 +442,20 @@ export async function renewChannel(event: H3Event, lease: ChannelConcurrencyLeas
   const transaction = useRedis(event).multi()
   transaction.zadd(key, 'XX', now + CONCURRENCY_LEASE_TTL_MS, lease.id)
   transaction.pexpire(key, CONCURRENCY_LEASE_TTL_MS + 60000)
+  if (lease.relayGroupId) {
+    const groupKey = `hub:relay-group:${lease.relayGroupId}:concurrency:leases`
+    transaction.zadd(groupKey, 'XX', now + CONCURRENCY_LEASE_TTL_MS, lease.id)
+    transaction.pexpire(groupKey, CONCURRENCY_LEASE_TTL_MS + 60000)
+  }
   await transaction.exec()
   lease.renewAfter = now + CONCURRENCY_LEASE_RENEW_MS
 }
 
 export async function releaseChannel(event: H3Event, lease: ChannelConcurrencyLease) {
-  await useRedis(event).zrem(`hub:channel:${lease.channelId}:concurrency:leases`, lease.id)
+  const transaction = useRedis(event).multi()
+  transaction.zrem(`hub:channel:${lease.channelId}:concurrency:leases`, lease.id)
+  if (lease.relayGroupId) transaction.zrem(`hub:relay-group:${lease.relayGroupId}:concurrency:leases`, lease.id)
+  await transaction.exec()
 }
 
 export async function beginChannelDeletion(event: H3Event, channelId: string) {

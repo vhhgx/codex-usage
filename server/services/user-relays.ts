@@ -1,21 +1,22 @@
 import { randomUUID } from 'node:crypto'
-import { and, asc, eq, inArray, max } from 'drizzle-orm'
+import { and, asc, eq, inArray, max, sql } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { createError } from 'h3'
-import type { ChannelAuthScheme, ChannelModelView, ChannelProtocol, ChannelType } from '#shared/types/hub'
+import type { ChannelAuthScheme, ChannelModelView, ChannelProtocol, ChannelType, RelayAccountOrderMode, RelayPlatformType, UserRelayAccountView, UserRelayGroupView } from '#shared/types/hub'
 import { useDatabase } from '../db'
-import { channelModels, channelProtocolBindings, channels, userPoolAccounts, userPoolGroups, userRoutePreferences } from '../db/schema'
+import { channelModels, channelProtocolBindings, channels, userPoolAccounts, userPoolGroups, userRelayAccountStates, userRelayGroups, userRoutePreferences } from '../db/schema'
 import { decryptChannelSecret, decryptContextSecret, encryptChannelSecret, encryptContextSecret } from '../utils/hub-crypto'
 import { normalizeUserUpstreamUrl, pinnedUpstreamFetch, resolvePublicUpstream, upstreamNetworkError, userUpstreamTarget } from '../utils/upstream-url'
 import { redactSensitiveText } from '../utils/upstream'
 import { isClientIdentityRejection, probeAuthSchemes, upstreamAuthHeaders } from '../utils/upstream-auth'
 import { upstreamProbeClientIdentity } from '../utils/upstream-client-identity'
 import { listChannels, parseChannelModels, parseChannelProtocols, replaceChannelModels, replaceChannelProtocols } from './hub-admin'
-import { discoverUpstreamModelIds, syncChannelModelsFromUpstream } from './hub-model-discovery'
+import { discoverUpstreamModelIds, modelIdsFromPayload, syncChannelModelsFromUpstream } from './hub-model-discovery'
 import { invalidateChannelAccess } from './channel-access'
 import { channelCircuitState } from './hub-routing'
 import { getActiveSubscription } from './customer-management'
-import { getUserFailoverSourceIds, PACKAGE_SOURCE_ID, PRIVATE_POOL_SOURCE_ID, relaySourceId } from './user-route-preferences'
+import { getUserFailoverSourceIds, PACKAGE_SOURCE_ID, PRIVATE_POOL_SOURCE_ID, relayGroupSourceId } from './user-route-preferences'
+import { classifyRelayFailure, parseNewApiBalance, parseSub2ApiBalance, relayPlatform, relayPlatformDefinition, type RelayFailureClass } from './relay-platform'
 
 type Input = Record<string, unknown>
 const MAX_USER_RELAY_MODELS = 500
@@ -60,6 +61,100 @@ export async function listUserRelays(event: H3Event, ownerUserId: string) {
   return (await listChannels(event)).filter(channel => channel.ownerKind === 'user' && channel.ownerUserId === ownerUserId)
 }
 
+function stateNumber(value: string | null) {
+  if (value === null) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function emptyAccountState() {
+  return {
+    routingState: 'active' as const,
+    stateReasonCode: null,
+    stateReasonMessage: null,
+    stateChangedAt: null,
+    totalQuota: null,
+    purchasedQuota: null,
+    giftQuota: null,
+    usedQuota: null,
+    remainingBalance: null,
+    currency: null,
+    balanceSource: null,
+    balanceStatus: 'unknown' as const,
+    balanceFetchedAt: null,
+    balanceError: null
+  }
+}
+
+function accountStateView(row: typeof userRelayAccountStates.$inferSelect | undefined) {
+  if (!row) return emptyAccountState()
+  return {
+    routingState: row.routingState,
+    stateReasonCode: row.stateReasonCode,
+    stateReasonMessage: row.stateReasonMessage,
+    stateChangedAt: row.stateChangedAt?.getTime() || null,
+    totalQuota: stateNumber(row.totalQuota),
+    purchasedQuota: stateNumber(row.purchasedQuota),
+    giftQuota: stateNumber(row.giftQuota),
+    usedQuota: stateNumber(row.usedQuota),
+    remainingBalance: stateNumber(row.remainingBalance),
+    currency: row.currency,
+    balanceSource: row.balanceSource,
+    balanceStatus: row.balanceStatus,
+    balanceFetchedAt: row.balanceFetchedAt?.getTime() || null,
+    balanceError: row.balanceError
+  }
+}
+
+export function sortRelayAccounts(accounts: UserRelayAccountView[], mode: RelayAccountOrderMode) {
+  const schedulable = (item: UserRelayAccountView) => item.state.routingState === 'active' ? 0 : 1
+  return [...accounts].sort((left, right) => {
+    const state = schedulable(left) - schedulable(right)
+    if (state) return state
+    if (mode !== 'manual') {
+      const leftBalance = left.state.remainingBalance
+      const rightBalance = right.state.remainingBalance
+      if (leftBalance !== null || rightBalance !== null) {
+        if (leftBalance === null) return 1
+        if (rightBalance === null) return -1
+        const balance = mode === 'balance_asc' ? leftBalance - rightBalance : rightBalance - leftBalance
+        if (balance) return balance
+      }
+    }
+    return left.accountRank - right.accountRank || left.createdAt - right.createdAt || left.id.localeCompare(right.id)
+  })
+}
+
+export async function listUserRelayGroups(event: H3Event, ownerUserId: string): Promise<UserRelayGroupView[]> {
+  const db = useDatabase(event)
+  const [groups, relays, states] = await Promise.all([
+    db.select().from(userRelayGroups).where(eq(userRelayGroups.ownerUserId, ownerUserId)).orderBy(asc(userRelayGroups.createdAt)),
+    listUserRelays(event, ownerUserId),
+    db.select().from(userRelayAccountStates)
+  ])
+  const stateMap = new Map(states.map(state => [state.channelId, state]))
+  return groups.map(group => ({
+    id: group.id,
+    ownerUserId: group.ownerUserId,
+    name: group.name,
+    homepageUrl: group.homepageUrl,
+    normalizedOrigin: group.normalizedOrigin,
+    platformType: group.platformType,
+    enabled: group.enabled,
+    accountOrderMode: group.accountOrderMode,
+    maxConcurrency: group.maxConcurrency,
+    accounts: sortRelayAccounts(relays.filter(relay => relay.userRelayGroupId === group.id).map(relay => ({ ...relay, state: accountStateView(stateMap.get(relay.id)) })), group.accountOrderMode),
+    createdAt: group.createdAt.getTime(),
+    updatedAt: group.updatedAt.getTime()
+  }))
+}
+
+async function ownedRelayGroup(event: H3Event, ownerUserId: string, id: string) {
+  const [group] = await useDatabase(event).select().from(userRelayGroups).where(and(eq(userRelayGroups.id, id), eq(userRelayGroups.ownerUserId, ownerUserId))).limit(1)
+  if (!group) throw createError({ statusCode: 404, message: '中转站不存在' })
+  return group
+}
+
 function balanceRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
@@ -83,32 +178,70 @@ export function newApiBalanceQuotaValues(source: Record<string, unknown>) {
 
 export async function getUserRelayBalance(event: H3Event, ownerUserId: string, id: string) {
   const relay = await ownedRelay(event, ownerUserId, id)
-  if (!relay.encryptedCheckinToken) throw createError({ statusCode: 409, message: '请先在中转设置中配置 NewAPI 访问令牌' })
-  const token = decryptContextSecret(relay.encryptedCheckinToken, `user-relay-checkin:${id}`, event)
-  const headers: Record<string, string> = { authorization: `Bearer ${token}`, accept: 'application/json' }
-  if (relay.checkinUserId) headers['new-api-user'] = relay.checkinUserId
+  if (!relay.userRelayGroupId) throw createError({ statusCode: 409, message: '中转账号尚未归入站点组' })
+  const group = await ownedRelayGroup(event, ownerUserId, relay.userRelayGroupId)
+  const platform = relayPlatformDefinition(group.platformType)
+  if (!platform.supportsBalance) throw createError({ statusCode: 409, message: '通用兼容站未配置余额接口' })
+  let path: string
+  let headers: Record<string, string>
+  if (group.platformType === 'newapi') {
+    if (!relay.encryptedCheckinToken) throw createError({ statusCode: 409, message: '请先配置 NewAPI 控制台访问令牌' })
+    const token = decryptContextSecret(relay.encryptedCheckinToken, `user-relay-checkin:${id}`, event)
+    path = '/api/user/self'
+    headers = { authorization: `Bearer ${token}`, accept: 'application/json' }
+    if (relay.checkinUserId) headers['new-api-user'] = relay.checkinUserId
+  } else {
+    path = '/v1/usage'
+    headers = { authorization: `Bearer ${decryptChannelSecret(relay.encryptedApiKey, relay.id, 'user', event)}`, accept: 'application/json' }
+  }
   let result
   try {
-    result = await pinnedUpstreamFetch(relay.baseUrl, '/api/user/self', { method: 'GET', headers, signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 30_000)) })
+    result = await pinnedUpstreamFetch(relay.baseUrl, path, { method: 'GET', headers, signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 30_000)) })
     const raw = await result.response.text()
     await result.close().catch(() => {})
-    let payload: unknown = null
-    try { payload = raw ? JSON.parse(raw) : null } catch {}
-    const root = balanceRecord(payload)
-    const data = balanceRecord(root.data)
-    const nested = balanceRecord(data.data)
-    const source = Object.keys(nested).length ? nested : data
-    const ratio = 500_000
-    const exchangeRate = 1
-    const values = newApiBalanceQuotaValues(source)
-    const rawQuota = values.quota
-    const rawUsedQuota = values.usedQuota
-    const quota = rawQuota === null ? null : rawQuota / ratio * exchangeRate
-    const usedQuota = rawUsedQuota === null ? null : rawUsedQuota / ratio * exchangeRate
-    // NewAPI 的 quota 字段是当前余额，used_quota 是历史消耗；与 switch 的默认配额模式一致。
-    return { id, name: relay.name, quota, usedQuota, remaining: quota, currency: typeof source.currency === 'string' ? source.currency : 'CNY', fetchedAt: Date.now() }
+    if (!result.response.ok) throw createError({ statusCode: 502, message: `余额查询失败：HTTP ${result.response.status} ${redactSensitiveText(raw).slice(0, 300)}` })
+    let payload: unknown
+    try { payload = raw ? JSON.parse(raw) : {} } catch { throw createError({ statusCode: 502, message: '余额接口未返回有效 JSON' }) }
+    const values = group.platformType === 'newapi' ? parseNewApiBalance(payload) : parseSub2ApiBalance(payload)
+    const now = new Date()
+    const depleted = values.remainingBalance !== null && values.remainingBalance <= 0
+    await useDatabase(event).insert(userRelayAccountStates).values({
+      channelId: id,
+      totalQuota: values.totalQuota === null ? null : String(values.totalQuota),
+      purchasedQuota: values.purchasedQuota === null ? null : String(values.purchasedQuota),
+      giftQuota: values.giftQuota === null ? null : String(values.giftQuota),
+      usedQuota: values.usedQuota === null ? null : String(values.usedQuota),
+      remainingBalance: values.remainingBalance === null ? null : String(values.remainingBalance),
+      currency: values.currency,
+      balanceSource: values.source,
+      balanceStatus: 'success',
+      balanceFetchedAt: now,
+      balanceError: null,
+      routingState: depleted ? 'depleted' : 'active',
+      stateReasonCode: depleted ? 'balance_zero' : null,
+      stateReasonMessage: depleted ? '余额刷新结果为零，等待下次手工刷新' : null,
+      stateChangedAt: now,
+      updatedAt: now
+    }).onConflictDoUpdate({
+      target: userRelayAccountStates.channelId,
+      set: {
+        totalQuota: values.totalQuota === null ? null : String(values.totalQuota), purchasedQuota: values.purchasedQuota === null ? null : String(values.purchasedQuota),
+        giftQuota: values.giftQuota === null ? null : String(values.giftQuota), usedQuota: values.usedQuota === null ? null : String(values.usedQuota),
+        remainingBalance: values.remainingBalance === null ? null : String(values.remainingBalance), currency: values.currency, balanceSource: values.source,
+        balanceStatus: 'success', balanceFetchedAt: now, balanceError: null, routingState: depleted ? 'depleted' : 'active',
+        stateReasonCode: depleted ? 'balance_zero' : null, stateReasonMessage: depleted ? '余额刷新结果为零，等待下次手工刷新' : null,
+        stateChangedAt: now, version: sql`${userRelayAccountStates.version} + 1`, updatedAt: now
+      }
+    })
+    return {
+      id, name: relay.name, quota: values.totalQuota, purchasedQuota: values.purchasedQuota, giftQuota: values.giftQuota,
+      usedQuota: values.usedQuota, remaining: values.remainingBalance, currency: values.currency, fetchedAt: now.getTime(), routingState: depleted ? 'depleted' : 'active'
+    }
   } catch (error) {
     const detail = upstreamNetworkError(error)
+    const now = new Date()
+    await useDatabase(event).insert(userRelayAccountStates).values({ channelId: id, balanceStatus: 'error', balanceFetchedAt: now, balanceError: detail.message, updatedAt: now })
+      .onConflictDoUpdate({ target: userRelayAccountStates.channelId, set: { balanceStatus: 'error', balanceFetchedAt: now, balanceError: detail.message, version: sql`${userRelayAccountStates.version} + 1`, updatedAt: now } })
     throw createError({ statusCode: 502, message: detail.message || '余额查询失败' })
   }
 }
@@ -128,26 +261,18 @@ export async function listUserRelayOrder(event: H3Event, ownerUserId: string) {
     getActiveSubscription(event, ownerUserId),
     db.select().from(userPoolGroups).where(eq(userPoolGroups.ownerUserId, ownerUserId)).limit(1)
   ])
-  const relays = await db.select({
-    id: channels.id,
-    name: channels.name,
-    priority: channels.priority,
-    enabled: channels.enabled,
-    healthStatus: channels.healthStatus,
-    lastHealthCheckAt: channels.lastHealthCheckAt,
-    lastHealthError: channels.lastHealthError
-  }).from(channels).where(and(eq(channels.ownerKind, 'user'), eq(channels.ownerUserId, ownerUserId))).orderBy(asc(channels.priority), asc(channels.name))
-  const sourceIds = await getUserFailoverSourceIds(event, ownerUserId, relays.map(relay => relay.id))
-  const relayMap = new Map(await Promise.all(relays.map(async relay => [relaySourceId(relay.id), {
-    id: relaySourceId(relay.id),
-    sourceId: relay.id,
+  const groups = await listUserRelayGroups(event, ownerUserId)
+  const sourceIds = await getUserFailoverSourceIds(event, ownerUserId, groups.map(group => group.id))
+  const relayMap = new Map(groups.map(group => [relayGroupSourceId(group.id), {
+    id: relayGroupSourceId(group.id),
+    sourceId: group.id,
     sourceType: 'user_relay' as const,
-    name: relay.name,
-    enabled: relay.enabled,
-    healthStatus: relay.healthStatus,
-    circuitState: await channelCircuitState(event, relay.id),
-    lastHealthCheckAt: relay.lastHealthCheckAt?.getTime() || null
-  }] as const)))
+    name: group.name,
+    enabled: group.enabled && group.accounts.some(account => account.enabled),
+    healthStatus: group.accounts.some(account => account.healthStatus === 'healthy' && account.state.routingState === 'active') ? 'healthy' : group.accounts.some(account => account.healthStatus === 'unknown' && account.state.routingState === 'active') ? 'unknown' : 'unhealthy',
+    circuitState: group.accounts.some(account => account.circuitState === 'closed' && account.state.routingState === 'active') ? 'closed' as const : 'open' as const,
+    lastHealthCheckAt: group.accounts.reduce<number | null>((latest, account) => Math.max(latest || 0, account.lastHealthCheckAt || 0) || null, null)
+  }] as const))
   const packageItem = {
     id: PACKAGE_SOURCE_ID,
     sourceId: subscription?.subscription.id || null,
@@ -174,16 +299,16 @@ export async function listUserRelayOrder(event: H3Event, ownerUserId: string) {
 
 export async function reorderUserRelays(event: H3Event, ownerUserId: string, value: unknown) {
   const db = useDatabase(event)
-  const current = await db.select({ id: channels.id }).from(channels).where(and(eq(channels.ownerKind, 'user'), eq(channels.ownerUserId, ownerUserId))).orderBy(asc(channels.priority), asc(channels.name))
-  const currentSourceIds = await getUserFailoverSourceIds(event, ownerUserId, current.map(relay => relay.id))
+  const current = await db.select({ id: userRelayGroups.id }).from(userRelayGroups).where(eq(userRelayGroups.ownerUserId, ownerUserId)).orderBy(asc(userRelayGroups.createdAt), asc(userRelayGroups.name))
+  const currentSourceIds = await getUserFailoverSourceIds(event, ownerUserId, current.map(group => group.id))
   const orderedIds = normalizeUserRelayOrder(currentSourceIds, value)
   const updatedAt = new Date()
   await db.insert(userRoutePreferences).values({ userId: ownerUserId, orderedSourceIds: orderedIds, updatedAt }).onConflictDoUpdate({ target: userRoutePreferences.userId, set: { orderedSourceIds: orderedIds, updatedAt } })
-  const relayIds = orderedIds.filter(id => id.startsWith('relay:')).map(id => id.slice(6))
-  for (const [index, id] of relayIds.entries()) {
-    await db.update(channels).set({ priority: (index + 1) * 10, updatedAt }).where(and(eq(channels.id, id), eq(channels.ownerKind, 'user'), eq(channels.ownerUserId, ownerUserId)))
+  const relayGroupIds = orderedIds.filter(id => id.startsWith('relay_group:')).map(id => id.slice(12))
+  for (const [index, id] of relayGroupIds.entries()) {
+    await db.update(channels).set({ priority: (index + 1) * 10, updatedAt }).where(and(eq(channels.userRelayGroupId, id), eq(channels.ownerKind, 'user'), eq(channels.ownerUserId, ownerUserId)))
   }
-  await invalidateChannelAccess(event, relayIds)
+  await invalidateChannelAccess(event, (await db.select({ id: channels.id }).from(channels).where(and(eq(channels.ownerKind, 'user'), eq(channels.ownerUserId, ownerUserId)))).map(row => row.id))
   return listUserRelayOrder(event, ownerUserId)
 }
 
@@ -231,44 +356,60 @@ function requireProbeModels(protocols: ReturnType<typeof parseChannelProtocols>)
 }
 
 export async function createUserRelay(event: H3Event, ownerUserId: string, body: Input) {
-  const allowed = new Set(['name', 'baseUrl', 'apiKey', 'protocols', 'models', 'enabled', 'weight', 'maxConcurrency', 'timeoutMs', 'checkinEnabled', 'checkinToken', 'checkinUserId', 'modelDiscoveryEnabled', 'clientIdentityMode'])
+  const allowed = new Set(['name', 'baseUrl', 'apiKey', 'protocols', 'models', 'enabled', 'weight', 'maxConcurrency', 'timeoutMs', 'checkinEnabled', 'checkinToken', 'checkinUserId', 'clientIdentityMode', 'groupId', 'groupName', 'platformType', 'accountLabel', 'homepageUrl', 'insecureHttpAcknowledged'])
   const invalid = Object.keys(body).filter(key => !allowed.has(key))
   if (invalid.length) throw createError({ statusCode: 400, message: `用户不能设置字段：${invalid.join(', ')}` })
-  const [lastPriority] = await useDatabase(event).select({ value: max(channels.priority) }).from(channels).where(and(eq(channels.ownerKind, 'user'), eq(channels.ownerUserId, ownerUserId)))
+  const db = useDatabase(event)
   const name = text(body.name, 120)
   const apiKey = text(body.apiKey, 2000)
   const checkinToken = text(body.checkinToken, 4096)
   const checkinEnabled = body.checkinEnabled === true
   const baseUrl = normalizeUserUpstreamUrl(text(body.baseUrl, 1000))
   if (!name || !apiKey) throw createError({ statusCode: 400, message: '名称、地址和 API Key 均为必填项' })
-  if (checkinEnabled && !checkinToken) throw createError({ statusCode: 400, message: '启用签到时必须填写 NewAPI 控制台访问令牌' })
+  const requestedPlatform = relayPlatform(body.platformType)
+  let group = text(body.groupId, 100) ? await ownedRelayGroup(event, ownerUserId, text(body.groupId, 100)) : null
+  if (group && 'platformType' in body && group.platformType !== requestedPlatform) throw createError({ statusCode: 409, message: '同一站点组的平台类型必须一致' })
+  const platformType: RelayPlatformType = group?.platformType || requestedPlatform
+  const platform = relayPlatformDefinition(platformType)
+  if (checkinEnabled && !platform.supportsCheckin) throw createError({ statusCode: 400, message: `${platform.label} 不支持 Hub 签到` })
+  if (checkinEnabled && !checkinToken) throw createError({ statusCode: 400, message: '启用签到时必须填写控制台访问令牌' })
+  const insecureHttp = new URL(baseUrl).protocol === 'http:'
+  if (insecureHttp && body.insecureHttpAcknowledged !== true) throw createError({ statusCode: 400, message: '使用 HTTP 中转前必须确认 API Key 和请求内容将以明文传输' })
   await resolvePublicUpstream(baseUrl)
   validateModelCount(body.models)
   const provisionalType: ChannelType = Array.isArray(body.protocols) && body.protocols.some(item => item && typeof item === 'object' && (item as Input).protocol === 'anthropic_messages') ? 'anthropic_compatible' : 'openai_compatible'
   const protocols = await validateUserProtocols(parseChannelProtocols(body.protocols, provisionalType))
   if (!protocols.length) throw createError({ statusCode: 400, message: '请至少选择一种上游协议' })
   requireProbeModels(protocols)
+  if (!group) {
+    const [createdGroup] = await db.insert(userRelayGroups).values({
+      ownerUserId,
+      name: text(body.groupName, 120) || name,
+      homepageUrl: normalizeUserUpstreamUrl(text(body.homepageUrl, 1000) || baseUrl),
+      normalizedOrigin: new URL(baseUrl).origin.toLowerCase(),
+      platformType,
+      enabled: body.enabled !== false
+    }).returning()
+    group = createdGroup || null
+  }
+  if (!group) throw createError({ statusCode: 500, message: '创建中转站失败' })
+  const [lastRank] = await db.select({ value: max(channels.accountRank) }).from(channels).where(eq(channels.userRelayGroupId, group.id))
+  const [lastPriority] = await db.select({ value: max(channels.priority) }).from(channels).where(and(eq(channels.ownerKind, 'user'), eq(channels.ownerUserId, ownerUserId)))
   const id = randomUUID()
   const timeoutMs = integer(body.timeoutMs, 1000, 600000, 120000)
-  const modelDiscoveryEnabled = body.modelDiscoveryEnabled !== false
-  let models = parseChannelModels(body.models)
-  if (modelDiscoveryEnabled) {
-    try {
-      const discovered = await discoverPrivateModels(baseUrl, apiKey, timeoutMs, protocols)
-      models = [...new Map([...discovered, ...models].map(model => [model.publicModel, model])).values()]
-    } catch (error) {
-      if (!models.length) throw error
-    }
-  }
-  if (!models.length) throw createError({ statusCode: 400, message: '关闭自动模型发现时，请至少手工添加一个模型' })
-  const [created] = await useDatabase(event).insert(channels).values({
+  const models = parseChannelModels(body.models)
+  if (!models.length) throw createError({ statusCode: 400, message: '请先点击获取模型，或至少手工添加一个模型' })
+  const [created] = await db.insert(channels).values({
     id,
     name,
-    type: relayType(protocols),
+    type: platformType === 'sub2api' ? 'sub2api' : relayType(protocols),
     baseUrl,
     encryptedApiKey: encryptChannelSecret(apiKey, id, 'user', event),
     ownerKind: 'user',
     ownerUserId,
+    userRelayGroupId: group.id,
+    accountLabel: text(body.accountLabel, 120) || name,
+    accountRank: Math.min(10000, Number(lastRank?.value || 0) + 10),
     accessScope: 'private',
     createdBy: ownerUserId,
     credentialKeyVersion: 'v2',
@@ -277,8 +418,8 @@ export async function createUserRelay(event: H3Event, ownerUserId: string, body:
     weight: integer(body.weight, 1, 1000, 1),
     maxConcurrency: integer(body.maxConcurrency, 1, 1000, 5),
     timeoutMs,
-    modelDiscoveryEnabled,
     clientIdentityMode: body.clientIdentityMode === 'passthrough' ? 'passthrough' : 'standard',
+    insecureHttpAcknowledgedAt: insecureHttp ? new Date() : null,
     checkinEnabled,
     encryptedCheckinToken: checkinToken ? encryptContextSecret(checkinToken, `user-relay-checkin:${id}`, event) : null,
     checkinUserId: text(body.checkinUserId, 120) || null
@@ -286,18 +427,21 @@ export async function createUserRelay(event: H3Event, ownerUserId: string, body:
   if (!created) throw createError({ statusCode: 500, message: '创建中转失败' })
   const protocolRows = await replaceChannelProtocols(event, id, protocols)
   await replaceChannelModels(event, id, models, protocolRows)
+  await db.insert(userRelayAccountStates).values({ channelId: id }).onConflictDoNothing()
   return getUserRelay(event, ownerUserId, id)
 }
 
 export async function updateUserRelay(event: H3Event, ownerUserId: string, id: string, body: Input) {
   const relay = await ownedRelay(event, ownerUserId, id)
-  const allowed = new Set(['name', 'baseUrl', 'apiKey', 'protocols', 'models', 'enabled', 'weight', 'maxConcurrency', 'timeoutMs', 'checkinEnabled', 'checkinToken', 'checkinUserId', 'modelDiscoveryEnabled', 'clientIdentityMode'])
+  const allowed = new Set(['name', 'baseUrl', 'apiKey', 'protocols', 'models', 'enabled', 'weight', 'maxConcurrency', 'timeoutMs', 'checkinEnabled', 'checkinToken', 'checkinUserId', 'clientIdentityMode', 'accountLabel', 'insecureHttpAcknowledged'])
   const invalid = Object.keys(body).filter(key => !allowed.has(key))
   if (invalid.length) throw createError({ statusCode: 400, message: `用户不能修改字段：${invalid.join(', ')}` })
   const patch: Partial<typeof channels.$inferInsert> = { updatedAt: new Date() }
   if ('name' in body) patch.name = text(body.name, 120) || relay.name
   if ('baseUrl' in body) {
     patch.baseUrl = normalizeUserUpstreamUrl(text(body.baseUrl, 1000))
+    if (new URL(patch.baseUrl).protocol === 'http:' && body.insecureHttpAcknowledged !== true && !relay.insecureHttpAcknowledgedAt) throw createError({ statusCode: 400, message: '使用 HTTP 中转前必须确认 API Key 和请求内容将以明文传输' })
+    patch.insecureHttpAcknowledgedAt = new URL(patch.baseUrl).protocol === 'http:' ? relay.insecureHttpAcknowledgedAt || new Date() : null
     await resolvePublicUpstream(patch.baseUrl)
   }
   if (text(body.apiKey, 2000)) patch.encryptedApiKey = encryptChannelSecret(text(body.apiKey, 2000), relay.id, 'user', event)
@@ -305,9 +449,9 @@ export async function updateUserRelay(event: H3Event, ownerUserId: string, id: s
   if ('weight' in body) patch.weight = integer(body.weight, 1, 1000, relay.weight)
   if ('maxConcurrency' in body) patch.maxConcurrency = integer(body.maxConcurrency, 1, 1000, relay.maxConcurrency)
   if ('timeoutMs' in body) patch.timeoutMs = integer(body.timeoutMs, 1000, 600000, relay.timeoutMs)
-  if ('modelDiscoveryEnabled' in body) patch.modelDiscoveryEnabled = body.modelDiscoveryEnabled !== false
   if ('clientIdentityMode' in body) patch.clientIdentityMode = body.clientIdentityMode === 'passthrough' ? 'passthrough' : 'standard'
-  if ('modelDiscoveryEnabled' in body || 'clientIdentityMode' in body || 'protocols' in body) {
+  if ('accountLabel' in body) patch.accountLabel = text(body.accountLabel, 120) || relay.accountLabel || relay.name
+  if ('clientIdentityMode' in body || 'protocols' in body || 'baseUrl' in body || text(body.apiKey, 2000)) {
     patch.healthStatus = 'unknown'
     patch.lastHealthError = null
   }
@@ -330,7 +474,7 @@ export async function updateUserRelay(event: H3Event, ownerUserId: string, id: s
   await useDatabase(event).update(channels).set(patch).where(and(eq(channels.id, id), eq(channels.ownerUserId, ownerUserId)))
   if ('models' in body) {
     const models = parseChannelModels(body.models)
-    if (!models.length && (patch.modelDiscoveryEnabled ?? relay.modelDiscoveryEnabled) === false) throw createError({ statusCode: 400, message: '关闭自动模型发现时，请至少手工添加一个模型' })
+    if (!models.length) throw createError({ statusCode: 400, message: '请先点击获取模型，或至少手工添加一个模型' })
     await replaceChannelModels(event, id, models, protocols)
   } else if ('protocols' in body) {
     const models = await useDatabase(event).select().from(channelModels).where(eq(channelModels.channelId, id))
@@ -350,8 +494,54 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
   const relay = await ownedRelay(event, ownerUserId, id)
   const protocols = await useDatabase(event).select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, id))
   const apiKey = decryptChannelSecret(relay.encryptedApiKey, relay.id, 'user', event)
+  const firstProtocol = protocols[0]
+  const connectivity = {
+    endpoint: userUpstreamTarget(firstProtocol?.baseUrlOverride || relay.baseUrl, '/v1/models'),
+    ok: false,
+    reachable: false,
+    status: null as number | null,
+    latencyMs: 0,
+    errorCode: null as string | null,
+    message: null as string | null,
+    modelCount: 0,
+    authScheme: (firstProtocol?.authScheme || 'bearer') as ChannelAuthScheme,
+    attemptedAuthSchemes: [] as ChannelAuthScheme[]
+  }
+  const connectivityStarted = Date.now()
+  try {
+    const probe = await probeAuthSchemes(connectivity.authScheme, async (authScheme) => {
+      const result = await pinnedUpstreamFetch(firstProtocol?.baseUrlOverride || relay.baseUrl, '/v1/models', {
+        method: 'GET',
+        headers: upstreamAuthHeaders(authScheme, apiKey, firstProtocol?.apiVersion),
+        signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 15000))
+      })
+      connectivity.endpoint = result.target
+      const body = await result.response.text()
+      const response = { ok: result.response.ok, status: result.response.status, body }
+      await result.close().catch(() => {})
+      return response
+    })
+    const final = probe.attempts.at(-1)!
+    connectivity.reachable = true
+    connectivity.ok = probe.ok
+    connectivity.status = final.status
+    connectivity.authScheme = probe.selectedAuthScheme || final.authScheme
+    connectivity.attemptedAuthSchemes = probe.attempts.map(attempt => attempt.authScheme)
+    if (probe.ok) {
+      try { connectivity.modelCount = modelIdsFromPayload(JSON.parse(final.body)).length } catch {}
+      if (!connectivity.modelCount) connectivity.message = '模型接口可访问，但没有识别到模型；检测不会自动修改模型目录'
+    } else {
+      connectivity.errorCode = final.status ? `HTTP_${final.status}` : 'UPSTREAM_ERROR'
+      connectivity.message = `${final.status ? `HTTP ${final.status}: ` : ''}${redactSensitiveText(final.body)}`.slice(0, 500)
+    }
+  } catch (error) {
+    const detail = upstreamNetworkError(error)
+    connectivity.errorCode = detail.code
+    connectivity.message = detail.message
+  }
+  connectivity.latencyMs = Date.now() - connectivityStarted
   const results = []
-  for (const protocol of protocols) {
+  for (const protocol of connectivity.reachable ? protocols : []) {
     const model = protocol.probeModel
     if (!model) {
       const message = '该协议尚未指定检测模型，请编辑中转后再检测'
@@ -397,13 +587,21 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
       message = detail.message
     }
     const clientIdentityRejected = attempts.some(attempt => isClientIdentityRejection(attempt.body))
-    await useDatabase(event).update(channelProtocolBindings).set({ verificationStatus: ok ? 'verified' : 'failed', verifiedAt: new Date(), lastError: message, updatedAt: new Date() }).where(and(eq(channelProtocolBindings.id, protocol.id), eq(channelProtocolBindings.channelId, relay.id)))
+    const verificationStatus = ok ? 'verified' : clientIdentityRejected ? 'pending_real_client' : 'failed'
+    await useDatabase(event).update(channelProtocolBindings).set({ verificationStatus, verifiedAt: new Date(), lastError: message, updatedAt: new Date() }).where(and(eq(channelProtocolBindings.id, protocol.id), eq(channelProtocolBindings.channelId, relay.id)))
     results.push({ protocol: protocol.protocol, endpoint, ok, status, latencyMs: Date.now() - started, errorCode, message, authScheme: selectedAuthScheme || protocol.authScheme, attemptedAuthSchemes: attempts.map(attempt => attempt.authScheme), clientIdentityRejected, clientIdentityProbed: relay.clientIdentityMode === 'passthrough' })
   }
-  const healthy = results.some(result => result.ok)
-  const pendingClientVerification = !healthy && relay.clientIdentityMode === 'passthrough' && relay.modelDiscoveryEnabled === false && results.some(result => result.clientIdentityRejected)
-  await useDatabase(event).update(channels).set({ healthStatus: healthy ? 'healthy' : pendingClientVerification ? 'unknown' : 'unhealthy', lastHealthCheckAt: new Date(), lastHealthError: healthy ? null : pendingClientVerification ? '上游要求受支持的客户端身份，等待真实 Claude Code / Codex 请求验证' : results.map(result => `${result.protocol}: ${result.errorCode ? `[${result.errorCode}] ` : ''}${result.message || '检测失败'}`).join('\n').slice(0, 2000), updatedAt: new Date() }).where(and(eq(channels.id, id), eq(channels.ownerUserId, ownerUserId)))
-  return { healthy, pendingClientVerification, results }
+  const passed = results.filter(result => result.ok).length
+  const pendingClientVerification = results.some(result => result.clientIdentityRejected)
+  const healthy = passed > 0
+  const summaryStatus = !connectivity.reachable ? 'unavailable' : passed === protocols.length && protocols.length ? 'all_available' : healthy ? 'partially_available' : pendingClientVerification ? 'pending_real_client' : 'unavailable'
+  const healthStatus = healthy ? 'healthy' : pendingClientVerification ? 'unknown' : 'unhealthy'
+  const lastHealthError = summaryStatus === 'all_available' ? null
+    : !connectivity.reachable ? connectivity.message
+      : pendingClientVerification && !healthy ? '上游要求受支持的客户端身份，等待真实 Claude Code / Codex 请求验证'
+        : results.filter(result => !result.ok).map(result => `${result.protocol}: ${result.errorCode ? `[${result.errorCode}] ` : ''}${result.message || '检测失败'}`).join('\n').slice(0, 2000)
+  await useDatabase(event).update(channels).set({ healthStatus, lastHealthCheckAt: new Date(), lastHealthError, updatedAt: new Date() }).where(and(eq(channels.id, id), eq(channels.ownerUserId, ownerUserId)))
+  return { healthy, summaryStatus, pendingClientVerification, connectivity, results }
 }
 
 export async function syncUserRelayModels(event: H3Event, ownerUserId: string, id: string) {
@@ -484,10 +682,208 @@ export async function checkinAllUserRelays(event: H3Event, ownerUserId: string) 
   return { results, summary: { total: results.length, success: results.filter(result => result.success).length, failed: results.filter(result => !result.success).length } }
 }
 
+export async function updateUserRelayGroup(event: H3Event, ownerUserId: string, id: string, body: Input) {
+  const group = await ownedRelayGroup(event, ownerUserId, id)
+  const db = useDatabase(event)
+  const patch: Partial<typeof userRelayGroups.$inferInsert> = { updatedAt: new Date() }
+  if ('name' in body) patch.name = text(body.name, 120) || group.name
+  if ('homepageUrl' in body) {
+    const rawHomepage = text(body.homepageUrl, 1000)
+    if (rawHomepage) {
+      const homepage = normalizeUserUpstreamUrl(rawHomepage)
+      patch.homepageUrl = homepage
+      patch.normalizedOrigin = new URL(homepage).origin.toLowerCase()
+    } else {
+      patch.homepageUrl = null
+      patch.normalizedOrigin = null
+    }
+  }
+  if ('enabled' in body) patch.enabled = body.enabled === true
+  if ('accountOrderMode' in body && (body.accountOrderMode === 'manual' || body.accountOrderMode === 'balance_asc' || body.accountOrderMode === 'balance_desc')) patch.accountOrderMode = body.accountOrderMode
+  if ('maxConcurrency' in body) patch.maxConcurrency = body.maxConcurrency === null ? null : integer(body.maxConcurrency, 1, 10000, group.maxConcurrency || 100)
+  if ('platformType' in body) {
+    const next = relayPlatform(body.platformType)
+    patch.platformType = next
+    if (next !== 'newapi') await db.update(channels).set({ checkinEnabled: false, updatedAt: new Date() }).where(eq(channels.userRelayGroupId, id))
+    if (next !== group.platformType) {
+      const accountIds = await db.select({ id: channels.id }).from(channels).where(eq(channels.userRelayGroupId, id))
+      if (accountIds.length) await db.update(channelProtocolBindings).set({ verificationStatus: 'unknown', verifiedAt: null, lastError: null, updatedAt: new Date() }).where(inArray(channelProtocolBindings.channelId, accountIds.map(item => item.id)))
+    }
+  }
+  await db.update(userRelayGroups).set(patch).where(and(eq(userRelayGroups.id, id), eq(userRelayGroups.ownerUserId, ownerUserId)))
+  return (await listUserRelayGroups(event, ownerUserId)).find(item => item.id === id)!
+}
+
+export async function reorderUserRelayAccounts(event: H3Event, ownerUserId: string, groupId: string, value: unknown) {
+  await ownedRelayGroup(event, ownerUserId, groupId)
+  const db = useDatabase(event)
+  const current = await db.select({ id: channels.id }).from(channels).where(and(eq(channels.userRelayGroupId, groupId), eq(channels.ownerUserId, ownerUserId), eq(channels.ownerKind, 'user'))).orderBy(asc(channels.accountRank), asc(channels.createdAt))
+  if (!Array.isArray(value)) throw createError({ statusCode: 400, message: '账号顺序格式无效' })
+  const ordered = value.filter((item): item is string => typeof item === 'string' && current.some(row => row.id === item))
+  if (ordered.length !== current.length || new Set(ordered).size !== current.length) throw createError({ statusCode: 409, message: '账号列表已变化，请刷新后重新排序' })
+  const now = new Date()
+  await db.transaction(async tx => {
+    for (const [index, id] of ordered.entries()) await tx.update(channels).set({ accountRank: (index + 1) * 10, updatedAt: now }).where(eq(channels.id, id))
+  })
+  return (await listUserRelayGroups(event, ownerUserId)).find(item => item.id === groupId)!
+}
+
+export async function moveUserRelayAccount(event: H3Event, ownerUserId: string, groupId: string, channelId: string, targetGroupId: string) {
+  const source = await ownedRelayGroup(event, ownerUserId, groupId)
+  const target = await ownedRelayGroup(event, ownerUserId, targetGroupId)
+  const relay = await ownedRelay(event, ownerUserId, channelId)
+  if (relay.userRelayGroupId !== source.id) throw createError({ statusCode: 409, message: '账号不属于当前站点，请刷新后重试' })
+  if (source.id === target.id) return target
+  const db = useDatabase(event)
+  const [last] = await db.select({ rank: max(channels.accountRank) }).from(channels).where(eq(channels.userRelayGroupId, target.id))
+  await db.update(channels).set({
+    userRelayGroupId: target.id,
+    accountRank: Number(last?.rank || 0) + 10,
+    checkinEnabled: target.platformType === 'newapi' ? relay.checkinEnabled : false,
+    updatedAt: new Date()
+  }).where(and(eq(channels.id, channelId), eq(channels.ownerUserId, ownerUserId)))
+  const [remaining] = await db.select({ count: sql<number>`count(*)` }).from(channels).where(eq(channels.userRelayGroupId, source.id))
+  if (Number(remaining?.count || 0) === 0) {
+    await db.delete(userRelayGroups).where(eq(userRelayGroups.id, source.id))
+    const [preference] = await db.select().from(userRoutePreferences).where(eq(userRoutePreferences.userId, ownerUserId)).limit(1)
+    if (preference) {
+      const sourceId = relayGroupSourceId(source.id)
+      await db.update(userRoutePreferences).set({ orderedSourceIds: preference.orderedSourceIds.filter(id => id !== sourceId), updatedAt: new Date() }).where(eq(userRoutePreferences.userId, ownerUserId))
+    }
+  }
+  await invalidateChannelAccess(event, [channelId])
+  return (await listUserRelayGroups(event, ownerUserId)).find(group => group.id === target.id)!
+}
+
+export async function mergeUserRelayGroups(event: H3Event, ownerUserId: string, targetGroupId: string, sourceGroupIds: unknown) {
+  const target = await ownedRelayGroup(event, ownerUserId, targetGroupId)
+  if (!Array.isArray(sourceGroupIds)) throw createError({ statusCode: 400, message: '待合并站点格式无效' })
+  const ids = [...new Set(sourceGroupIds.filter((id): id is string => typeof id === 'string' && id !== target.id))]
+  if (!ids.length) return target
+  const sources: Array<typeof userRelayGroups.$inferSelect> = []
+  for (const id of ids) sources.push(await ownedRelayGroup(event, ownerUserId, id))
+  const db = useDatabase(event)
+  const targetRows = await db.select({ rank: channels.accountRank }).from(channels).where(eq(channels.userRelayGroupId, target.id))
+  let rank = Math.max(0, ...targetRows.map(row => row.rank))
+  const movedIds: string[] = []
+  await db.transaction(async tx => {
+    for (const source of sources) {
+      const accounts = await tx.select({ id: channels.id }).from(channels).where(eq(channels.userRelayGroupId, source.id)).orderBy(asc(channels.accountRank), asc(channels.createdAt))
+      for (const account of accounts) {
+        rank += 10; movedIds.push(account.id)
+        await tx.update(channels).set({ userRelayGroupId: target.id, accountRank: rank, checkinEnabled: target.platformType === 'newapi' ? undefined : false, updatedAt: new Date() }).where(eq(channels.id, account.id))
+      }
+      await tx.delete(userRelayGroups).where(eq(userRelayGroups.id, source.id))
+    }
+    const [preference] = await tx.select().from(userRoutePreferences).where(eq(userRoutePreferences.userId, ownerUserId)).limit(1)
+    if (preference) {
+      const mergedIds = new Set([relayGroupSourceId(target.id), ...sources.map(source => relayGroupSourceId(source.id))])
+      const first = preference.orderedSourceIds.findIndex(id => mergedIds.has(id))
+      const retained = preference.orderedSourceIds.filter(id => !mergedIds.has(id))
+      retained.splice(first < 0 ? retained.length : first, 0, relayGroupSourceId(target.id))
+      await tx.update(userRoutePreferences).set({ orderedSourceIds: retained, updatedAt: new Date() }).where(eq(userRoutePreferences.userId, ownerUserId))
+    }
+  })
+  await invalidateChannelAccess(event, movedIds)
+  return (await listUserRelayGroups(event, ownerUserId)).find(group => group.id === target.id)!
+}
+
+export async function getUserRelayCredentials(event: H3Event, ownerUserId: string, id: string) {
+  const relay = await ownedRelay(event, ownerUserId, id)
+  return {
+    id,
+    apiKey: decryptChannelSecret(relay.encryptedApiKey, relay.id, 'user', event),
+    checkinToken: relay.encryptedCheckinToken ? decryptContextSecret(relay.encryptedCheckinToken, `user-relay-checkin:${id}`, event) : '',
+    checkinUserId: relay.checkinUserId || ''
+  }
+}
+
+export async function duplicateUserRelay(event: H3Event, ownerUserId: string, id: string, body: Input) {
+  const relay = await ownedRelay(event, ownerUserId, id)
+  const view = (await listUserRelays(event, ownerUserId)).find(item => item.id === id)
+  if (!view) throw createError({ statusCode: 404, message: '中转账号不存在' })
+  const credentials = await getUserRelayCredentials(event, ownerUserId, id)
+  const createInGroup = body.newGroup !== true
+  const result = await createUserRelay(event, ownerUserId, {
+    name: text(body.name, 120) || `${relay.name} - 副本`,
+    accountLabel: text(body.accountLabel, 120) || `${relay.accountLabel || relay.name} - 副本`,
+    groupId: createInGroup ? relay.userRelayGroupId || undefined : undefined,
+    groupName: createInGroup ? undefined : text(body.groupName, 120) || `${relay.name} - 副本`,
+    homepageUrl: createInGroup ? undefined : text(body.homepageUrl, 1000) || relay.baseUrl,
+    platformType: createInGroup
+      ? relay.userRelayGroupId ? (await ownedRelayGroup(event, ownerUserId, relay.userRelayGroupId)).platformType : 'generic'
+      : relayPlatform(body.platformType),
+    baseUrl: text(body.baseUrl, 1000) || relay.baseUrl,
+    apiKey: text(body.apiKey, 2000) || credentials.apiKey,
+    protocols: view.protocols.map(protocol => ({ ...protocol, verificationStatus: 'unknown', verifiedAt: null, lastError: null })),
+    models: view.models,
+    enabled: body.enabled === undefined ? true : body.enabled,
+    weight: relay.weight,
+    maxConcurrency: relay.maxConcurrency,
+    timeoutMs: relay.timeoutMs,
+    checkinEnabled: body.checkinEnabled === undefined ? relay.checkinEnabled : body.checkinEnabled,
+    checkinToken: text(body.checkinToken, 4096) || credentials.checkinToken,
+    checkinUserId: text(body.checkinUserId, 120) || credentials.checkinUserId,
+    clientIdentityMode: relay.clientIdentityMode,
+    insecureHttpAcknowledged: new URL(text(body.baseUrl, 1000) || relay.baseUrl).protocol === 'http:'
+  })
+  return result
+}
+
+export async function deleteUserRelayGroup(event: H3Event, ownerUserId: string, id: string, deleteAccounts = false) {
+  await ownedRelayGroup(event, ownerUserId, id)
+  const [summary] = await useDatabase(event).select({ count: sql<number>`count(*)` }).from(channels).where(and(eq(channels.userRelayGroupId, id), eq(channels.ownerUserId, ownerUserId)))
+  if (Number(summary?.count || 0) > 0 && !deleteAccounts) throw createError({ statusCode: 409, message: '站点内仍有账号；请明确确认删除全部账号，或先把账号移动到其他站点' })
+  const [deleted] = await useDatabase(event).delete(userRelayGroups).where(and(eq(userRelayGroups.id, id), eq(userRelayGroups.ownerUserId, ownerUserId))).returning({ id: userRelayGroups.id })
+  if (!deleted) throw createError({ statusCode: 404, message: '中转站不存在' })
+  await useDatabase(event).delete(userRoutePreferences).where(eq(userRoutePreferences.userId, ownerUserId))
+  await invalidateChannelAccess(event, [])
+  return { success: true }
+}
+
+export async function refreshUserRelayGroupBalances(event: H3Event, ownerUserId: string, groupId: string) {
+  const group = await ownedRelayGroup(event, ownerUserId, groupId)
+  const accounts = await useDatabase(event).select({ id: channels.id, name: channels.name }).from(channels).where(and(eq(channels.userRelayGroupId, group.id), eq(channels.ownerUserId, ownerUserId), eq(channels.ownerKind, 'user'))).orderBy(asc(channels.accountRank))
+  const results = []
+  for (const account of accounts) {
+    try { results.push({ ...(await getUserRelayBalance(event, ownerUserId, account.id)), success: true }) }
+    catch (error) { results.push({ id: account.id, name: account.name, success: false, message: error instanceof Error ? error.message : '余额查询失败' }) }
+  }
+  return { groupId, results }
+}
+
+export async function refreshAllUserRelayBalances(event: H3Event, ownerUserId: string) {
+  const groups = await useDatabase(event).select({ id: userRelayGroups.id }).from(userRelayGroups).where(eq(userRelayGroups.ownerUserId, ownerUserId))
+  const results = []
+  for (const group of groups) results.push(await refreshUserRelayGroupBalances(event, ownerUserId, group.id))
+  return { results }
+}
+
+export async function markUserRelayFailure(event: H3Event | undefined, channelId: string, failureClass: RelayFailureClass, message: string) {
+  if (failureClass !== 'quota_exhausted' && failureClass !== 'credential_error') return
+  const routingState = failureClass === 'quota_exhausted' ? 'depleted' as const : 'credential_error' as const
+  const now = new Date()
+  await useDatabase(event).insert(userRelayAccountStates).values({
+    channelId,
+    routingState,
+    stateReasonCode: failureClass,
+    stateReasonMessage: redactSensitiveText(message).slice(0, 500),
+    stateChangedAt: now,
+    updatedAt: now
+  }).onConflictDoUpdate({
+    target: userRelayAccountStates.channelId,
+    set: { routingState, stateReasonCode: failureClass, stateReasonMessage: redactSensitiveText(message).slice(0, 500), stateChangedAt: now, version: sql`${userRelayAccountStates.version} + 1`, updatedAt: now }
+  })
+}
+
 export async function deleteUserRelay(event: H3Event, ownerUserId: string, id: string) {
-  await ownedRelay(event, ownerUserId, id)
+  const relay = await ownedRelay(event, ownerUserId, id)
   const [deleted] = await useDatabase(event).delete(channels).where(and(eq(channels.id, id), eq(channels.ownerUserId, ownerUserId), eq(channels.ownerKind, 'user'))).returning({ id: channels.id })
   if (!deleted) throw createError({ statusCode: 404, message: '中转不存在' })
+  if (relay.userRelayGroupId) {
+    const [summary] = await useDatabase(event).select({ count: sql<number>`count(*)` }).from(channels).where(eq(channels.userRelayGroupId, relay.userRelayGroupId))
+    if (Number(summary?.count || 0) === 0) await useDatabase(event).delete(userRelayGroups).where(eq(userRelayGroups.id, relay.userRelayGroupId))
+  }
   await invalidateChannelAccess(event, [id])
   return { success: true }
 }
