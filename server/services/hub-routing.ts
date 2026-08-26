@@ -38,6 +38,13 @@ export function channelHealthAllowsRouting(channel: Pick<typeof channels.$inferS
     || channel.healthStatus === 'unknown' && channel.clientIdentityMode === 'passthrough' && channel.modelDiscoveryEnabled === false
 }
 
+function channelCanRoute(channel: typeof channels.$inferSelect) {
+  // A user's newly added relay has no health result yet. Let the first real
+  // request validate it; failed relays remain blocked by the unhealthy state
+  // and circuit breaker.
+  return channel.ownerKind === 'user' && channel.healthStatus === 'unknown' || channelHealthAllowsRouting(channel)
+}
+
 type CandidateOrderValue = Pick<RouteCandidate, 'conversionMode'> & { channel: Pick<RouteCandidate['channel'], 'priority' | 'name'> }
 
 export function compareRouteCandidates(left: CandidateOrderValue, right: CandidateOrderValue, supplySource: RouteCandidate['supplySource']) {
@@ -182,7 +189,7 @@ export async function routeCandidates(
         : supplySource === 'user_relay'
           ? row.channel.ownerKind === 'user' && row.channel.ownerUserId === options.userId
           : row.channel.ownerKind === 'platform' && row.channel.type === 'sub2api'
-      return channelHealthAllowsRouting(row.channel)
+      return channelCanRoute(row.channel)
         && (!options.userId || visibleIds.has(row.channel.id) || supplySource === 'private_pool')
         && (!options.channelId || row.channel.id === options.channelId)
         && sourceMatches

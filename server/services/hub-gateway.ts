@@ -532,7 +532,8 @@ export async function listAccessibleModels(event: H3Event, key: typeof hubKeys.$
   const restrictedChannels = channelRules.length > 0
   const enabledChannels = new Set(channelRules.filter(rule => rule.enabled).map(rule => rule.channelId))
   for (const row of rows) {
-    const routable = row.healthStatus === 'healthy' || row.healthStatus === 'unknown' && row.clientIdentityMode === 'passthrough' && row.modelDiscoveryEnabled === false
+    const routable = row.ownerKind === 'user' && row.healthStatus === 'unknown'
+      || row.healthStatus === 'healthy' || row.healthStatus === 'unknown' && row.clientIdentityMode === 'passthrough' && row.modelDiscoveryEnabled === false
     const sourceAvailable = row.ownerKind === 'user'
       || Boolean(activeSubscription)
       || key.routeMode !== 'platform_only' && row.channelType === 'sub2api' && Boolean(privatePool)
