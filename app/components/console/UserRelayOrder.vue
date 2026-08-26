@@ -12,7 +12,7 @@ interface RelayOrderItem {
   lastHealthCheckAt: number | null
 }
 
-const { data, refresh } = await useFetch<{ sources: RelayOrderItem[] }>('/api/console/relay-order')
+const { data, refresh } = useLazyFetch<{ sources: RelayOrderItem[] }>('/api/console/relay-order')
 const toast = useAppToast()
 const orderedIds = ref<string[]>([])
 const draggingId = ref<string | null>(null)

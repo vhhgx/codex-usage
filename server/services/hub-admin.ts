@@ -157,9 +157,11 @@ function channelCache(channelId: string, allRows: CacheRow[]): ChannelCacheView 
   }
 }
 
-export async function listChannels(event: H3Event) {
+export async function listChannels(event: H3Event, owner?: { kind: 'user'; userId: string }) {
   const db = useDatabase(event)
-  const rows = await db.select().from(channels).orderBy(asc(channels.priority), asc(channels.name))
+  const rows = owner
+    ? await db.select().from(channels).where(and(eq(channels.ownerKind, owner.kind), eq(channels.ownerUserId, owner.userId))).orderBy(asc(channels.priority), asc(channels.name))
+    : await db.select().from(channels).orderBy(asc(channels.priority), asc(channels.name))
   const ids = rows.map(row => row.id)
   const [modelRows, protocolRows, modelBindingRows, userGrantRows, groupGrantRows, ownerRows, cacheRows] = await Promise.all([
     ids.length ? db.select().from(channelModels).where(inArray(channelModels.channelId, ids)) : [],
@@ -171,7 +173,9 @@ export async function listChannels(event: H3Event) {
       .where(inArray(channelModels.channelId, ids)) : [],
     ids.length ? db.select().from(channelUserGrants).where(inArray(channelUserGrants.channelId, ids)) : [],
     ids.length ? db.select().from(channelGroupGrants).where(inArray(channelGroupGrants.channelId, ids)) : [],
-    db.select({ id: users.id, username: users.username, displayName: users.displayName }).from(users),
+    owner
+      ? db.select({ id: users.id, username: users.username, displayName: users.displayName }).from(users).where(eq(users.id, owner.userId))
+      : db.select({ id: users.id, username: users.username, displayName: users.displayName }).from(users),
     ids.length ? db.select({
       channelId: usageRollups.channelId,
       protocol: usageRollups.protocol,

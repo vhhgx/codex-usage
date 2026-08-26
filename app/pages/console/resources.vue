@@ -26,7 +26,7 @@ interface PlanView {
 
 const route = useRoute()
 const router = useRouter()
-const { data: planData } = await useFetch<{ subscription: PlanView | null }>('/api/console/plan')
+const { data: planData, status: planStatus } = useLazyFetch<{ subscription: PlanView | null }>('/api/console/plan')
 const activeTab = computed<ResourceTab>(() => route.query.tab === 'pool' ? 'pool' : 'relays')
 const plan = computed(() => planData.value?.subscription || null)
 const tokenLimit = computed(() => Number(plan.value?.plan.entitlementSnapshot?.tokenLimit ?? plan.value?.plan.tokenLimit) || null)
@@ -41,10 +41,10 @@ function selectTab(tab: ResourceTab) { void router.replace({ query: { ...route.q
   <div class="admin-page resources-page">
     <header class="admin-page__header"><div><span class="admin-kicker">PLAN & RESOURCES</span><h1 class="text-balance">套餐与资源</h1><p class="text-pretty">查看套餐权限和额度，管理仅供自己使用的中转与专属号池。</p></div></header>
     <section class="package-summary" :data-status="plan?.status || 'none'">
-      <article class="package-summary__identity"><span><IconRoute :size="17" />当前套餐</span><strong>{{ plan?.plan.name || '未分配套餐' }}</strong><small>{{ plan ? `${packageType} · ${date(plan.expiresAt)}` : '请联系管理员配置套餐' }}</small></article>
-      <article><span>今日套餐 Token</span><strong class="tabular-nums">{{ compact(plan?.usage.today.tokens || 0) }}</strong><small>{{ compact(plan?.usage.today.requests || 0) }} 次请求</small></article>
-      <article><span>本周期套餐 Token</span><strong class="tabular-nums">{{ compact(plan?.usage.tokens || 0) }}</strong><small>自 {{ date(plan?.startsAt) }} 起</small></article>
-      <article><span>{{ remainingTokens === null ? '套餐额度' : '剩余 Token' }}</span><strong class="tabular-nums">{{ remainingTokens === null ? '不限量' : compact(remainingTokens) }}</strong><small>{{ tokenLimit === null ? '仅统计套餐供给' : `总额度 ${compact(tokenLimit)}` }}</small></article>
+      <article class="package-summary__identity"><span><IconRoute :size="17" />当前套餐</span><strong>{{ planStatus === 'pending' && !planData ? '加载中…' : plan?.plan.name || '未分配套餐' }}</strong><small>{{ planStatus === 'pending' && !planData ? '正在读取套餐状态' : plan ? `${packageType} · ${date(plan.expiresAt)}` : '请联系管理员配置套餐' }}</small></article>
+      <article><span>今日套餐 Token</span><strong class="tabular-nums">{{ planStatus === 'pending' && !planData ? '—' : compact(plan?.usage.today.tokens || 0) }}</strong><small>{{ planStatus === 'pending' && !planData ? '正在加载' : `${compact(plan?.usage.today.requests || 0)} 次请求` }}</small></article>
+      <article><span>本周期套餐 Token</span><strong class="tabular-nums">{{ planStatus === 'pending' && !planData ? '—' : compact(plan?.usage.tokens || 0) }}</strong><small>{{ planStatus === 'pending' && !planData ? '正在加载' : `自 ${date(plan?.startsAt)} 起` }}</small></article>
+      <article><span>{{ remainingTokens === null ? '套餐额度' : '剩余 Token' }}</span><strong class="tabular-nums">{{ planStatus === 'pending' && !planData ? '—' : remainingTokens === null ? '不限量' : compact(remainingTokens) }}</strong><small>{{ planStatus === 'pending' && !planData ? '正在加载' : tokenLimit === null ? '仅统计套餐供给' : `总额度 ${compact(tokenLimit)}` }}</small></article>
       <footer>套餐用量仅统计平台供给；个人中转和专属号池的消耗不计入。</footer>
     </section>
     <ConsoleUserRelayOrder />

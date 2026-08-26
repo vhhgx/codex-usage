@@ -58,7 +58,7 @@ async function ownedRelay(event: H3Event, ownerUserId: string, id: string) {
 }
 
 export async function listUserRelays(event: H3Event, ownerUserId: string) {
-  return (await listChannels(event)).filter(channel => channel.ownerKind === 'user' && channel.ownerUserId === ownerUserId)
+  return listChannels(event, { kind: 'user', userId: ownerUserId })
 }
 
 function stateNumber(value: string | null) {
@@ -127,11 +127,12 @@ export function sortRelayAccounts(accounts: UserRelayAccountView[], mode: RelayA
 
 export async function listUserRelayGroups(event: H3Event, ownerUserId: string): Promise<UserRelayGroupView[]> {
   const db = useDatabase(event)
-  const [groups, relays, states] = await Promise.all([
+  const [groups, relays] = await Promise.all([
     db.select().from(userRelayGroups).where(eq(userRelayGroups.ownerUserId, ownerUserId)).orderBy(asc(userRelayGroups.createdAt)),
-    listUserRelays(event, ownerUserId),
-    db.select().from(userRelayAccountStates)
+    listUserRelays(event, ownerUserId)
   ])
+  const relayIds = relays.map(relay => relay.id)
+  const states = relayIds.length ? await db.select().from(userRelayAccountStates).where(inArray(userRelayAccountStates.channelId, relayIds)) : []
   const stateMap = new Map(states.map(state => [state.channelId, state]))
   return groups.map(group => ({
     id: group.id,
@@ -369,6 +370,12 @@ export async function createUserRelay(event: H3Event, ownerUserId: string, body:
   const requestedPlatform = relayPlatform(body.platformType)
   let group = text(body.groupId, 100) ? await ownedRelayGroup(event, ownerUserId, text(body.groupId, 100)) : null
   if (group && 'platformType' in body && group.platformType !== requestedPlatform) throw createError({ statusCode: 409, message: '同一站点组的平台类型必须一致' })
+  if (!group) {
+    const requestedGroupName = text(body.groupName, 120)
+    const origin = new URL(baseUrl).origin.toLowerCase()
+    const candidates = await db.select().from(userRelayGroups).where(and(eq(userRelayGroups.ownerUserId, ownerUserId), eq(userRelayGroups.platformType, requestedPlatform))).orderBy(asc(userRelayGroups.createdAt))
+    group = candidates.find(candidate => candidate.normalizedOrigin === origin || candidate.name.trim().toLowerCase() === requestedGroupName.toLowerCase()) || null
+  }
   const platformType: RelayPlatformType = group?.platformType || requestedPlatform
   const platform = relayPlatformDefinition(platformType)
   if (checkinEnabled && !platform.supportsCheckin) throw createError({ statusCode: 400, message: `${platform.label} 不支持 Hub 签到` })

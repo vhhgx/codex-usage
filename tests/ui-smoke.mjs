@@ -66,9 +66,14 @@ if (bootstrap) {
   const upstreamSeed = Date.now() + Math.floor(Math.random() * 100000)
   await fixtureDb`insert into user_pool_groups (id, owner_user_id, upstream_user_id, upstream_group_id, upstream_api_key_id, encrypted_upstream_api_key, encryption_key_version, internal_name, display_name, status, max_accounts, created_by) values (${poolId}, ${user.id}, ${upstreamSeed}, ${upstreamSeed + 1}, ${upstreamSeed + 2}, 'ui-test-not-for-decryption', 'v2', ${`zh_pool_${poolId.replace(/-/g, '').slice(0, 12)}`}, 'UI Smoke 专属号池', 'active', 5, ${admin.id})`
   await fixtureDb`insert into group_memberships (group_id, user_id, role, created_by) values (${group.id}, ${admin.id}, 'manager', ${admin.id}), (${group.id}, ${user.id}, 'member', ${admin.id})`
-  await fixtureDb`insert into channels (name, type, base_url, encrypted_api_key, owner_kind, owner_user_id, access_scope, created_by, credential_key_version, enabled, priority, weight, max_concurrency, timeout_ms, health_status, last_health_check_at, last_health_error) values
-    ('UI Smoke Relay A', 'openai_compatible', 'https://relay-a.example.com', 'ui-test-not-for-decryption', 'user', ${user.id}, 'private', ${user.id}, 'v2', true, 10, 1, 5, 120000, 'healthy', now(), null),
-    ('UI Smoke Relay B', 'openai_compatible', 'https://relay-b.example.com', 'ui-test-not-for-decryption', 'user', ${user.id}, 'private', ${user.id}, 'v2', true, 20, 1, 5, 120000, 'unhealthy', now(), 'UI Smoke 上游连接失败')`
+  const relayGroups = await fixtureDb`insert into user_relay_groups (owner_user_id, name, homepage_url, normalized_origin, platform_type) values
+    (${user.id}, 'UI Smoke Site A', 'https://relay-a.example.com', 'https://relay-a.example.com', 'newapi'),
+    (${user.id}, 'UI Smoke Site B', 'https://relay-b.example.com', 'https://relay-b.example.com', 'generic') returning id, name`
+  const relayGroupA = relayGroups.find(item => item.name === 'UI Smoke Site A')
+  const relayGroupB = relayGroups.find(item => item.name === 'UI Smoke Site B')
+  await fixtureDb`insert into channels (name, type, base_url, encrypted_api_key, owner_kind, owner_user_id, user_relay_group_id, account_label, access_scope, created_by, credential_key_version, enabled, priority, weight, max_concurrency, timeout_ms, health_status, last_health_check_at, last_health_error) values
+    ('UI Smoke Relay A', 'openai_compatible', 'https://relay-a.example.com', 'ui-test-not-for-decryption', 'user', ${user.id}, ${relayGroupA.id}, '主账号', 'private', ${user.id}, 'v2', true, 10, 1, 5, 120000, 'healthy', now(), null),
+    ('UI Smoke Relay B', 'openai_compatible', 'https://relay-b.example.com', 'ui-test-not-for-decryption', 'user', ${user.id}, ${relayGroupB.id}, '主账号', 'private', ${user.id}, 'v2', true, 20, 1, 5, 120000, 'unhealthy', now(), 'UI Smoke 上游连接失败')`
   await fixtureDb`update channels set checkin_enabled = true, encrypted_checkin_token = 'ui-test-not-for-decryption' where owner_user_id = ${user.id} and name = 'UI Smoke Relay A'`
   const [announcement] = await fixtureDb`insert into announcements (title, content, tone, status, published_at, created_by) values ('UI Smoke 公告', '用户首页公告可见性检查', 'info', 'published', now(), ${admin.id}) returning id`
   fixtureAnnouncementIds = [announcement.id]
@@ -314,6 +319,8 @@ try {
         if (target.name === 'user' && path === '/console/resources') {
           if (!await page.locator('.workspace-nav').getByText('套餐与资源', { exact: true }).count()) throw new Error('combined resource navigation label is missing')
           if (await page.getByRole('tab', { name: '权限与额度', exact: true }).count()) throw new Error('redundant access and quota tab is still visible')
+          if (await page.locator('.relay-site-tabs > button').count() !== 2) throw new Error('relay groups are not rendered as one shared site tab bar')
+          if (await page.locator('.relay-group-summary').count() !== 1) throw new Error('inactive relay groups are still mounted in the page')
           const relayOrderItems = page.locator('.relay-order__item')
           if (await relayOrderItems.count() !== 3) throw new Error('failover order did not render the package and all user relays')
           if (await page.locator('.relay-order__item[data-source-type="package"]').count() !== 1) throw new Error('failover order did not render exactly one package source')
