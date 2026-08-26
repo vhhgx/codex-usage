@@ -20,6 +20,17 @@ function nullableNumber(value: unknown) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null
 }
 
+export function effectivePlatformExpiry(subscriptionExpiresAt: Date | null, platformAccessExpiresAt: Date | null) {
+  return [subscriptionExpiresAt, platformAccessExpiresAt]
+    .filter((value): value is Date => Boolean(value))
+    .sort((left, right) => left.getTime() - right.getTime())[0] || null
+}
+
+export function isPlatformAccessExpired(subscriptionExpiresAt: Date | null, platformAccessExpiresAt: Date | null, now = new Date()) {
+  const expiresAt = effectivePlatformExpiry(subscriptionExpiresAt, platformAccessExpiresAt)
+  return expiresAt !== null && expiresAt <= now
+}
+
 export async function ensureDefaultGroup(event: H3Event, actorId?: string) {
   const [group] = await useDatabase(event).insert(groups).values({
     id: DEFAULT_GROUP_ID,
@@ -250,8 +261,8 @@ export async function assignPlan(event: H3Event, userId: string, planId: string,
 export async function getUserPlan(event: H3Event, userId: string) {
   await ensureDefaultSubscription(event, userId)
   const db = useDatabase(event)
-  const [row] = await db.select({ subscription: userSubscriptions, plan: servicePlans }).from(userSubscriptions)
-    .innerJoin(servicePlans, eq(userSubscriptions.planId, servicePlans.id)).where(eq(userSubscriptions.userId, userId)).limit(1)
+  const [row] = await db.select({ subscription: userSubscriptions, plan: servicePlans, platformAccessExpiresAt: users.platformAccessExpiresAt }).from(userSubscriptions)
+    .innerJoin(servicePlans, eq(userSubscriptions.planId, servicePlans.id)).innerJoin(users, eq(userSubscriptions.userId, users.id)).where(eq(userSubscriptions.userId, userId)).limit(1)
   if (!row) return null
   const version = row.subscription.planVersionId
     ? (await db.select().from(servicePlanVersions).where(eq(servicePlanVersions.id, row.subscription.planVersionId)).limit(1))[0]
@@ -277,12 +288,13 @@ export async function getUserPlan(event: H3Event, userId: string) {
     eq(usageRollups.supplySource, 'platform'),
     gte(usageRollups.bucketStart, row.subscription.startsAt)
   ))
-  const expired = row.subscription.expiresAt !== null && row.subscription.expiresAt <= new Date()
+  const effectiveExpiresAt = effectivePlatformExpiry(row.subscription.expiresAt, row.platformAccessExpiresAt)
+  const expired = isPlatformAccessExpired(row.subscription.expiresAt, row.platformAccessExpiresAt)
   return {
     id: row.subscription.id,
     status: expired ? 'expired' : row.subscription.status,
     startsAt: row.subscription.startsAt.getTime(),
-    expiresAt: row.subscription.expiresAt?.getTime() || null,
+    expiresAt: effectiveExpiresAt?.getTime() || null,
     plan: {
       id: row.plan.id,
       name: row.plan.name,
@@ -313,14 +325,16 @@ export async function getActiveSubscription(event: H3Event, userId: string) {
   const now = new Date()
   return (await useDatabase(event).select({ subscription: userSubscriptions, plan: servicePlans }).from(userSubscriptions)
     .innerJoin(servicePlans, eq(userSubscriptions.planId, servicePlans.id))
-    .where(and(eq(userSubscriptions.userId, userId), eq(userSubscriptions.status, 'active'), lte(userSubscriptions.startsAt, now), or(isNull(userSubscriptions.expiresAt), gt(userSubscriptions.expiresAt, now))))
+    .innerJoin(users, eq(userSubscriptions.userId, users.id))
+    .where(and(eq(userSubscriptions.userId, userId), eq(userSubscriptions.status, 'active'), eq(servicePlans.status, 'active'), lte(userSubscriptions.startsAt, now), or(isNull(userSubscriptions.expiresAt), gt(userSubscriptions.expiresAt, now)), or(isNull(users.platformAccessExpiresAt), gt(users.platformAccessExpiresAt, now))))
     .limit(1))[0] || null
 }
 
 export async function requireActiveSubscription(event: H3Event, userId: string) {
   await ensureDefaultSubscription(event, userId)
-  const [row] = await useDatabase(event).select({ subscription: userSubscriptions, plan: servicePlans }).from(userSubscriptions)
+  const [row] = await useDatabase(event).select({ subscription: userSubscriptions, plan: servicePlans, platformAccessExpiresAt: users.platformAccessExpiresAt }).from(userSubscriptions)
     .innerJoin(servicePlans, eq(userSubscriptions.planId, servicePlans.id))
+    .innerJoin(users, eq(userSubscriptions.userId, users.id))
     .where(eq(userSubscriptions.userId, userId)).limit(1)
   if (!row) throw createError({ statusCode: 429, message: '当前账号没有可用套餐，请联系管理员' })
   const now = new Date()
@@ -332,6 +346,9 @@ export async function requireActiveSubscription(event: H3Event, userId: string) 
   }
   if (row.subscription.expiresAt && row.subscription.expiresAt <= now) {
     throw createError({ statusCode: 429, message: '当前套餐已到期，请联系管理员续期' })
+  }
+  if (row.platformAccessExpiresAt && row.platformAccessExpiresAt <= now) {
+    throw createError({ statusCode: 429, message: '当前账号的平台套餐权限已到期，请联系管理员续期' })
   }
   return row
 }
@@ -352,8 +369,8 @@ export async function listPlanAssignments(event: H3Event) {
       planId: plan.id,
       planName: plan.name,
       startsAt: subscription.startsAt.getTime(),
-      expiresAt: subscription.expiresAt?.getTime() || null,
-      status: subscription.expiresAt && subscription.expiresAt <= new Date() ? 'expired' : subscription.status
+      expiresAt: effectivePlatformExpiry(subscription.expiresAt, user.platformAccessExpiresAt)?.getTime() || null,
+      status: isPlatformAccessExpired(subscription.expiresAt, user.platformAccessExpiresAt) ? 'expired' : subscription.status
     } : null
   }))
 }

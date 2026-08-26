@@ -111,6 +111,7 @@ const form = reactive({
   displayName: '',
   email: '',
   password: '',
+  platformAccessExpiresAt: '',
   role: 'user' as UserRole,
   status: 'active' as UserStatus,
   groupIds: [] as string[]
@@ -175,8 +176,21 @@ function defaultPlanId() {
     || ''
 }
 
+function localDateTime(value: number | null) {
+  if (!value) return ''
+  const date = new Date(value)
+  date.setMinutes(date.getMinutes() - date.getTimezoneOffset())
+  return date.toISOString().slice(0, 16)
+}
+
+function setPlatformExpiry(days: number) {
+  const value = new Date(Date.now() + days * 86400_000)
+  value.setMinutes(value.getMinutes() - value.getTimezoneOffset())
+  form.platformAccessExpiresAt = value.toISOString().slice(0, 16)
+}
+
 function resetForm() {
-  Object.assign(form, { username: '', displayName: '', email: '', password: '', role: 'user', status: 'active', groupIds: [] })
+  Object.assign(form, { username: '', displayName: '', email: '', password: '', platformAccessExpiresAt: '', role: 'user', status: 'active', groupIds: [] })
   resetPassword.value = ''
   showPassword.value = false
   formError.value = ''
@@ -204,6 +218,7 @@ function openEdit(user: ManagedUserView) {
     displayName: user.displayName || '',
     email: user.email || '',
     password: '',
+    platformAccessExpiresAt: localDateTime(user.platformAccessExpiresAt),
     role: uiRole(user.role),
     status: uiStatus(user.status),
     groupIds: [...user.groupIds]
@@ -235,6 +250,7 @@ async function save() {
           email: form.email,
           role: form.role === 'user' ? 'user' : (originalRole.value === 'user' ? 'admin' : originalRole.value),
           status: form.status,
+          platformAccessExpiresAt: form.platformAccessExpiresAt ? new Date(form.platformAccessExpiresAt).toISOString() : null,
           groupIds: form.groupIds,
           planId: form.role === 'user' && selectedPlanId.value !== originalPlanId.value ? selectedPlanId.value : undefined
         }
@@ -244,7 +260,7 @@ async function save() {
       }
       showToast('用户资料已保存', 'success')
     } else {
-      await $fetch<{ user: HubUserView }>('/api/admin/users', { method: 'POST', body: { ...form, planId: form.role === 'user' ? selectedPlanId.value : undefined } })
+      await $fetch<{ user: HubUserView }>('/api/admin/users', { method: 'POST', body: { ...form, platformAccessExpiresAt: form.platformAccessExpiresAt ? new Date(form.platformAccessExpiresAt).toISOString() : null, planId: form.role === 'user' ? selectedPlanId.value : undefined } })
       showToast('用户已创建', 'success')
     }
     await Promise.all([refresh(), refreshGroups(), refreshPlans()])
@@ -308,6 +324,11 @@ function date(value: number | null) {
   return value
     ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(value)
     : '从未登录'
+}
+
+function platformExpiryLabel(user: HubUserView) {
+  if (!user.platformAccessExpiresAt) return '长期有效'
+  return user.platformAccessExpiresAt <= Date.now() ? `已于 ${date(user.platformAccessExpiresAt)} 到期` : `有效至 ${date(user.platformAccessExpiresAt)}`
 }
 
 function roleLabel(value: string) {
@@ -396,7 +417,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleEscape))
               </td>
               <td data-label="角色 / 状态"><div class="users-role-cell"><strong>{{ roleLabel(user.role) }}</strong><span class="status-label" :data-status="statusTone(user.status)"><i />{{ statusLabel(user.status) }}</span></div></td>
               <td data-label="分组"><span class="users-text-cell">{{ user.groupNames.join('、') || '未分组' }}</span></td>
-              <td data-label="套餐"><span class="users-text-cell">{{ user.subscription?.planName || (user.role === 'user' ? '默认不限量' : '—') }}</span></td>
+              <td data-label="套餐"><span class="users-plan-cell"><strong>{{ user.subscription?.planName || (user.role === 'user' ? '默认不限量' : '—') }}</strong><small :data-expired="Boolean(user.platformAccessExpiresAt && user.platformAccessExpiresAt <= Date.now())">{{ platformExpiryLabel(user) }}</small></span></td>
               <td data-label="Key"><NuxtLink :to="{ path: '/admin/keys', query: { owner: user.id } }" class="users-key-link"><IconKey :size="14" :stroke-width="1.8" />{{ user.keyCount }}</NuxtLink></td>
               <td data-label="最后登录"><span class="users-date">{{ date(user.lastLoginAt) }}</span></td>
               <td data-label="操作"><div class="table-actions users-table-actions"><button class="icon-button" type="button" title="用户详情" aria-label="用户详情" @click="openDetail(user)"><IconChartBar :size="16" :stroke-width="1.8" /></button><button class="icon-button" type="button" title="重置密码" aria-label="重置密码" @click="openEdit(user)"><IconKey :size="16" :stroke-width="1.8" /></button><button class="icon-button" type="button" title="编辑用户" aria-label="编辑用户" @click="openEdit(user)"><IconEdit :size="16" :stroke-width="1.8" /></button><button class="icon-button danger" type="button" title="删除用户" aria-label="删除用户" :disabled="user.keyCount > 0" @click="deletingUser = user"><IconTrash :size="16" :stroke-width="1.8" /></button></div></td>
@@ -450,6 +471,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleEscape))
                   <label class="users-form-field"><span>邮箱</span><input v-model="form.email" type="email"><small /></label>
                   <label class="users-form-field"><span>{{ editing ? '重置密码' : '初始密码' }} <b v-if="!editing" class="users-required">*</b></span><span class="users-password-shell"><input v-if="editing" v-model="resetPassword" :type="showPassword ? 'text' : 'password'" minlength="8" autocomplete="new-password" placeholder="留空表示不修改"><input v-else v-model="form.password" :type="showPassword ? 'text' : 'password'" required minlength="8" autocomplete="new-password"><button class="icon-button users-password-toggle" type="button" :title="showPassword ? '隐藏密码' : '显示密码'" :aria-label="showPassword ? '隐藏密码' : '显示密码'" @click="showPassword = !showPassword"><IconEyeOff v-if="showPassword" :size="16" :stroke-width="1.8" /><IconEye v-else :size="16" :stroke-width="1.8" /></button></span><small>{{ editing ? '重置后该用户下次登录必须修改密码' : '至少 8 位字符；用户首次登录必须修改' }}</small></label>
                 </div>
+                <div class="form-grid form-grid--expiry users-platform-expiry"><label class="users-form-field"><span>平台套餐到期时间</span><input v-model="form.platformAccessExpiresAt" type="datetime-local"><small>到期后仅停用平台套餐，个人中转与专属号池不受影响</small></label><div class="expiry-presets"><span>从现在起</span><div><button v-for="days in [1, 7, 30]" :key="days" type="button" @click="setPlatformExpiry(days)">{{ days }} 天</button><button type="button" @click="form.platformAccessExpiresAt = ''">永久</button></div></div></div>
                 <div class="users-role-controls">
                   <AppRadioGroup v-model="form.role" name="user-role" label="角色" legend="角色" :options="roleOptions" :columns="2" class="users-role-group" />
                   <label v-if="editing" class="users-form-field users-status-field"><span>状态</span><span class="switch users-status-switch"><input v-model="statusEnabled" type="checkbox" :aria-label="statusEnabled ? '停用用户' : '启用用户'"><span aria-hidden="true" /><em>{{ statusEnabled ? '启用' : '停用' }}</em></span><small>停用后将无法登录或使用 Hub Key</small></label>
@@ -509,6 +531,10 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleEscape))
 .users-page .status-label[data-status='disabled'] i { background: var(--hub-text-disabled); box-shadow: none; }
 .users-page .status-label[data-status='locked'] i { background: var(--hub-warning); box-shadow: 0 0 0 3px var(--hub-warning-soft); }
 .users-text-cell, .users-date { color: var(--hub-text-muted); white-space: nowrap; }
+.users-plan-cell { display:grid; gap:.18rem; white-space:nowrap; }
+.users-plan-cell strong { color:var(--hub-text-muted); font-size:.74rem; font-weight:var(--hub-weight-medium); }
+.users-plan-cell small { color:var(--hub-text-faint); font-size:.66rem; }
+.users-plan-cell small[data-expired='true'] { color:var(--hub-danger); }
 .users-key-link { display: inline-flex; align-items: center; gap: .35rem; color: var(--hub-accent-text); font-family: var(--hub-font-mono); font-size: .74rem; font-weight: var(--hub-weight-medium); }
 .users-key-link:hover { color: var(--hub-accent-bright); }
 .users-table-actions { justify-content: flex-end; gap: .35rem; }

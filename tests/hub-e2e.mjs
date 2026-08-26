@@ -1196,7 +1196,7 @@ async function main() {
       method: 'POST',
       body: JSON.stringify({ name: 'Multi Protocol CLI E2E', allowedModels: ['hub-anthropic', 'hub-test'], allowedEndpoints: ['/v1/messages', '/v1/responses'] })
     })).body
-    const nativeAnthropic = await fetch(`${appUrl}/anthropic/v1/messages`, {
+    const nativeAnthropic = await fetch(`${appUrl}/v1/messages`, {
       method: 'POST',
       headers: { 'x-api-key': anthropicKey.key, 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'hub-anthropic', max_tokens: 16, messages: [{ role: 'user', content: 'native' }] })
@@ -1230,7 +1230,7 @@ async function main() {
             ...process.env,
             HOME: cliHome,
             CLAUDE_CONFIG_DIR: join(cliHome, '.claude'),
-            ANTHROPIC_BASE_URL: `${appUrl}/anthropic`,
+            ANTHROPIC_BASE_URL: appUrl,
             ANTHROPIC_API_KEY: anthropicKey.key,
             CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
             DISABLE_AUTOUPDATER: '1',

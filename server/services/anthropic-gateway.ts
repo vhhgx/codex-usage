@@ -119,7 +119,7 @@ export async function handleAnthropicModels(event: H3Event) {
   const { key, group, userId } = access
   await assertTrafficAccepting(event)
   if (!policyAllows(key.allowedEndpoints, '/v1/models') || !policyAllows(group.allowedEndpoints, '/v1/models')) anthropicError(403, 'This Hub Key cannot list models', 'permission_error')
-  const lease = await admitHubRequest(event, key, group, 0, 0)
+  const lease = await admitHubRequest(event, key, group, 0, 0, { scopeMode: 'base_only' })
   try {
     const result = await listAccessibleModels(event, key, group, userId, ['anthropic_messages', 'openai_chat'])
     await touchKeyCredential(event, key.id)
@@ -170,16 +170,17 @@ export async function handleAnthropicMessages(event: H3Event) {
   const requestId = typeof event.context.hubRequestId === 'string' ? event.context.hubRequestId : `req_${crypto.randomUUID().replace(/-/g, '')}`
   let packageDecision: SupplyDecision | null = null
   let billingMode = 'unlimited'
-  if (candidateBatches.some(batch => batch.node.source === 'platform')) {
-    const activeSubscription = await getActiveSubscription(event, userId)
-    const version = activeSubscription?.subscription.planVersionId
+  const hasPackageNode = candidateBatches.some(batch => batch.node.source === 'platform')
+  const activeSubscription = hasPackageNode ? await getActiveSubscription(event, userId) : null
+  if (hasPackageNode && activeSubscription) {
+    const version = activeSubscription.subscription.planVersionId
       ? (await useDatabase(event).select().from(servicePlanVersions).where(eq(servicePlanVersions.id, activeSubscription.subscription.planVersionId)).limit(1))[0]
       : null
-    const snapshot = activeSubscription?.subscription.entitlementSnapshot || {}
-    billingMode = String(version?.billingMode || snapshot.billingMode || (activeSubscription?.plan.mode === 'token' ? 'token_package' : activeSubscription?.plan.mode === 'cost' ? 'token_metered' : 'unlimited'))
+    const snapshot = activeSubscription.subscription.entitlementSnapshot || {}
+    billingMode = String(version?.billingMode || snapshot.billingMode || (activeSubscription.plan.mode === 'token' ? 'token_package' : activeSubscription.plan.mode === 'cost' ? 'token_metered' : 'unlimited'))
     const supplyMode = String(version?.supplyMode || snapshot.supplyMode || 'platform_only')
-    const tokenLimit = Number(version?.tokenLimit ?? snapshot.tokenLimit ?? activeSubscription?.plan.tokenLimit ?? 0)
-    const usedRow = activeSubscription && tokenLimit > 0
+    const tokenLimit = Number(version?.tokenLimit ?? snapshot.tokenLimit ?? activeSubscription.plan.tokenLimit ?? 0)
+    const usedRow = tokenLimit > 0
       ? (await useDatabase(event).select({ tokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}), 0)` }).from(usageRollups).where(and(eq(usageRollups.userId, userId), eq(usageRollups.granularity, 'day'), gte(usageRollups.bucketStart, activeSubscription.subscription.startsAt))))[0]
       : null
     try {
@@ -189,8 +190,8 @@ export async function handleAnthropicMessages(event: H3Event) {
         estimatedTokens: reservation.tokens,
         remainingTokens: tokenLimit > 0 ? Math.max(0, tokenLimit - Number(usedRow?.tokens || 0)) : null,
         privatePoolAvailable,
-        subscriptionId: activeSubscription?.subscription.id,
-        planVersionId: version?.id || activeSubscription?.subscription.planVersionId,
+        subscriptionId: activeSubscription.subscription.id,
+        planVersionId: version?.id || activeSubscription.subscription.planVersionId,
         poolGroupId: privatePool?.id
       })
     } catch (error) {

@@ -1,23 +1,23 @@
 import { randomUUID } from 'node:crypto'
-import { and, asc, count, eq, inArray, max } from 'drizzle-orm'
+import { and, asc, eq, inArray, max } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { createError } from 'h3'
 import type { ChannelAuthScheme, ChannelModelView, ChannelProtocol, ChannelType } from '#shared/types/hub'
 import { useDatabase } from '../db'
-import { channelModelBindings, channelModels, channelProtocolBindings, channels, userPoolAccounts, userPoolGroups, userRoutePreferences } from '../db/schema'
+import { channelModels, channelProtocolBindings, channels, userPoolAccounts, userPoolGroups, userRoutePreferences } from '../db/schema'
 import { decryptChannelSecret, decryptContextSecret, encryptChannelSecret, encryptContextSecret } from '../utils/hub-crypto'
 import { normalizeUserUpstreamUrl, pinnedUpstreamFetch, resolvePublicUpstream, upstreamNetworkError, userUpstreamTarget } from '../utils/upstream-url'
 import { redactSensitiveText } from '../utils/upstream'
 import { isClientIdentityRejection, probeAuthSchemes, upstreamAuthHeaders } from '../utils/upstream-auth'
+import { upstreamProbeClientIdentity } from '../utils/upstream-client-identity'
 import { listChannels, parseChannelModels, parseChannelProtocols, replaceChannelModels, replaceChannelProtocols } from './hub-admin'
-import { discoverUpstreamModelIds, mergeDiscoveredModelMappings, syncChannelModelsFromUpstream } from './hub-model-discovery'
+import { discoverUpstreamModelIds, syncChannelModelsFromUpstream } from './hub-model-discovery'
 import { invalidateChannelAccess } from './channel-access'
 import { channelCircuitState } from './hub-routing'
 import { getActiveSubscription } from './customer-management'
 import { getUserFailoverSourceIds, PACKAGE_SOURCE_ID, PRIVATE_POOL_SOURCE_ID, relaySourceId } from './user-route-preferences'
 
 type Input = Record<string, unknown>
-const MAX_USER_RELAYS = 10
 const MAX_USER_RELAY_MODELS = 500
 
 function text(value: unknown, max = 500) {
@@ -64,6 +64,23 @@ function balanceRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
+function balanceNumber(value: unknown) {
+  return value === null || value === undefined || value === '' || !Number.isFinite(Number(value)) ? null : Number(value)
+}
+
+export function newApiBalanceQuotaValues(source: Record<string, unknown>) {
+  const purchasedQuota = balanceNumber(source.quota ?? source.purchased_quota ?? source.purchase_quota)
+  const giftQuota = balanceNumber(source.gift_quota ?? source.giftQuota)
+  const explicitTotal = balanceNumber(source.total_quota ?? source.totalQuota)
+  const fallbackQuota = balanceNumber(source.unlimited_quota)
+  return {
+    quota: explicitTotal ?? (purchasedQuota !== null && giftQuota !== null ? purchasedQuota + giftQuota : purchasedQuota ?? fallbackQuota),
+    purchasedQuota,
+    giftQuota,
+    usedQuota: balanceNumber(source.used_quota ?? source.usedQuota)
+  }
+}
+
 export async function getUserRelayBalance(event: H3Event, ownerUserId: string, id: string) {
   const relay = await ownedRelay(event, ownerUserId, id)
   if (!relay.encryptedCheckinToken) throw createError({ statusCode: 409, message: '请先在中转设置中配置 NewAPI 访问令牌' })
@@ -81,11 +98,11 @@ export async function getUserRelayBalance(event: H3Event, ownerUserId: string, i
     const data = balanceRecord(root.data)
     const nested = balanceRecord(data.data)
     const source = Object.keys(nested).length ? nested : data
-    const number = (value: unknown) => value === null || value === undefined || value === '' || !Number.isFinite(Number(value)) ? null : Number(value)
     const ratio = 500_000
     const exchangeRate = 1
-    const rawQuota = number(source.quota ?? source.unlimited_quota ?? source.total_quota)
-    const rawUsedQuota = number(source.used_quota ?? source.usedQuota)
+    const values = newApiBalanceQuotaValues(source)
+    const rawQuota = values.quota
+    const rawUsedQuota = values.usedQuota
     const quota = rawQuota === null ? null : rawQuota / ratio * exchangeRate
     const usedQuota = rawUsedQuota === null ? null : rawUsedQuota / ratio * exchangeRate
     // NewAPI 的 quota 字段是当前余额，used_quota 是历史消耗；与 switch 的默认配额模式一致。
@@ -194,12 +211,29 @@ async function discoverPrivateModels(baseUrl: string, apiKey: string, timeoutMs:
   } satisfies ChannelModelView))
 }
 
+export async function discoverUserRelayModels(event: H3Event, ownerUserId: string, body: Input) {
+  const relayId = text(body.relayId, 100)
+  const relay = relayId ? await ownedRelay(event, ownerUserId, relayId) : null
+  const baseUrl = normalizeUserUpstreamUrl(text(body.baseUrl, 1000) || relay?.baseUrl || '')
+  const apiKey = text(body.apiKey, 2000) || (relay ? decryptChannelSecret(relay.encryptedApiKey, relay.id, 'user', event) : '')
+  if (!baseUrl || !apiKey) throw createError({ statusCode: 400, message: '请先填写中转地址和 API Key' })
+  await resolvePublicUpstream(baseUrl)
+  const provisionalType: ChannelType = Array.isArray(body.protocols) && body.protocols.some(item => item && typeof item === 'object' && (item as Input).protocol === 'anthropic_messages') ? 'anthropic_compatible' : 'openai_compatible'
+  const protocols = await validateUserProtocols(parseChannelProtocols(body.protocols, provisionalType))
+  if (!protocols.length) throw createError({ statusCode: 400, message: '请至少选择一种上游协议' })
+  const models = await discoverPrivateModels(baseUrl, apiKey, integer(body.timeoutMs, 1000, 600000, relay?.timeoutMs || 120000), protocols)
+  return { models: models.map(model => model.upstreamModel) }
+}
+
+function requireProbeModels(protocols: ReturnType<typeof parseChannelProtocols>) {
+  const missing = protocols.filter(protocol => !protocol.probeModel).map(protocol => protocol.protocol)
+  if (missing.length) throw createError({ statusCode: 400, message: `请为每个协议指定检测模型：${missing.join(', ')}` })
+}
+
 export async function createUserRelay(event: H3Event, ownerUserId: string, body: Input) {
   const allowed = new Set(['name', 'baseUrl', 'apiKey', 'protocols', 'models', 'enabled', 'weight', 'maxConcurrency', 'timeoutMs', 'checkinEnabled', 'checkinToken', 'checkinUserId', 'modelDiscoveryEnabled', 'clientIdentityMode'])
   const invalid = Object.keys(body).filter(key => !allowed.has(key))
   if (invalid.length) throw createError({ statusCode: 400, message: `用户不能设置字段：${invalid.join(', ')}` })
-  const [existing] = await useDatabase(event).select({ value: count() }).from(channels).where(and(eq(channels.ownerKind, 'user'), eq(channels.ownerUserId, ownerUserId)))
-  if (Number(existing?.value || 0) >= MAX_USER_RELAYS) throw createError({ statusCode: 409, message: `每个用户最多添加 ${MAX_USER_RELAYS} 个中转` })
   const [lastPriority] = await useDatabase(event).select({ value: max(channels.priority) }).from(channels).where(and(eq(channels.ownerKind, 'user'), eq(channels.ownerUserId, ownerUserId)))
   const name = text(body.name, 120)
   const apiKey = text(body.apiKey, 2000)
@@ -213,6 +247,7 @@ export async function createUserRelay(event: H3Event, ownerUserId: string, body:
   const provisionalType: ChannelType = Array.isArray(body.protocols) && body.protocols.some(item => item && typeof item === 'object' && (item as Input).protocol === 'anthropic_messages') ? 'anthropic_compatible' : 'openai_compatible'
   const protocols = await validateUserProtocols(parseChannelProtocols(body.protocols, provisionalType))
   if (!protocols.length) throw createError({ statusCode: 400, message: '请至少选择一种上游协议' })
+  requireProbeModels(protocols)
   const id = randomUUID()
   const timeoutMs = integer(body.timeoutMs, 1000, 600000, 120000)
   const modelDiscoveryEnabled = body.modelDiscoveryEnabled !== false
@@ -288,6 +323,7 @@ export async function updateUserRelay(event: H3Event, ownerUserId: string, id: s
   if ('protocols' in body) {
     const parsed = await validateUserProtocols(parseChannelProtocols(body.protocols, relay.type))
     if (!parsed.length) throw createError({ statusCode: 400, message: '请至少选择一种上游协议' })
+    requireProbeModels(parsed)
     protocols = await replaceChannelProtocols(event, id, parsed)
     patch.type = relayType(parsed)
   }
@@ -310,35 +346,15 @@ function testPayload(protocol: ChannelProtocol, model: string) {
   return { path: '/v1/chat/completions', body: { model, max_tokens: 1, messages: [{ role: 'user', content: 'Reply OK' }] } }
 }
 
-export function selectRelayProbeModel(protocol: ChannelProtocol, models: string[]) {
-  const score = (model: string) => {
-    const value = model.toLowerCase()
-    let result = 0
-    if (/image|embedding|audio|tts|whisper|dall[.-]?e|moderation|rerank|auto-review/.test(value)) result -= 100
-    if (protocol === 'anthropic_messages' && value.includes('claude')) result += 60
-    if (protocol === 'openai_responses' && (value.includes('codex') || value.includes('responses'))) result += 50
-    if (protocol !== 'anthropic_messages' && value.startsWith('gpt-')) result += 40
-    if (protocol === 'openai_chat' && (value.startsWith('grok-') || value.startsWith('claude-'))) result += 30
-    if (/^(?:gpt|grok|claude)-\d+(?:\.\d+)*$/.test(value)) result += 20
-    return result
-  }
-  return [...new Set(models)].sort((left, right) => score(right) - score(left) || left.localeCompare(right))[0] || null
-}
-
 export async function testUserRelay(event: H3Event, ownerUserId: string, id: string) {
   const relay = await ownedRelay(event, ownerUserId, id)
-  if (relay.modelDiscoveryEnabled) try { await syncChannelModelsFromUpstream(event, id) } catch {}
   const protocols = await useDatabase(event).select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, id))
   const apiKey = decryptChannelSecret(relay.encryptedApiKey, relay.id, 'user', event)
   const results = []
   for (const protocol of protocols) {
-    const modelBindings = await useDatabase(event).select({ upstreamModel: channelModelBindings.upstreamModel })
-      .from(channelModelBindings)
-      .innerJoin(channelModels, eq(channelModelBindings.channelModelId, channelModels.id))
-      .where(and(eq(channelModelBindings.protocolBindingId, protocol.id), eq(channelModelBindings.enabled, true), eq(channelModels.enabled, true)))
-    const model = selectRelayProbeModel(protocol.protocol, modelBindings.map(binding => binding.upstreamModel))
+    const model = protocol.probeModel
     if (!model) {
-      const message = '该协议没有启用的模型绑定'
+      const message = '该协议尚未指定检测模型，请编辑中转后再检测'
       await useDatabase(event).update(channelProtocolBindings).set({ verificationStatus: 'failed', verifiedAt: new Date(), lastError: message, updatedAt: new Date() }).where(and(eq(channelProtocolBindings.id, protocol.id), eq(channelProtocolBindings.channelId, relay.id)))
       results.push({ protocol: protocol.protocol, endpoint: userUpstreamTarget(protocol.baseUrlOverride || relay.baseUrl, testPayload(protocol.protocol, '').path), ok: false, status: null, latencyMs: 0, errorCode: 'MODEL_BINDING_MISSING', message })
       continue
@@ -354,7 +370,8 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
     let attempts: Array<{ authScheme: ChannelAuthScheme; ok: boolean; status: number | null; body: string }> = []
     try {
       const probe = await probeAuthSchemes(protocol.authScheme, async (authScheme) => {
-        const headers = { 'content-type': 'application/json', ...upstreamAuthHeaders(authScheme, apiKey, protocol.apiVersion) }
+        const clientIdentity = relay.clientIdentityMode === 'passthrough' ? upstreamProbeClientIdentity(protocol.protocol) : {}
+        const headers = { 'content-type': 'application/json', ...clientIdentity, ...upstreamAuthHeaders(authScheme, apiKey, protocol.apiVersion) }
         const result = await pinnedUpstreamFetch(protocol.baseUrlOverride || relay.baseUrl, payload.path, {
           method: 'POST', headers, body: JSON.stringify(payload.body), signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 30000))
         })
@@ -381,7 +398,7 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
     }
     const clientIdentityRejected = attempts.some(attempt => isClientIdentityRejection(attempt.body))
     await useDatabase(event).update(channelProtocolBindings).set({ verificationStatus: ok ? 'verified' : 'failed', verifiedAt: new Date(), lastError: message, updatedAt: new Date() }).where(and(eq(channelProtocolBindings.id, protocol.id), eq(channelProtocolBindings.channelId, relay.id)))
-    results.push({ protocol: protocol.protocol, endpoint, ok, status, latencyMs: Date.now() - started, errorCode, message, authScheme: selectedAuthScheme || protocol.authScheme, attemptedAuthSchemes: attempts.map(attempt => attempt.authScheme), clientIdentityRejected })
+    results.push({ protocol: protocol.protocol, endpoint, ok, status, latencyMs: Date.now() - started, errorCode, message, authScheme: selectedAuthScheme || protocol.authScheme, attemptedAuthSchemes: attempts.map(attempt => attempt.authScheme), clientIdentityRejected, clientIdentityProbed: relay.clientIdentityMode === 'passthrough' })
   }
   const healthy = results.some(result => result.ok)
   const pendingClientVerification = !healthy && relay.clientIdentityMode === 'passthrough' && relay.modelDiscoveryEnabled === false && results.some(result => result.clientIdentityRejected)

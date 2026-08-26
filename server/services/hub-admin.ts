@@ -208,6 +208,7 @@ export async function listChannels(event: H3Event) {
       baseUrlOverride: binding.baseUrlOverride,
       authScheme: binding.authScheme,
       apiVersion: binding.apiVersion,
+      probeModel: binding.probeModel,
       verificationStatus: binding.verificationStatus,
       verifiedAt: binding.verifiedAt?.getTime() || null,
       lastError: binding.lastError
@@ -244,7 +245,8 @@ export function parseChannelProtocols(value: unknown, type: ChannelType): Array<
       enabled: item.enabled !== false,
       baseUrlOverride,
       authScheme: item.authScheme === 'x_api_key' || protocol === 'anthropic_messages' && item.authScheme !== 'bearer' ? 'x_api_key' as const : 'bearer' as const,
-      apiVersion: text(item.apiVersion, 100) || (protocol === 'anthropic_messages' ? '2023-06-01' : null)
+      apiVersion: text(item.apiVersion, 100) || (protocol === 'anthropic_messages' ? '2023-06-01' : null),
+      probeModel: text(item.probeModel, 200) || null
     }]
   })
   return [...new Map(parsed.map(binding => [binding.protocol, binding])).values()]
@@ -562,7 +564,7 @@ export async function createHubKeyRecord(event: H3Event, body: UnknownRecord, ac
   const values = keyValues(body)
   if (!values.name) throw createError({ statusCode: 400, message: '请输入 Key 名称' })
   if (values.expiresAt && values.expiresAt <= new Date()) throw createError({ statusCode: 400, message: '到期时间必须晚于当前时间' })
-  const plainKey = typeof body.key === 'string' && body.key ? validateHubKeySecret(body.key) : createHubKey()
+  const plainKey = createHubKey()
   const ownership = await resolveKeyOwnership(event, body.ownerUserId, body.groupId, actorId)
   const keyId = randomUUID()
   const credentialId = randomUUID()
@@ -666,10 +668,6 @@ async function activateHubKeySecret(event: H3Event, id: string, plainKey: string
 
 export function rotateHubKeyCredential(event: H3Event, id: string, graceSeconds: number, actorId?: string) {
   return activateHubKeySecret(event, id, createHubKey(), graceSeconds, actorId)
-}
-
-export function replaceHubKeySecret(event: H3Event, id: string, plainKey: string, graceSeconds: number, actorId: string) {
-  return activateHubKeySecret(event, id, plainKey, graceSeconds, actorId)
 }
 
 export async function revealHubKeySecret(event: H3Event, id: string) {

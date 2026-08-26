@@ -6,8 +6,10 @@ const props = withDefaults(defineProps<{
   title: string
   message: string
   confirmLabel?: string
+  confirmTone?: 'primary' | 'danger'
+  busyLabel?: string
   busy?: boolean
-}>(), { confirmLabel: '确认删除', busy: false })
+}>(), { confirmLabel: '确认删除', confirmTone: 'danger', busyLabel: '处理中', busy: false })
 const emit = defineEmits<{ close: []; confirm: [] }>()
 const dialog = ref<HTMLDialogElement | null>(null)
 const headingId = useId()
@@ -32,7 +34,7 @@ watch(() => props.open, (open) => {
         </div>
         <footer>
           <button type="button" class="button button--secondary" :disabled="busy" @click="emit('close')">取消</button>
-          <button type="button" class="button button--danger" :disabled="busy" @click="emit('confirm')">{{ busy ? '处理中' : confirmLabel }}</button>
+          <button type="button" class="button" :class="confirmTone === 'primary' ? 'button--primary' : 'button--danger'" :disabled="busy" @click="emit('confirm')">{{ busy ? busyLabel : confirmLabel }}</button>
         </footer>
       </form>
     </dialog>

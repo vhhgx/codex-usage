@@ -51,13 +51,6 @@ const detailLoading = ref(false)
 const rotating = ref(false)
 const rotatedKey = ref('')
 const rotationGraceSeconds = ref(3600)
-const secretItem = ref<HubKeyView | null>(null)
-const secretMode = ref<'reveal' | 'replace'>('reveal')
-const secretPassword = ref('')
-const replacementKey = ref('')
-const secretValue = ref('')
-const secretBusy = ref(false)
-const secretError = ref('')
 const endpointOptions = ['/v1/models', '/v1/chat/completions', '/v1/responses', '/v1/embeddings', '/v1/images/generations', '/v1/images/edits']
 
 type KeyForm = Record<string, string | string[]>
@@ -167,24 +160,6 @@ async function copyKey(item: HubKeyView) {
     showToast(failure.data?.message || failure.message || '复制 Key 失败', 'error')
   } finally { copyingKeyId.value = null }
 }
-function openSecret(item: HubKeyView, mode: 'reveal' | 'replace') {
-  secretItem.value = item; secretMode.value = mode; secretPassword.value = ''; replacementKey.value = ''; secretValue.value = ''; secretError.value = ''
-}
-async function submitSecret() {
-  if (!secretItem.value) return
-  secretBusy.value = true; secretError.value = ''
-  try {
-    if (secretMode.value === 'reveal') {
-      const result = await $fetch<{ key: string }>(`/api/admin/keys/${secretItem.value.id}/reveal`, { method: 'POST', body: { password: secretPassword.value } })
-      secretValue.value = result.key
-    } else {
-      const result = await $fetch<{ key: string }>(`/api/admin/keys/${secretItem.value.id}/secret`, { method: 'PUT', body: { password: secretPassword.value, key: replacementKey.value, graceSeconds: 0 } })
-      secretValue.value = result.key
-      await refresh()
-    }
-  } catch (value) { const failure = value as { data?: { message?: string }; message?: string }; secretError.value = failure.data?.message || failure.message || '操作失败' }
-  finally { secretBusy.value = false }
-}
 async function openUsage(item: HubKeyView) {
   detailLoading.value = true
   detail.value = null
@@ -259,7 +234,7 @@ function periodLimit(item: HubKeyView, period: HubKeyUsagePeriod, metric: 'Reque
           <td><code>{{ item.rpmLimit || '∞' }} RPM</code><small class="table-sub">{{ item.concurrencyLimit || '∞' }} 并发</small></td>
           <td><span class="table-date"><IconCalendarTime :size="15" />{{ timestamp(item.expiresAt) }}</span></td>
           <td>{{ timestamp(item.lastUsedAt) }}</td>
-          <td><div class="table-actions"><button class="icon-button" title="复制完整 Key" aria-label="复制完整 Key" :disabled="copyingKeyId === item.id || !item.revealable" @click="copyKey(item)"><IconCopy :size="17" /></button><button class="icon-button" title="设置完整 Key" aria-label="设置完整 Key" @click="openSecret(item, 'replace')"><IconKey :size="16" /></button><button class="icon-button" title="用量详情" aria-label="用量详情" @click="openUsage(item)"><IconChartBar :size="17" /></button><button class="icon-button" :title="item.status === 'active' ? '停用' : '启用'" :aria-label="item.status === 'active' ? '停用 Key' : '启用 Key'" @click="toggle(item)"><IconDotsVertical :size="17" /></button><button class="icon-button" title="编辑策略" aria-label="编辑策略" @click="openEdit(item)"><IconEdit :size="16" /></button><button class="icon-button danger" title="删除" aria-label="删除 Key" @click="remove(item)"><IconTrash :size="16" /></button></div></td>
+          <td><div class="table-actions"><button class="icon-button" title="复制完整 Key" aria-label="复制完整 Key" :disabled="copyingKeyId === item.id || !item.revealable" @click="copyKey(item)"><IconCopy :size="17" /></button><button class="icon-button" title="用量详情" aria-label="用量详情" @click="openUsage(item)"><IconChartBar :size="17" /></button><button class="icon-button" :title="item.status === 'active' ? '停用' : '启用'" :aria-label="item.status === 'active' ? '停用 Key' : '启用 Key'" @click="toggle(item)"><IconDotsVertical :size="17" /></button><button class="icon-button" title="编辑策略" aria-label="编辑策略" @click="openEdit(item)"><IconEdit :size="16" /></button><button class="icon-button danger" title="删除" aria-label="删除 Key" @click="remove(item)"><IconTrash :size="16" /></button></div></td>
         </tr><tr v-if="!filtered.length"><td colspan="8"><div class="admin-empty">没有匹配的 Hub Key</div></td></tr></tbody>
       </table>
     </section>
@@ -285,7 +260,6 @@ function periodLimit(item: HubKeyView, period: HubKeyUsagePeriod, metric: 'Reque
       </section>
     </div>
 
-    <div v-if="secretItem" class="admin-modal-backdrop" @click.self="secretItem = null"><section class="admin-modal" role="dialog" aria-modal="true"><header><div><span>KEY SECRET</span><h2>{{ secretMode === 'reveal' ? '查看完整 Key' : '设置完整 Key 值' }}</h2></div><button class="icon-button" title="关闭" aria-label="关闭" @click="secretItem = null"><IconX :size="18" /></button></header><form class="admin-form" @submit.prevent="submitSecret"><p><strong>{{ secretItem.name }}</strong> · <code>{{ secretItem.maskedKey }}</code></p><label><span>当前管理员密码</span><input v-model="secretPassword" type="password" autocomplete="current-password" required></label><label v-if="secretMode === 'replace'"><span>新的完整 Key</span><input v-model="replacementKey" type="password" minlength="16" maxlength="512" autocomplete="off" required></label><div v-if="secretValue" class="credential-secret"><code>{{ masked(secretValue) }}</code><button type="button" class="button button--secondary button--small" @click="copySecret(secretValue)"><IconCopy :size="15" />{{ copied ? '已复制' : '复制' }}</button></div><p v-if="secretError" class="form-error">{{ secretError }}</p><footer><button type="button" class="button button--secondary" @click="secretItem = null">关闭</button><button v-if="!secretValue" class="button button--primary" :disabled="secretBusy">{{ secretBusy ? '处理中' : secretMode === 'reveal' ? '验证并查看' : '验证并设置' }}</button></footer></form></section></div>
 
     <div v-if="detail || detailLoading" class="log-drawer-backdrop" @click.self="detail = null">
       <aside class="log-drawer key-usage-drawer">

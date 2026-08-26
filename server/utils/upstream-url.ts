@@ -5,6 +5,7 @@ import { Agent, fetch as undiciFetch } from 'undici'
 import { redactSensitiveText } from './upstream'
 
 const ALLOWED_RANGES = new Set(['unicast'])
+const TUN_FAKE_IP_RANGE = ipaddr.parseCIDR('198.18.0.0/15')
 
 export function isPublicUpstreamAddress(value: string) {
   if (!ipaddr.isValid(value)) return false
@@ -14,6 +15,17 @@ export function isPublicUpstreamAddress(value: string) {
     if (ipv6.isIPv4MappedAddress()) address = ipv6.toIPv4Address()
   }
   return ALLOWED_RANGES.has(address.range())
+}
+
+export function isTunFakeIpAddress(value: string) {
+  if (!ipaddr.isValid(value)) return false
+  let address = ipaddr.parse(value)
+  if (address.kind() === 'ipv6' && (address as ipaddr.IPv6).isIPv4MappedAddress()) address = (address as ipaddr.IPv6).toIPv4Address()
+  return address.kind() === 'ipv4' && address.match(TUN_FAKE_IP_RANGE)
+}
+
+function allowTunFakeIpForHostname(hostname: string) {
+  return process.env.NUXT_ALLOW_TUN_FAKE_IP_UPSTREAMS === 'true' && !ipaddr.isValid(hostname)
 }
 
 export function normalizeUserUpstreamUrl(raw: string) {
@@ -36,7 +48,8 @@ export async function resolvePublicUpstream(raw: string) {
     const message = error instanceof Error ? error.message : 'DNS 解析失败'
     throw createError({ statusCode: 400, message: `无法解析中转地址：${message}` })
   }
-  if (!addresses.length || addresses.some(item => !isPublicUpstreamAddress(item.address))) {
+  const allowTunFakeIp = allowTunFakeIpForHostname(url.hostname)
+  if (!addresses.length || addresses.some(item => !isPublicUpstreamAddress(item.address) && !(allowTunFakeIp && isTunFakeIpAddress(item.address)))) {
     throw createError({ statusCode: 400, message: '中转地址解析到了不允许访问的网络' })
   }
   return { normalized, url, addresses: addresses.slice(0, 8) }

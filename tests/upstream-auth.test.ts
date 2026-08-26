@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { isClientIdentityRejection, probeAuthSchemes, upstreamAuthHeaders } from '../server/utils/upstream-auth'
+import { upstreamProbeClientIdentity } from '../server/utils/upstream-client-identity'
 
 describe('upstream authentication compatibility', () => {
   it('keeps the configured scheme when it succeeds', async () => {
@@ -33,5 +34,11 @@ describe('upstream authentication compatibility', () => {
   it('builds either Bearer or x-api-key headers without combining credentials', () => {
     expect(upstreamAuthHeaders('bearer', 'secret')).toEqual({ authorization: 'Bearer secret' })
     expect(upstreamAuthHeaders('x_api_key', 'secret')).toEqual({ 'x-api-key': 'secret', 'anthropic-version': '2023-06-01' })
+  })
+
+  it('uses protocol-specific identities for compatibility probes', () => {
+    expect(upstreamProbeClientIdentity('anthropic_messages')).toEqual({ 'user-agent': 'claude-cli/2.1.232 (external, cli)' })
+    expect(upstreamProbeClientIdentity('openai_chat')).toEqual({ 'user-agent': 'codex_cli_rs/0.80.0', originator: 'codex_cli_rs' })
+    expect(upstreamProbeClientIdentity('openai_responses')).toEqual({ 'user-agent': 'codex_cli_rs/0.80.0', originator: 'codex_cli_rs' })
   })
 })

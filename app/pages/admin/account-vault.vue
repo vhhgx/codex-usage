@@ -160,7 +160,6 @@ const form = reactive({
 })
 
 const showExport = ref(false)
-const exportPassword = ref('')
 const exportError = ref('')
 
 const showReceiverForm = ref(false)
@@ -1047,19 +1046,16 @@ async function importDelivery() {
 }
 
 function openExport() {
-  exportPassword.value = ''
   exportError.value = ''
   showExport.value = true
 }
 
 async function exportAccounts() {
   exportError.value = ''
-  if (!exportPassword.value) return
   try {
     const response = await fetch('/api/admin/account-vault/export', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ password: exportPassword.value })
+      headers: { 'content-type': 'application/json' }
     })
     if (!response.ok) {
       const body = await response.json().catch(() => null)
@@ -2026,7 +2022,7 @@ onBeforeUnmount(() => { totpTimers.forEach(timer => window.clearTimeout(timer)) 
       <div v-if="showExport" class="admin-modal-backdrop account-vault-layer" @click.self="showExport = false">
       <section class="admin-modal vault-security-modal hub-layer-panel" role="dialog" aria-modal="true" aria-label="导出完整账号">
         <header><div><span>SECURITY CHECK</span><h2 class="text-balance">导出完整账号</h2></div><button class="icon-button" type="button" title="关闭" aria-label="关闭" @click="showExport = false"><IconX :size="18" /></button></header>
-        <form class="admin-form" @submit.prevent="exportAccounts"><div class="vault-security-note"><IconLock :size="18" /><p class="text-pretty">导出文件包含账号密码、Token、2FA 密钥、邮箱验证码链接和完整接码链接。操作会写入审计日志。</p></div><label><span>当前管理员密码</span><input v-model="exportPassword" type="password" required autocomplete="current-password"></label><p v-if="exportError" class="form-error">{{ exportError }}</p><footer><button class="button button--secondary" type="button" @click="showExport = false">取消</button><button class="button button--primary">确认导出</button></footer></form>
+        <form class="admin-form" @submit.prevent="exportAccounts"><div class="vault-security-note"><IconLock :size="18" /><p class="text-pretty">导出文件包含账号密码、Token、2FA 密钥、邮箱验证码链接和完整接码链接。操作会写入审计日志。</p></div><p v-if="exportError" class="form-error">{{ exportError }}</p><footer><button class="button button--secondary" type="button" @click="showExport = false">取消</button><button class="button button--primary">确认导出</button></footer></form>
       </section>
       </div>
     </Transition>

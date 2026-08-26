@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { ServicePlan, UserSubscription } from '../server/db/schema'
 import { subscriptionAdmissionScope } from '../server/services/hub-limits'
+import { effectivePlatformExpiry, isPlatformAccessExpired } from '../server/services/customer-management'
 
 function subscription(overrides: Partial<UserSubscription> = {}): UserSubscription {
   const startsAt = new Date('2026-08-01T00:00:00.000Z')
@@ -52,5 +53,17 @@ describe('customer plan admission scope', () => {
     expect(subscriptionAdmissionScope(subscription(), plan({ mode: 'cost', tokenLimit: null, costLimit: '25.5' })))
       .toMatchObject({ periods: [{ tokenLimit: null, costLimit: '25.5' }] })
     expect(subscriptionAdmissionScope(subscription(), plan({ mode: 'unlimited', tokenLimit: null }))).toBeNull()
+  })
+})
+
+describe('user platform access expiry', () => {
+  it('uses the earlier of the package cycle and account platform expiry', () => {
+    expect(effectivePlatformExpiry(new Date('2026-09-01T00:00:00Z'), new Date('2026-08-20T00:00:00Z'))?.toISOString()).toBe('2026-08-20T00:00:00.000Z')
+    expect(effectivePlatformExpiry(null, null)).toBeNull()
+  })
+
+  it('expires platform access without changing personal-resource state', () => {
+    expect(isPlatformAccessExpired(null, new Date('2026-08-25T00:00:00Z'), new Date('2026-08-26T00:00:00Z'))).toBe(true)
+    expect(isPlatformAccessExpired(null, new Date('2026-08-27T00:00:00Z'), new Date('2026-08-26T00:00:00Z'))).toBe(false)
   })
 })

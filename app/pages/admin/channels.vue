@@ -63,7 +63,7 @@ watch(() => form.type, (type) => {
 })
 
 function protocolBinding(protocol: ChannelProtocol): ChannelProtocolBindingView {
-  return { protocol, enabled: true, baseUrlOverride: null, authScheme: protocol === 'anthropic_messages' ? 'x_api_key' : 'bearer', apiVersion: protocol === 'anthropic_messages' ? '2023-06-01' : null, verificationStatus: 'unknown', verifiedAt: null, lastError: null }
+  return { protocol, enabled: true, baseUrlOverride: null, authScheme: protocol === 'anthropic_messages' ? 'x_api_key' : 'bearer', apiVersion: protocol === 'anthropic_messages' ? '2023-06-01' : null, probeModel: null, verificationStatus: 'unknown', verifiedAt: null, lastError: null }
 }
 function reset() { Object.assign(form, { name: '', type: 'cpa', baseUrl: '', apiKey: '', enabled: true, priority: 100, weight: 1, maxConcurrency: 20, timeoutMs: settingsData.value?.settings.defaultTimeoutMs || 120000, priceMultiplier: 1, accessScope: 'all', grantedUserIds: [], grantedGroupIds: [], protocols: [protocolBinding('openai_responses'), protocolBinding('openai_chat')], models: [{ publicModel: '', upstreamModel: '', enabled: true, endpoints: [] }], modelDiscoveryEnabled: true, clientIdentityMode: 'standard' }) }
 function create() { editing.value = null; reset(); error.value = ''; modelSyncResult.value = ''; modelSearch.value = ''; showAvailableModels.value = false; showForm.value = true }

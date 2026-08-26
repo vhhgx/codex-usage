@@ -17,6 +17,7 @@ export interface HubUserView {
   role: UserRole
   status: UserStatus
   mustChangePassword: boolean
+  platformAccessExpiresAt: number | null
   lastLoginAt: number | null
   passwordChangedAt: number | null
   createdAt: number

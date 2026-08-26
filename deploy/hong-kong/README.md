@@ -19,3 +19,6 @@
 `NUXT_HUB_KEY_PEPPER` 与旧环境一致。切换窗口中只允许一个 Hub 数据面接收正式写流量。
 数据库、Redis、MinIO 和应用服务都没有 `ports` 映射；需要维护时应通过 SSH 和
 `docker compose exec` 进入，不要临时暴露到公网。
+
+如需避免在香港服务器现场执行耗时的 Nuxt 构建，请使用
+[本地构建并通过 GHCR 部署](./LOCAL_BUILD_GHCR_DEPLOY.md)操作手册。

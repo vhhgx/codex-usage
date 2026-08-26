@@ -37,7 +37,7 @@ async function requirePoolEntitlement(event: H3Event, ownerUserId: string) {
   const plan = record(subscription?.plan)
   const entitlement = record(plan.entitlementSnapshot)
   const version = record(plan.version)
-  if (subscription?.status !== 'active') throw createError({ statusCode: 403, message: '当前套餐不可用，不能使用专属号池' })
+  if (!subscription) throw createError({ statusCode: 403, message: '当前账号没有可用的专属号池配置' })
   return { maxAccounts: numberValue(entitlement.maxPoolAccounts ?? version.maxPoolAccounts) }
 }
 

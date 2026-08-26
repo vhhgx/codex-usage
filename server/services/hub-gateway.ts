@@ -514,7 +514,7 @@ export async function listAccessibleModels(event: H3Event, key: typeof hubKeys.$
     db.select().from(groupModelRules).where(eq(groupModelRules.groupId, group.id)),
     db.select().from(groupChannelRules).where(eq(groupChannelRules.groupId, group.id))
   ])
-  const rows = await db.select({ publicModel: channelModels.publicModel, channelId: channels.id, healthStatus: channels.healthStatus, clientIdentityMode: channels.clientIdentityMode, modelDiscoveryEnabled: channels.modelDiscoveryEnabled, protocol: channelProtocolBindings.protocol })
+  const rows = await db.select({ publicModel: channelModels.publicModel, channelId: channels.id, channelType: channels.type, ownerKind: channels.ownerKind, healthStatus: channels.healthStatus, clientIdentityMode: channels.clientIdentityMode, modelDiscoveryEnabled: channels.modelDiscoveryEnabled, protocol: channelProtocolBindings.protocol })
     .from(channelModelBindings)
     .innerJoin(channelModels, eq(channelModelBindings.channelModelId, channelModels.id))
     .innerJoin(channelProtocolBindings, eq(channelModelBindings.protocolBindingId, channelProtocolBindings.id))
@@ -524,12 +524,19 @@ export async function listAccessibleModels(event: H3Event, key: typeof hubKeys.$
   const disabledPools = new Set(pools.filter(pool => !pool.enabled).map(pool => pool.publicModel))
   const redis = useRedis(event)
   const visibleIds = new Set((await visibleChannels(event, userId, key.id)).map(channel => channel.id))
+  const [activeSubscription, [privatePool]] = await Promise.all([
+    getActiveSubscription(event, userId),
+    db.select({ id: userPoolGroups.id }).from(userPoolGroups).where(and(eq(userPoolGroups.ownerUserId, userId), eq(userPoolGroups.status, 'active'))).limit(1)
+  ])
   const usableRows = []
   const restrictedChannels = channelRules.length > 0
   const enabledChannels = new Set(channelRules.filter(rule => rule.enabled).map(rule => rule.channelId))
   for (const row of rows) {
     const routable = row.healthStatus === 'healthy' || row.healthStatus === 'unknown' && row.clientIdentityMode === 'passthrough' && row.modelDiscoveryEnabled === false
-    if (!protocols.includes(row.protocol) || !visibleIds.has(row.channelId) || !routable || disabledPools.has(row.publicModel)) continue
+    const sourceAvailable = row.ownerKind === 'user'
+      || Boolean(activeSubscription)
+      || key.routeMode !== 'platform_only' && row.channelType === 'sub2api' && Boolean(privatePool)
+    if (!sourceAvailable || !protocols.includes(row.protocol) || !visibleIds.has(row.channelId) || !routable || disabledPools.has(row.publicModel)) continue
     if (restrictedChannels && !enabledChannels.has(row.channelId)) continue
     if (!await redis.exists(`hub:circuit:${row.channelId}:open`)) usableRows.push(row)
   }
@@ -547,7 +554,7 @@ async function handleModelsRequest(event: H3Event, access: Awaited<ReturnType<ty
   const startedAt = Date.now()
   let concurrencyLease: HubConcurrencyLease
   try {
-    concurrencyLease = await admitHubRequest(event, key, group, 0, 0)
+    concurrencyLease = await admitHubRequest(event, key, group, 0, 0, { scopeMode: 'base_only' })
   } catch (error) {
     const failure = error as { statusCode?: number; message?: string }
     if (failure.statusCode === 429) {
@@ -737,16 +744,16 @@ export async function handleHubRequest(event: H3Event, path: string) {
       effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Math.max(...initialCandidates.map(candidate => Number(candidate.channel.priceMultiplier))))
     )
     const hasPackageNode = candidateBatches.some(batch => batch.node.source === 'platform')
-    if (hasPackageNode) {
-      const activeSubscription = await getActiveSubscription(event, userId)
-      const version = activeSubscription?.subscription.planVersionId
+    const activeSubscription = hasPackageNode ? await getActiveSubscription(event, userId) : null
+    if (hasPackageNode && activeSubscription) {
+      const version = activeSubscription.subscription.planVersionId
         ? (await useDatabase(event).select().from(servicePlanVersions).where(eq(servicePlanVersions.id, activeSubscription.subscription.planVersionId)).limit(1))[0]
         : null
-      const snapshot = activeSubscription?.subscription.entitlementSnapshot || {}
-      packageBillingMode = String(version?.billingMode || snapshot.billingMode || (activeSubscription?.plan.mode === 'token' ? 'token_package' : activeSubscription?.plan.mode === 'cost' ? 'token_metered' : 'unlimited'))
+      const snapshot = activeSubscription.subscription.entitlementSnapshot || {}
+      packageBillingMode = String(version?.billingMode || snapshot.billingMode || (activeSubscription.plan.mode === 'token' ? 'token_package' : activeSubscription.plan.mode === 'cost' ? 'token_metered' : 'unlimited'))
       const supplyMode = String(version?.supplyMode || snapshot.supplyMode || 'platform_only')
-      const tokenLimit = Number(version?.tokenLimit ?? snapshot.tokenLimit ?? activeSubscription?.plan.tokenLimit ?? 0)
-      const usedRow = activeSubscription && tokenLimit > 0
+      const tokenLimit = Number(version?.tokenLimit ?? snapshot.tokenLimit ?? activeSubscription.plan.tokenLimit ?? 0)
+      const usedRow = tokenLimit > 0
         ? (await useDatabase(event).select({ tokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}), 0)` }).from(usageRollups).where(and(eq(usageRollups.userId, userId), eq(usageRollups.granularity, 'day'), gte(usageRollups.bucketStart, activeSubscription.subscription.startsAt))))[0]
         : null
       try {
@@ -756,8 +763,8 @@ export async function handleHubRequest(event: H3Event, path: string) {
           estimatedTokens: reservation.tokens,
           remainingTokens: tokenLimit > 0 ? Math.max(0, tokenLimit - Number(usedRow?.tokens || 0)) : null,
           privatePoolAvailable,
-          subscriptionId: activeSubscription?.subscription.id,
-          planVersionId: version?.id || activeSubscription?.subscription.planVersionId,
+          subscriptionId: activeSubscription.subscription.id,
+          planVersionId: version?.id || activeSubscription.subscription.planVersionId,
           poolGroupId: privatePool?.id
         })
       } catch (error) {

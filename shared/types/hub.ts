@@ -74,6 +74,7 @@ export interface ChannelProtocolBindingView {
   baseUrlOverride: string | null
   authScheme: ChannelAuthScheme
   apiVersion: string | null
+  probeModel: string | null
   verificationStatus: ProtocolVerificationStatus
   verifiedAt: number | null
   lastError: string | null

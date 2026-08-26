@@ -21,9 +21,12 @@ vi.mock('undici', () => {
   return { Agent, fetch: mocks.fetch }
 })
 
-import { isPublicUpstreamAddress, normalizeUserUpstreamUrl, pinnedUpstreamFetch, upstreamNetworkError } from '../server/utils/upstream-url'
+import { isPublicUpstreamAddress, isTunFakeIpAddress, normalizeUserUpstreamUrl, pinnedUpstreamFetch, upstreamNetworkError } from '../server/utils/upstream-url'
 
-afterEach(() => vi.clearAllMocks())
+afterEach(() => {
+  vi.clearAllMocks()
+  delete process.env.NUXT_ALLOW_TUN_FAKE_IP_UPSTREAMS
+})
 
 describe('private relay SSRF protection', () => {
   it('accepts only clean HTTPS base URLs', () => {
@@ -39,6 +42,13 @@ describe('private relay SSRF protection', () => {
     }
     expect(isPublicUpstreamAddress('1.1.1.1')).toBe(true)
     expect(isPublicUpstreamAddress('2606:4700:4700::1111')).toBe(true)
+  })
+
+  it('recognizes only the benchmark range used by TUN fake-IP DNS', () => {
+    expect(isTunFakeIpAddress('198.18.0.1')).toBe(true)
+    expect(isTunFakeIpAddress('198.19.255.254')).toBe(true)
+    expect(isTunFakeIpAddress('198.20.0.1')).toBe(false)
+    expect(isTunFakeIpAddress('192.168.1.1')).toBe(false)
   })
 })
 
@@ -64,6 +74,18 @@ describe('pinned upstream fetch', () => {
     expect(result.target).toBe('https://relay.test/v1/models')
     expect(result.response).toBe(response)
     expect(mocks.fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('allows hostname fake-IP addresses only with the explicit local TUN switch', async () => {
+    process.env.NUXT_ALLOW_TUN_FAKE_IP_UPSTREAMS = 'true'
+    mocks.lookup.mockResolvedValue([{ address: '198.18.0.11', family: 4 }])
+    const response = { ok: true, status: 200 }
+    mocks.fetch.mockResolvedValue(response)
+
+    const result = await pinnedUpstreamFetch('https://relay.test', '/v1/models')
+
+    expect(result.address).toBe('198.18.0.11')
+    expect(result.response).toBe(response)
   })
 
   it('expands the useful cause and code hidden behind fetch failed', () => {

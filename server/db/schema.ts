@@ -56,6 +56,7 @@ export const users = pgTable('users', {
   role: userRoleEnum('role').notNull().default('user'),
   status: userStatusEnum('status').notNull().default('active'),
   mustChangePassword: boolean('must_change_password').notNull().default(false),
+  platformAccessExpiresAt: timestamp('platform_access_expires_at', { withTimezone: true }),
   lastLoginAt: timestamp('last_login_at', { withTimezone: true }),
   passwordChangedAt: timestamp('password_changed_at', { withTimezone: true }),
   ...timestamps
@@ -145,6 +146,7 @@ export const channelProtocolBindings = pgTable('channel_protocol_bindings', {
   baseUrlOverride: text('base_url_override'),
   authScheme: channelAuthSchemeEnum('auth_scheme').notNull().default('bearer'),
   apiVersion: text('api_version'),
+  probeModel: text('probe_model'),
   adapterOptions: jsonb('adapter_options').$type<Record<string, unknown>>().notNull().default({}),
   verificationStatus: protocolVerificationStatusEnum('verification_status').notNull().default('unknown'),
   verifiedAt: timestamp('verified_at', { withTimezone: true }),

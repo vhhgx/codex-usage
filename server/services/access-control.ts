@@ -26,6 +26,13 @@ function text(value: unknown, max = 500) {
   return typeof value === 'string' ? value.trim().slice(0, max) : ''
 }
 
+function platformExpiry(value: unknown) {
+  if (value === null || value === undefined || value === '') return null
+  const date = new Date(String(value))
+  if (Number.isNaN(date.getTime())) throw createError({ statusCode: 400, message: '平台套餐到期时间格式不正确' })
+  return date
+}
+
 function nullableInteger(value: unknown, min = 0) {
   if (value === null || value === undefined || value === '') return null
   const parsed = Number(value)
@@ -98,6 +105,7 @@ export async function listUsers(event: H3Event): Promise<HubUserView[]> {
       role: user.role,
       status: user.status,
       mustChangePassword: user.mustChangePassword,
+      platformAccessExpiresAt: user.platformAccessExpiresAt?.getTime() || null,
       lastLoginAt: user.lastLoginAt?.getTime() || null,
       passwordChangedAt: user.passwordChangedAt?.getTime() || null,
       createdAt: user.createdAt.getTime(),
@@ -175,6 +183,7 @@ export async function createUserRecord(event: H3Event, body: UnknownRecord, acto
     role,
     status: 'active',
     mustChangePassword: role === 'user',
+    platformAccessExpiresAt: platformExpiry(body.platformAccessExpiresAt),
     passwordChangedAt: null
   }).returning({ id: users.id })
   if (!created) throw createError({ statusCode: 500, message: '创建用户失败' })
@@ -202,6 +211,7 @@ export async function updateUserRecord(event: H3Event, id: string, body: Unknown
     email,
     role,
     status,
+    platformAccessExpiresAt: body.platformAccessExpiresAt === undefined ? current.platformAccessExpiresAt ? new Date(current.platformAccessExpiresAt) : null : platformExpiry(body.platformAccessExpiresAt),
     updatedAt: new Date()
   }).where(eq(users.id, id))
   if (role === 'user') {
