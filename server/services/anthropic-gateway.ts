@@ -148,6 +148,7 @@ export async function handleAnthropicMessages(event: H3Event) {
     useDatabase(event).select().from(groupModelRules).where(eq(groupModelRules.groupId, group.id))
   ])
   const requestedModel = String(body.model)
+  event.context.hubRequestedModel = requestedModel
   if (keyModels.length && !keyModels.some(rule => rule.publicModel === requestedModel)) anthropicError(403, 'This Hub Key cannot use the requested model', 'permission_error')
   if (groupModels.length && !groupModels.some(rule => rule.publicModel === requestedModel)) anthropicError(403, 'This group cannot use the requested model', 'permission_error')
   const affinityKey = hashCacheAffinity(event, { scope: `${userId}:${key.id}`, protocol: 'anthropic_messages', model: requestedModel, system: body.system, tools: body.tools, sessionId: getHeader(event, 'x-zephyr-session-id') || null })

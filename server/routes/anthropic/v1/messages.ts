@@ -1,4 +1,5 @@
 import { handleAnthropicMessages } from '../../../services/anthropic-gateway'
+import { recordRejectedHubRequest } from '../../../services/hub-gateway'
 
 export default defineEventHandler(async (event) => {
   const requestId = `req_${crypto.randomUUID().replace(/-/g, '')}`
@@ -8,6 +9,7 @@ export default defineEventHandler(async (event) => {
   try {
     return await handleAnthropicMessages(event)
   } catch (error) {
+    await recordRejectedHubRequest(event, 'messages', error).catch(logError => console.error('[hub-request-log]', logError instanceof Error ? logError.message : logError))
     const failure = error as { statusCode?: number; message?: string; data?: { type?: string; error?: { type?: string; message?: string } } }
     const status = Number(failure.statusCode || 500)
     setResponseStatus(event, status)
