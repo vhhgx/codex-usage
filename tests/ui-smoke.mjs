@@ -71,9 +71,10 @@ if (bootstrap) {
     (${user.id}, 'UI Smoke Site B', 'https://relay-b.example.com', 'https://relay-b.example.com', 'generic') returning id, name`
   const relayGroupA = relayGroups.find(item => item.name === 'UI Smoke Site A')
   const relayGroupB = relayGroups.find(item => item.name === 'UI Smoke Site B')
-  await fixtureDb`insert into channels (name, type, base_url, encrypted_api_key, owner_kind, owner_user_id, user_relay_group_id, account_label, access_scope, created_by, credential_key_version, enabled, priority, weight, max_concurrency, timeout_ms, health_status, last_health_check_at, last_health_error) values
-    ('UI Smoke Relay A', 'openai_compatible', 'https://relay-a.example.com', 'ui-test-not-for-decryption', 'user', ${user.id}, ${relayGroupA.id}, '主账号', 'private', ${user.id}, 'v2', true, 10, 1, 5, 120000, 'healthy', now(), null),
-    ('UI Smoke Relay B', 'openai_compatible', 'https://relay-b.example.com', 'ui-test-not-for-decryption', 'user', ${user.id}, ${relayGroupB.id}, '主账号', 'private', ${user.id}, 'v2', true, 20, 1, 5, 120000, 'unhealthy', now(), 'UI Smoke 上游连接失败')`
+  await fixtureDb`insert into channels (name, type, base_url, encrypted_api_key, owner_kind, owner_user_id, user_relay_group_id, account_label, account_rank, access_scope, created_by, credential_key_version, enabled, priority, weight, max_concurrency, timeout_ms, health_status, last_health_check_at, last_health_error) values
+    ('UI Smoke Relay A', 'openai_compatible', 'https://relay-a.example.com', 'ui-test-not-for-decryption', 'user', ${user.id}, ${relayGroupA.id}, '主账号', 10, 'private', ${user.id}, 'v2', true, 10, 1, 5, 120000, 'healthy', now(), null),
+    ('UI Smoke Relay A2', 'openai_compatible', 'https://relay-a2.example.com', 'ui-test-not-for-decryption', 'user', ${user.id}, ${relayGroupA.id}, '备用账号', 20, 'private', ${user.id}, 'v2', true, 15, 1, 5, 120000, 'healthy', now(), null),
+    ('UI Smoke Relay B', 'openai_compatible', 'https://relay-b.example.com', 'ui-test-not-for-decryption', 'user', ${user.id}, ${relayGroupB.id}, '主账号', 10, 'private', ${user.id}, 'v2', true, 20, 1, 5, 120000, 'unhealthy', now(), 'UI Smoke 上游连接失败')`
   await fixtureDb`update channels set checkin_enabled = true, encrypted_checkin_token = 'ui-test-not-for-decryption' where owner_user_id = ${user.id} and name = 'UI Smoke Relay A'`
   const [announcement] = await fixtureDb`insert into announcements (title, content, tone, status, published_at, created_by) values ('UI Smoke 公告', '用户首页公告可见性检查', 'info', 'published', now(), ${admin.id}) returning id`
   fixtureAnnouncementIds = [announcement.id]
@@ -232,6 +233,15 @@ try {
           throw new Error('published administrator announcement is not visible on the user announcement page')
         }
         if (target.name === 'admin' && path === '/admin/models') {
+          const probeResponse = await context.request.get(`${baseUrl}/api/admin/probe-models`)
+          const probeModels = (await probeResponse.json()).models || []
+          if (!probeResponse.ok() || probeModels.length < 3) throw new Error('protocol probe model catalog is missing seeded models')
+          if (!await page.locator('.probe-model-list article').count()) throw new Error('protocol probe model catalog is not rendered')
+          await page.getByRole('button', { name: '添加模型', exact: true }).click()
+          const probeDrawer = page.getByRole('dialog', { name: '添加探测模型' })
+          await probeDrawer.waitFor()
+          await probeDrawer.getByLabel('协议 / 端点 *').selectOption('openai_responses')
+          await probeDrawer.getByRole('button', { name: '关闭' }).click()
           const response = await context.request.get(`${baseUrl}/api/admin/models`)
           const models = (await response.json()).models || []
           for (const model of models) {
@@ -319,11 +329,32 @@ try {
         if (target.name === 'user' && path === '/console/resources') {
           if (!await page.locator('.workspace-nav').getByText('套餐与资源', { exact: true }).count()) throw new Error('combined resource navigation label is missing')
           if (await page.getByRole('tab', { name: '权限与额度', exact: true }).count()) throw new Error('redundant access and quota tab is still visible')
-          if (await page.locator('.relay-site-tabs > button').count() !== 2) throw new Error('relay groups are not rendered as one shared site tab bar')
-          if (await page.locator('.relay-group-summary').count() !== 1) throw new Error('inactive relay groups are still mounted in the page')
+          if (await page.locator('.relay-group-summary').count() !== 2) throw new Error('relay groups are not rendered as a complete vertical list')
+          if (await page.locator('.relay-row').count() !== 3) throw new Error('grouped relay accounts are not all expanded as list rows')
+          const groupedSite = page.locator('.relay-group-summary').filter({ hasText: 'UI Smoke Site A' })
+          const groupedAccounts = groupedSite.locator('.relay-row')
+          if (await groupedAccounts.count() !== 2) throw new Error('same-site accounts are not grouped in one station list')
+          if (await groupedSite.locator('.relay-row-drag').count() !== 2) throw new Error('manual account order does not expose vertical drag handles')
+          await groupedAccounts.nth(1).scrollIntoViewIfNeeded()
+          await groupedAccounts.first().locator('.relay-row-drag').scrollIntoViewIfNeeded()
+          const accountOrderResponse = page.waitForResponse(response => /\/api\/console\/relay-groups\/[^/]+\/account-order$/.test(new URL(response.url()).pathname) && response.request().method() === 'PUT')
+          const [accountHandleBox, accountTargetBox] = await Promise.all([groupedAccounts.first().locator('.relay-row-drag').boundingBox(), groupedAccounts.nth(1).boundingBox()])
+          if (!accountHandleBox || !accountTargetBox) throw new Error('account drag handles are not visible')
+          await page.mouse.move(accountHandleBox.x + accountHandleBox.width / 2, accountHandleBox.y + accountHandleBox.height / 2)
+          await page.mouse.down()
+          await page.mouse.move(accountTargetBox.x + accountTargetBox.width / 2, accountTargetBox.y + accountTargetBox.height / 2, { steps: 8 })
+          await page.mouse.up()
+          const accountOrderResult = await accountOrderResponse
+          if (!accountOrderResult.ok()) throw new Error(`manual account row order could not be saved: HTTP ${accountOrderResult.status()} ${await accountOrderResult.text()}`)
+          await groupedSite.locator('.relay-row').first().getByText('备用账号', { exact: true }).waitFor()
+          await page.route(/\/api\/console\/relays\/[^/]+\/connectivity$/, route => route.fulfill({ status: 200, json: { status: 'operational', success: true, message: '中转地址可达', endpoint: 'https://relay-a.example.com', responseTimeMs: 25, httpStatus: 401, testedAt: Date.now(), retryCount: 0, errorCode: null } }))
+          await page.getByRole('button', { name: 'UI Smoke Relay A 检测连通', exact: true }).click()
+          await page.locator('.app-toast[data-tone="success"]', { hasText: '连通正常' }).waitFor()
+          await page.unroute(/\/api\/console\/relays\/[^/]+\/connectivity$/)
           const relayOrderItems = page.locator('.relay-order__item')
-          if (await relayOrderItems.count() !== 3) throw new Error('failover order did not render the package and all user relays')
-          if (await page.locator('.relay-order__item[data-source-type="package"]').count() !== 1) throw new Error('failover order did not render exactly one package source')
+          if (await page.locator('.relay-order__item[data-source-type="user_relay"]').count() !== 2) throw new Error('failover order did not collapse each relay station into one source')
+          if (await relayOrderItems.count() < 2) throw new Error('failover order did not render the available relay sources')
+          if (await page.locator('.relay-order__item[data-source-type="package"]').count() > 1) throw new Error('failover order rendered duplicate package sources')
           if (await page.locator('.relay-order').getByText('UI Smoke 上游连接失败', { exact: true }).count()) throw new Error('failover order still exposes channel error details')
           if (!await page.getByRole('button', { name: '一键签到', exact: true }).isEnabled()) throw new Error('bulk check-in is not available for a configured relay')
           if (!await page.getByRole('button', { name: 'UI Smoke Relay A 签到', exact: true }).count()) throw new Error('configured relay does not expose its check-in action')
@@ -345,10 +376,13 @@ try {
           await page.mouse.up()
           if (!(await reorderResponse).ok()) throw new Error('relay failover order could not be saved')
           await relayOrderItems.first().getByText(nextRelayName, { exact: true }).waitFor()
-          await page.getByRole('button', { name: '添加中转', exact: true }).click()
+          await page.getByRole('button', { name: '添加站点', exact: true }).click()
           const relayDrawer = page.getByRole('dialog', { name: '添加中转' })
           await relayDrawer.waitFor()
           if (!await relayDrawer.locator('input').count()) throw new Error('relay create form did not open in a drawer')
+          await relayDrawer.getByLabel('预设服务商').selectOption('agentrouter')
+          if (await relayDrawer.getByLabel('Base URL *').inputValue() !== 'https://agentrouter.org') throw new Error('relay provider preset did not fill the base URL')
+          if (await relayDrawer.locator('.protocol-option.active').count() !== 3) throw new Error('relay provider preset did not fill supported protocols')
           await relayDrawer.getByRole('button', { name: '关闭' }).click()
           for (const tabName of ['我的中转', '专属号池']) {
             if (!await page.getByRole('tab', { name: tabName, exact: true }).count()) throw new Error(`combined user resource tab is missing: ${tabName}`)
@@ -357,6 +391,7 @@ try {
           await page.waitForURL(`${baseUrl}/console/resources?tab=pool`)
           await page.locator('.pool-page').waitFor({ state: 'attached', timeout: 5000 })
           const poolImport = page.getByRole('button', { name: '导入账号', exact: true })
+          await poolImport.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {})
           if (!await poolImport.count()) throw new Error('user pool import action is missing')
           if (await poolImport.isDisabled()) throw new Error('user pool import should be enabled after the pool exists')
           await poolImport.click()
@@ -390,6 +425,14 @@ try {
           if (await page.locator('.resource-section-heading').count()) throw new Error('resource tabs still render duplicated section headings')
           const resourceHeader = page.locator('.admin-page__header')
           await resourceHeader.getByRole('button', { name: '添加渠道', exact: true }).waitFor()
+          await resourceHeader.getByRole('button', { name: '添加渠道', exact: true }).click()
+          const channelDialog = page.getByRole('dialog', { name: '连接新渠道' })
+          const providerPresetSelect = channelDialog.locator('label', { hasText: '预设服务商' }).locator('select')
+          if (!await providerPresetSelect.count()) throw new Error(`admin provider preset is missing: ${(await channelDialog.innerText()).slice(0, 500)}`)
+          await providerPresetSelect.selectOption('agentrouter')
+          if (await channelDialog.getByLabel('Base URL *').inputValue() !== 'https://agentrouter.org') throw new Error('admin provider preset did not fill the base URL')
+          if (await channelDialog.locator('.channel-protocol-picker button.active').count() !== 3) throw new Error('admin provider preset did not fill supported protocols')
+          await channelDialog.getByRole('button', { name: '关闭' }).click()
           for (const tabName of ['渠道', '分组', '套餐']) {
             if (!await page.getByRole('tab', { name: tabName, exact: true }).count()) throw new Error(`combined resource tab is missing: ${tabName}`)
           }

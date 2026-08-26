@@ -35,6 +35,7 @@ import {
 } from '../db/schema'
 import { contentHash, decryptChannelSecret, hashCacheAffinity, hashClientIp, hashHubKey } from '../utils/hub-crypto'
 import { classifyRelayFailure, relayFailureAffectsAccount, relayFailureAllowsFailover } from './relay-platform'
+import { MAX_UPSTREAM_RETRIES, shouldRetryUpstream, shouldRetryUpstreamError, upstreamRetryDelay, waitForUpstreamRetry } from './upstream-retry'
 import { markUserRelayFailure } from './user-relays'
 import { storeEncryptedBody, storeEncryptedStream } from '../utils/object-storage'
 import {
@@ -937,9 +938,8 @@ export async function handleHubRequest(event: H3Event, path: string) {
       }
       affinityWasReused = candidate.affinityReused === true
       lastCandidate = candidate
-      attemptCount += 1
       admittedChannel = channelLease
-      const attemptStarted = Date.now()
+      let attemptStarted = Date.now()
       let upstreamHeadersReceived = false
       let closePinnedConnection: (() => Promise<void>) | null = null
       const closePinned = async () => {
@@ -967,19 +967,42 @@ export async function handleHubRequest(event: H3Event, path: string) {
         const credential = candidate.credential || decryptChannelSecret(candidate.channel.encryptedApiKey, candidate.channel.id, candidate.channel.ownerKind, event)
         const headers = upstreamHeaders(event, credential, candidate.protocolBinding.authScheme, candidate.protocolBinding.apiVersion)
         upstreamRequestStarted = true
-        const response = candidate.channel.ownerKind === 'user'
-          ? await (async () => {
-              const result = await pinnedUpstreamFetch(upstreamBase, endpoint, { method: 'POST', headers, body: outgoing, signal: upstreamAbort.signal })
-              closePinnedConnection = result.close
-              return result.response as unknown as Response
-            })()
-          : await fetch(`${upstreamBase}${endpoint}`, { method: 'POST', headers, body: outgoing as unknown as BodyInit, redirect: 'manual', signal: upstreamAbort.signal })
-        upstreamHeadersReceived = true
+        let response: Response
         let prefetchedResponseBuffer: Buffer | null = null
         let responseFailureClass = null as ReturnType<typeof classifyRelayFailure> | null
-        if (!response.ok) {
-          prefetchedResponseBuffer = Buffer.from(await response.arrayBuffer())
-          responseFailureClass = classifyRelayFailure(response.status, prefetchedResponseBuffer.toString('utf8'))
+        for (let retryIndex = 0; ; retryIndex++) {
+          attemptCount += 1
+          attemptStarted = Date.now()
+          upstreamHeadersReceived = false
+          try {
+            response = candidate.channel.ownerKind === 'user'
+              ? await (async () => {
+                  const result = await pinnedUpstreamFetch(upstreamBase, endpoint, { method: 'POST', headers, body: outgoing, signal: upstreamAbort.signal })
+                  closePinnedConnection = result.close
+                  return result.response as unknown as Response
+                })()
+              : await fetch(`${upstreamBase}${endpoint}`, { method: 'POST', headers, body: outgoing as unknown as BodyInit, redirect: 'manual', signal: upstreamAbort.signal })
+          } catch (error) {
+            if (retryIndex >= MAX_UPSTREAM_RETRIES || upstreamAbort.signal.aborted || !shouldRetryUpstreamError(error)) throw error
+            await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attemptCount, status: 'retrying', durationMs: Date.now() - attemptStarted, errorMessage: error instanceof Error ? error.message.slice(0, 2000) : 'Temporary upstream network error', failureClass: 'upstream_unavailable', ...resourceFields(candidate) })
+            await closePinned()
+            closePinnedConnection = null
+            await waitForUpstreamRetry(upstreamRetryDelay(null, retryIndex))
+            continue
+          }
+          upstreamHeadersReceived = true
+          prefetchedResponseBuffer = null
+          responseFailureClass = null
+          if (!response.ok) {
+            prefetchedResponseBuffer = Buffer.from(await response.arrayBuffer())
+            responseFailureClass = classifyRelayFailure(response.status, prefetchedResponseBuffer.toString('utf8'))
+          }
+          const failureText = prefetchedResponseBuffer?.toString('utf8') || ''
+          if (!shouldRetryUpstream(response.status, failureText) || retryIndex >= MAX_UPSTREAM_RETRIES) break
+          await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attemptCount, status: 'retrying', httpStatus: response.status, durationMs: Date.now() - attemptStarted, errorMessage: failureText.slice(0, 2000), failureClass: responseFailureClass || 'upstream_unavailable', ...resourceFields(candidate) })
+          await closePinned()
+          closePinnedConnection = null
+          await waitForUpstreamRetry(upstreamRetryDelay(response.headers.get('retry-after'), retryIndex))
         }
         const retryable = responseFailureClass
           ? relayFailureAllowsFailover(response.status, responseFailureClass, candidate.channel.ownerKind === 'user')

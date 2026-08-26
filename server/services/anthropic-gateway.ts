@@ -26,6 +26,7 @@ import { pipeOpenAiChatAsAnthropic } from './protocols/anthropic-stream'
 import type { CanonicalUsage } from './protocols/canonical'
 import { getUserFailoverSourceIds } from './user-route-preferences'
 import { classifyRelayFailure, relayFailureAffectsAccount, relayFailureAllowsFailover } from './relay-platform'
+import { MAX_UPSTREAM_RETRIES, shouldRetryUpstream, shouldRetryUpstreamError, upstreamRetryDelay, waitForUpstreamRetry } from './upstream-retry'
 import { markUserRelayFailure } from './user-relays'
 
 const MAX_BODY_BYTES = 50 * 1024 * 1024
@@ -277,10 +278,11 @@ export async function handleAnthropicMessages(event: H3Event) {
       if (!lease) continue
       admitted = lease
       lastCandidate = candidate
-      attempts += 1
       const started = Date.now()
+      let attemptStarted = started
       let closePinned: (() => Promise<void>) | null = null
       let controller: AbortController | null = null
+      let upstreamTimer: ReturnType<typeof setTimeout> | null = null
       let streamDirectory: string | null = null
       let streamArchive: ReturnType<typeof createWriteStream> | null = null
       const abortUpstream = () => controller?.abort(new Error('Client disconnected'))
@@ -300,22 +302,47 @@ export async function handleAnthropicMessages(event: H3Event) {
         const requestController = new AbortController()
         controller = requestController
         event.node.res.once('close', abortUpstream)
-        const timer = setTimeout(() => requestController.abort(new Error('Upstream request timed out')), candidate.channel.timeoutMs)
-        timer.unref()
-        const response = candidate.channel.ownerKind === 'user'
-          ? await (async () => {
-              const result = await pinnedUpstreamFetch(base, path, { method: 'POST', headers, body: JSON.stringify(outgoing), signal: requestController.signal })
-              closePinned = result.close
-              return result.response as unknown as Response
-            })()
-          : await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/i, '')}${path}`, { method: 'POST', headers, body: JSON.stringify(outgoing), redirect: 'manual', signal: requestController.signal })
-        clearTimeout(timer)
+        upstreamTimer = setTimeout(() => requestController.abort(new Error('Upstream request timed out')), candidate.channel.timeoutMs)
+        upstreamTimer.unref()
+        let response: Response
         let prefetchedResponseBuffer: Buffer | null = null
         let responseFailureClass = null as ReturnType<typeof classifyRelayFailure> | null
-        if (!response.ok) {
-          prefetchedResponseBuffer = Buffer.from(await response.arrayBuffer())
-          responseFailureClass = classifyRelayFailure(response.status, prefetchedResponseBuffer.toString('utf8'))
+        for (let retryIndex = 0; ; retryIndex++) {
+          attempts += 1
+          attemptStarted = Date.now()
+          try {
+            response = candidate.channel.ownerKind === 'user'
+              ? await (async () => {
+                  const result = await pinnedUpstreamFetch(base, path, { method: 'POST', headers, body: JSON.stringify(outgoing), signal: requestController.signal })
+                  closePinned = result.close
+                  return result.response as unknown as Response
+                })()
+              : await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/i, '')}${path}`, { method: 'POST', headers, body: JSON.stringify(outgoing), redirect: 'manual', signal: requestController.signal })
+          } catch (error) {
+            if (retryIndex >= MAX_UPSTREAM_RETRIES || requestController.signal.aborted || !shouldRetryUpstreamError(error)) throw error
+            await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'retrying', durationMs: Date.now() - attemptStarted, errorMessage: error instanceof Error ? error.message.slice(0, 2000) : 'Temporary upstream network error', failureClass: 'upstream_unavailable', ...resourceFields(candidate) })
+            await closeConnection()
+            closePinned = null
+            event.node.res.once('close', abortUpstream)
+            await waitForUpstreamRetry(upstreamRetryDelay(null, retryIndex))
+            continue
+          }
+          prefetchedResponseBuffer = null
+          responseFailureClass = null
+          if (!response.ok) {
+            prefetchedResponseBuffer = Buffer.from(await response.arrayBuffer())
+            responseFailureClass = classifyRelayFailure(response.status, prefetchedResponseBuffer.toString('utf8'))
+          }
+          const failureText = prefetchedResponseBuffer?.toString('utf8') || ''
+          if (!shouldRetryUpstream(response.status, failureText) || retryIndex >= MAX_UPSTREAM_RETRIES) break
+          await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'retrying', httpStatus: response.status, durationMs: Date.now() - attemptStarted, errorMessage: failureText.slice(0, 2000), failureClass: responseFailureClass || 'upstream_unavailable', ...resourceFields(candidate) })
+          await closeConnection()
+          closePinned = null
+          event.node.res.once('close', abortUpstream)
+          await waitForUpstreamRetry(upstreamRetryDelay(response.headers.get('retry-after'), retryIndex))
         }
+        clearTimeout(upstreamTimer)
+        upstreamTimer = null
         if (responseFailureClass && relayFailureAllowsFailover(response.status, responseFailureClass, candidate.channel.ownerKind === 'user') && index < candidates.length - 1) {
           const errorBody = prefetchedResponseBuffer!
           await closeConnection()
@@ -427,6 +454,7 @@ export async function handleAnthropicMessages(event: H3Event) {
         setResponseHeader(event, 'x-request-id', requestId)
         return output
       } catch (error) {
+        if (upstreamTimer) clearTimeout(upstreamTimer)
         if (streamArchive && !streamArchive.destroyed) streamArchive.destroy()
         if (streamDirectory) await rm(streamDirectory, { recursive: true, force: true }).catch(() => {})
         await closeConnection()

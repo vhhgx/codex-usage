@@ -253,6 +253,13 @@
       "when": 1787754119474,
       "tag": "0035_merge_legacy_user_relay_groups",
       "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1787757356011,
+      "tag": "0036_chunky_rhino",
+      "breakpoints": true
     }
   ]
 }

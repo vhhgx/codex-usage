@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { IconActivityHeartbeat, IconChartBar, IconCheck, IconChevronDown, IconCloudDownload, IconPlus, IconRefresh, IconRoute, IconSearch, IconTrash, IconX } from '@tabler/icons-vue'
+import { IconActivityHeartbeat, IconChartBar, IconCheck, IconChevronDown, IconCloudDownload, IconPlugConnected, IconPlus, IconRefresh, IconRoute, IconSearch, IconTrash, IconX } from '@tabler/icons-vue'
 import type { HubGroupView, HubUserView } from '#shared/types/access-control'
-import type { ChannelAccessScope, ChannelModelView, ChannelProtocol, ChannelProtocolBindingView, ChannelType, ChannelView } from '#shared/types/hub'
+import type { ChannelAccessScope, ChannelModelView, ChannelProtocol, ChannelProtocolBindingView, ChannelType, ChannelView, ProbeModelCatalogView } from '#shared/types/hub'
+import { relayProviderPresets } from '#shared/relay-provider-presets'
 
 definePageMeta({ layout: 'admin', middleware: 'admin' })
 useSeoMeta({ title: '资源管理 | Zephyr Hub' })
@@ -24,6 +25,7 @@ const { data, refresh } = await useFetch<{ channels: ChannelView[] }>('/api/admi
 const { data: settingsData } = await useFetch<{ settings: { defaultTimeoutMs: number } }>('/api/admin/settings')
 const { data: userData } = await useFetch<{ users: HubUserView[] }>('/api/admin/users')
 const { data: groupData } = await useFetch<{ groups: HubGroupView[] }>('/api/admin/groups')
+const { data: probeModelData } = await useFetch<{ models: ProbeModelCatalogView[] }>('/api/admin/probe-models')
 const { show: showToast } = useAppToast()
 const showForm = ref(false)
 const editing = ref<ChannelView | null>(null)
@@ -33,6 +35,8 @@ const modelSyncResult = ref('')
 const showAvailableModels = ref(false)
 const modelSearch = ref('')
 const testing = ref(new Set<string>())
+const connectivityTesting = ref(new Set<string>())
+const selectedPresetId = ref('')
 const error = ref('')
 const groupPanel = ref<{ openCreate: () => void } | null>(null)
 const planPanel = ref<{ openCreate: () => void } | null>(null)
@@ -65,7 +69,7 @@ watch(() => form.type, (type) => {
 function protocolBinding(protocol: ChannelProtocol): ChannelProtocolBindingView {
   return { protocol, enabled: true, baseUrlOverride: null, authScheme: protocol === 'anthropic_messages' ? 'x_api_key' : 'bearer', apiVersion: protocol === 'anthropic_messages' ? '2023-06-01' : null, probeModel: null, verificationStatus: 'unknown', verifiedAt: null, lastError: null }
 }
-function reset() { Object.assign(form, { name: '', type: 'cpa', baseUrl: '', apiKey: '', enabled: true, priority: 100, weight: 1, maxConcurrency: 20, timeoutMs: settingsData.value?.settings.defaultTimeoutMs || 120000, priceMultiplier: 1, accessScope: 'all', grantedUserIds: [], grantedGroupIds: [], protocols: [protocolBinding('openai_responses'), protocolBinding('openai_chat')], models: [{ publicModel: '', upstreamModel: '', enabled: true, endpoints: [] }], clientIdentityMode: 'standard' }) }
+function reset() { Object.assign(form, { name: '', type: 'cpa', baseUrl: '', apiKey: '', enabled: true, priority: 100, weight: 1, maxConcurrency: 20, timeoutMs: settingsData.value?.settings.defaultTimeoutMs || 120000, priceMultiplier: 1, accessScope: 'all', grantedUserIds: [], grantedGroupIds: [], protocols: [protocolBinding('openai_responses'), protocolBinding('openai_chat')], models: [{ publicModel: '', upstreamModel: '', enabled: true, endpoints: [] }], clientIdentityMode: 'standard' }); selectedPresetId.value = '' }
 function create() { editing.value = null; reset(); error.value = ''; modelSyncResult.value = ''; modelSearch.value = ''; showAvailableModels.value = false; showForm.value = true }
 function edit(item: ChannelView) { if (item.ownerKind !== 'platform') return; editing.value = item; Object.assign(form, { ...item, apiKey: '', grantedUserIds: [...item.grantedUserIds], grantedGroupIds: [...item.grantedGroupIds], protocols: item.protocols.map(protocol => ({ ...protocol })), models: item.models.map(model => ({ ...model, endpoints: [...model.endpoints], protocolBindings: model.protocolBindings?.map(binding => ({ ...binding, capabilities: { ...binding.capabilities } })) })) }); error.value = ''; modelSyncResult.value = ''; modelSearch.value = ''; showAvailableModels.value = false; showForm.value = true }
 function addModel() { form.models.push({ publicModel: '', upstreamModel: '', enabled: true, endpoints: [] }) }
@@ -76,6 +80,14 @@ function toggleProtocol(protocol: ChannelProtocol) {
   else form.protocols.push(protocolBinding(protocol))
 }
 function selectedProtocol(protocol: ChannelProtocol) { return form.protocols.some(item => item.protocol === protocol) }
+function protocolFor(protocol: ChannelProtocol) { return form.protocols.find(item => item.protocol === protocol) }
+function probeModelsFor(protocol: ChannelProtocol) { return probeModelData.value?.models.filter(item => item.protocol === protocol && item.enabled) || [] }
+function applyPreset() {
+  const preset = relayProviderPresets.find(item => item.id === selectedPresetId.value)
+  if (!preset) return
+  const protocols = preset.protocols.map(item => ({ ...protocolBinding(item.protocol), authScheme: item.authScheme, baseUrlOverride: item.baseUrlOverride || null, probeModel: probeModelsFor(item.protocol)[0]?.model || null }))
+  Object.assign(form, { name: preset.name, baseUrl: preset.baseUrl, type: protocols.length === 1 && protocols[0]?.protocol === 'anthropic_messages' ? 'anthropic_compatible' : 'openai_compatible', protocols })
+}
 function payload() {
   const enabledProtocols = form.protocols.map(item => ({ ...item, id: undefined }))
   return {
@@ -94,6 +106,7 @@ function payload() {
 }
 async function save() {
   if (!form.protocols.length) { error.value = '请至少选择一种上游协议'; return }
+  if (form.protocols.some(protocol => !protocol.probeModel?.trim())) { error.value = '请为每个上游协议指定检测模型'; return }
   saving.value = true; error.value = ''
   try {
     if (editing.value) await $fetch(`/api/admin/channels/${editing.value.id}`, { method: 'PATCH', body: payload() })
@@ -106,6 +119,22 @@ async function test(item: ChannelView) {
   testing.value = new Set(testing.value).add(item.id)
   try { await $fetch(`/api/admin/channels/${item.id}/test`, { method: 'POST' }); await refresh() }
   finally { const next = new Set(testing.value); next.delete(item.id); testing.value = next }
+}
+async function testConnectivity(item: ChannelView) {
+  connectivityTesting.value = new Set(connectivityTesting.value).add(item.id)
+  try {
+    const result = await $fetch<{ status: 'operational' | 'degraded' | 'failed'; success: boolean; message: string; responseTimeMs: number; httpStatus: number | null }>(`/api/admin/channels/${item.id}/connectivity`, { method: 'POST' })
+    if (result.success) {
+      showToast(`${item.name} ${result.status === 'degraded' ? '可以连通，但响应较慢' : '连通正常'}（${result.responseTimeMs} ms · HTTP ${result.httpStatus}）`, result.status === 'degraded' ? 'info' : 'success')
+    } else {
+      showToast(`${item.name} 无法连通：${result.message}`, 'error')
+    }
+  } catch (value) {
+    const failure = value as { data?: { message?: string }; message?: string }
+    showToast(failure.data?.message || failure.message || '连通检测失败', 'error')
+  } finally {
+    const next = new Set(connectivityTesting.value); next.delete(item.id); connectivityTesting.value = next
+  }
 }
 async function syncModels() {
   if (!editing.value) return
@@ -180,18 +209,19 @@ watch(() => route.query.tab, value => { activeTab.value = resourceTab(value) })
         <div class="channel-row__health"><span class="status-dot" :data-status="!item.enabled ? 'disabled' : item.circuitState === 'open' ? 'unhealthy' : item.circuitState === 'half_open' ? 'unknown' : item.healthStatus"><i />{{ !item.enabled ? '已停用' : item.circuitState === 'open' ? '已熔断' : item.circuitState === 'half_open' ? '等待探测' : item.healthStatus === 'healthy' ? '健康' : item.healthStatus === 'unhealthy' ? '异常' : '待检测' }}</span><small>{{ time(item.lastHealthCheckAt) }}</small><em v-if="item.lastHealthError">{{ item.lastHealthError }}</em></div>
         <div class="channel-row__models"><span>协议 / 客户端</span><strong>{{ item.protocols.filter(protocol => protocol.enabled).map(protocol => protocolLabel(protocol.protocol)).join(' · ') || '未配置' }}</strong><small>{{ compatibility(item).join(' · ') || '无客户端兼容' }} · {{ item.models.filter(model => model.enabled).length }} 个模型</small></div>
         <div class="channel-row__policy"><span>可用范围</span><strong>{{ accessLabel(item) }}</strong><small>{{ item.weight }}× 权重 · {{ item.maxConcurrency }} 并发</small></div>
-        <div class="table-actions"><button class="icon-button" type="button" title="缓存诊断" aria-label="缓存诊断" @click="inspectingCache = item"><IconChartBar :size="17" /></button><button class="icon-button" type="button" title="健康检测" aria-label="健康检测" :disabled="testing.has(item.id)" @click="test(item)"><IconRefresh :class="{ 'is-spinning': testing.has(item.id) }" :size="17" /></button><button class="icon-button" type="button" :title="item.enabled ? '停用' : '启用'" :aria-label="item.enabled ? '停用渠道' : '启用渠道'" @click="toggle(item)"><IconActivityHeartbeat :size="17" /></button><button v-if="item.ownerKind === 'platform'" class="button button--quiet button--small" type="button" @click="edit(item)">配置</button><button v-if="item.ownerKind === 'platform'" class="icon-button danger" type="button" title="删除渠道" aria-label="删除渠道" @click="deletingChannel = item"><IconTrash :size="16" /></button></div>
+        <div class="table-actions"><button class="icon-button" type="button" title="缓存诊断" aria-label="缓存诊断" @click="inspectingCache = item"><IconChartBar :size="17" /></button><button class="icon-button" type="button" title="检测连通" aria-label="检测连通" :disabled="connectivityTesting.has(item.id)" @click="testConnectivity(item)"><IconPlugConnected :class="{ 'is-spinning': connectivityTesting.has(item.id) }" :size="17" /></button><button class="icon-button" type="button" title="健康检测" aria-label="健康检测" :disabled="testing.has(item.id)" @click="test(item)"><IconRefresh :class="{ 'is-spinning': testing.has(item.id) }" :size="17" /></button><button class="icon-button" type="button" :title="item.enabled ? '停用' : '启用'" :aria-label="item.enabled ? '停用渠道' : '启用渠道'" @click="toggle(item)"><IconActivityHeartbeat :size="17" /></button><button v-if="item.ownerKind === 'platform'" class="button button--quiet button--small" type="button" @click="edit(item)">配置</button><button v-if="item.ownerKind === 'platform'" class="icon-button danger" type="button" title="删除渠道" aria-label="删除渠道" @click="deletingChannel = item"><IconTrash :size="16" /></button></div>
       </article>
       <div v-if="!data?.channels.length" class="admin-empty admin-empty--large">还没有渠道。添加 CPA 或 Sub2API 后才能开始转发。</div>
     </section>
 
-    <div v-if="showForm" class="admin-modal-backdrop" @click.self="showForm = false"><section class="admin-modal admin-modal--wide" role="dialog" aria-modal="true">
-      <header><div><span>UPSTREAM CHANNEL</span><h2 class="text-balance">{{ editing ? '编辑渠道' : '连接新渠道' }}</h2></div><button class="icon-button" type="button" title="关闭" aria-label="关闭" @click="showForm = false"><IconX :size="18" /></button></header>
+    <div v-if="showForm" class="admin-modal-backdrop" @click.self="showForm = false"><section class="admin-modal admin-modal--wide" role="dialog" aria-modal="true" aria-labelledby="channel-dialog-title">
+      <header><div><span>UPSTREAM CHANNEL</span><h2 id="channel-dialog-title" class="text-balance">{{ editing ? '编辑渠道' : '连接新渠道' }}</h2></div><button class="icon-button" type="button" title="关闭" aria-label="关闭" @click="showForm = false"><IconX :size="18" /></button></header>
       <form class="admin-form" @submit.prevent="save">
+        <label v-if="!editing"><span>预设服务商</span><AppSelect v-model="selectedPresetId" @update:model-value="applyPreset"><option value="">自定义</option><option v-for="preset in relayProviderPresets" :key="preset.id" :value="preset.id">{{ preset.name }}</option></AppSelect><small>选择后自动填写名称、地址、协议与认证方式</small></label>
         <div class="form-grid"><label><span>渠道名称 *</span><input v-model="form.name" required placeholder="例如：CPA 主节点"></label><label><span>渠道类型 *</span><AppSelect v-model="form.type" :disabled="Boolean(editing)"><option value="cpa">CPA / CLIProxyAPI</option><option value="sub2api">Sub2API</option><option value="openai_compatible">OpenAI 兼容中转</option><option value="anthropic_compatible">Anthropic 兼容中转</option></AppSelect></label></div>
         <label><span>Base URL *</span><input v-model="form.baseUrl" type="url" required placeholder="https://upstream.example.com"></label>
         <label><span>上游 API Key {{ editing ? '（留空保持不变）' : '*' }}</span><input v-model="form.apiKey" type="password" :required="!editing" autocomplete="off"></label>
-        <section class="form-section"><header><div><h3>上游协议</h3><span>检测认证失败时自动补测另一种认证</span></div></header><div class="channel-protocol-picker"><button v-for="option in protocolOptions" :key="option.id" type="button" :class="{ active: selectedProtocol(option.id) }" @click="toggleProtocol(option.id)"><IconCheck :size="15" /><span><strong>{{ option.label }}</strong><small>{{ option.detail }}</small></span></button></div><div class="channel-auth-schemes"><label v-for="protocol in form.protocols" :key="protocol.protocol"><span>{{ protocolOptions.find(item => item.id === protocol.protocol)?.label }} 默认认证</span><AppSelect v-model="protocol.authScheme"><option value="bearer">Bearer</option><option value="x_api_key">x-api-key</option></AppSelect></label></div><div class="channel-compatibility"><span>Claude Code：{{ selectedProtocol('anthropic_messages') ? '原生' : selectedProtocol('openai_chat') ? '协议转换' : '不可用' }}</span><span>Codex：{{ selectedProtocol('openai_responses') || selectedProtocol('openai_chat') ? '可用' : '不可用' }}</span></div></section>
+        <section class="form-section"><header><div><h3>上游协议</h3><span>每个端点使用独立检测模型，认证失败时自动补测另一种认证</span></div></header><datalist v-for="option in protocolOptions" :id="`admin-probe-models-${option.id}`" :key="`probe-${option.id}`"><option v-for="model in probeModelsFor(option.id)" :key="model.id" :value="model.model">{{ model.vendor }} · {{ model.displayName }}</option></datalist><div class="channel-protocol-picker"><button v-for="option in protocolOptions" :key="option.id" type="button" :class="{ active: selectedProtocol(option.id) }" @click="toggleProtocol(option.id)"><IconCheck :size="15" /><span><strong>{{ option.label }}</strong><small>{{ option.detail }}</small></span></button></div><div class="channel-auth-schemes"><label v-for="protocol in form.protocols" :key="protocol.protocol"><span>{{ protocolOptions.find(item => item.id === protocol.protocol)?.label }} 默认认证</span><AppSelect v-model="protocol.authScheme"><option value="bearer">Bearer</option><option value="x_api_key">x-api-key</option></AppSelect><input v-model="protocol.probeModel" :list="`admin-probe-models-${protocol.protocol}`" required placeholder="检测模型"></label></div><div class="channel-compatibility"><span>Claude Code：{{ selectedProtocol('anthropic_messages') ? '原生' : selectedProtocol('openai_chat') ? '协议转换' : '不可用' }}</span><span>Codex：{{ selectedProtocol('openai_responses') || selectedProtocol('openai_chat') ? '可用' : '不可用' }}</span></div></section>
         <section class="form-section channel-compat-options"><header><div><h3>兼容设置</h3><span>模型只在手动同步时更新</span></div></header><label class="switch"><input v-model="form.clientIdentityMode" type="checkbox" true-value="passthrough" false-value="standard"><span />透传真实 Claude Code / Codex 客户端身份</label></section>
         <section class="form-section"><header><div><h3>可用范围</h3><span>{{ form.accessScope === 'all' ? '所有用户均可使用' : `已选 ${form.grantedGroupIds.length} 个分组、${form.grantedUserIds.length} 个用户` }}</span></div></header><div class="channel-access-mode"><label><input v-model="form.accessScope" type="radio" value="all"><span>全部用户</span></label><label><input v-model="form.accessScope" type="radio" value="restricted"><span>部分用户</span></label></div><template v-if="form.accessScope === 'restricted'"><h4 class="channel-grant-title">权限分组</h4><fieldset class="group-picker"><label v-for="group in groupData?.groups || []" :key="group.id"><input v-model="form.grantedGroupIds" type="checkbox" :value="group.id"><span>{{ group.name }}<small>{{ group.userIds.length }} 位成员</small></span></label></fieldset><h4 class="channel-grant-title">单独授权用户</h4><fieldset class="group-picker"><label v-for="user in userData?.users || []" :key="user.id"><input v-model="form.grantedUserIds" type="checkbox" :value="user.id"><span>{{ user.displayName || user.username }}<small>{{ user.username }}</small></span></label></fieldset></template></section>
         <div class="form-grid form-grid--four"><label><span>优先级</span><input v-model.number="form.priority" type="number" min="0"></label><label><span>权重</span><input v-model.number="form.weight" type="number" min="1"></label><label><span>最大并发</span><input v-model.number="form.maxConcurrency" type="number" min="1"></label><label><span>超时（毫秒）</span><input v-model.number="form.timeoutMs" type="number" min="1000"></label></div>

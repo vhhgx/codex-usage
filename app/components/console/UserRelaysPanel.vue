@@ -1,15 +1,19 @@
 <script setup lang="ts">
-import { IconBraces, IconCalendarCheck, IconCheck, IconChecks, IconChevronDown, IconChevronLeft, IconChevronRight, IconChevronUp, IconCloudDownload, IconCode, IconCopy, IconEdit, IconExternalLink, IconEye, IconEyeOff, IconGripVertical, IconKey, IconPlus, IconRefresh, IconServerBolt, IconSettings, IconTrash, IconWallet, IconX } from '@tabler/icons-vue'
-import type { ChannelModelView, ChannelProtocol, ChannelProtocolBindingView, ChannelView, HubKeyView, RelayPlatformType, UserRelayAccountView, UserRelayGroupView } from '#shared/types/hub'
+import { IconBraces, IconCalendarCheck, IconCheck, IconChecks, IconChevronDown, IconChevronUp, IconCloudDownload, IconCode, IconCopy, IconEdit, IconExternalLink, IconEye, IconEyeOff, IconGripVertical, IconKey, IconPlugConnected, IconPlus, IconRefresh, IconServerBolt, IconSettings, IconTrash, IconWallet, IconX } from '@tabler/icons-vue'
+import type { ChannelModelView, ChannelProtocol, ChannelProtocolBindingView, ChannelView, HubKeyView, ProbeModelCatalogView, RelayPlatformType, UserRelayAccountView, UserRelayGroupView } from '#shared/types/hub'
+import { relayProviderPresets } from '#shared/relay-provider-presets'
 
 const { data, refresh, status: relayStatus } = useLazyFetch<{ groups: UserRelayGroupView[] }>('/api/console/relay-groups')
 const { data: keyData, refresh: refreshKeys } = useLazyFetch<{ keys: HubKeyView[] }>('/api/console/keys')
+const { data: probeModelData } = useLazyFetch<{ models: ProbeModelCatalogView[] }>('/api/console/probe-models')
 const toast = useAppToast()
 const busy = ref(false)
 const discovering = ref(false)
 const discoveredModels = ref<string[]>([])
 const mappingsExpanded = ref(false)
 const testing = ref<string | null>(null)
+const connectivityTesting = ref<string | null>(null)
+const selectedPresetId = ref('')
 const testingCandidate = ref<ChannelView | null>(null)
 interface RelayTestResult { protocol: ChannelProtocol; endpoint: string; ok: boolean; status: number | null; latencyMs: number; errorCode: string | null; message: string | null; authScheme: 'bearer' | 'x_api_key'; attemptedAuthSchemes: Array<'bearer' | 'x_api_key'>; clientIdentityRejected: boolean; clientIdentityProbed: boolean }
 interface RelayConnectivity { endpoint: string; ok: boolean; reachable: boolean; status: number | null; latencyMs: number; errorCode: string | null; message: string | null; modelCount: number; authScheme: 'bearer' | 'x_api_key'; attemptedAuthSchemes: Array<'bearer' | 'x_api_key'> }
@@ -40,7 +44,6 @@ const protocolOptions: Array<{ id: ChannelProtocol; label: string; detail: strin
 const form = reactive({ name: '', accountLabel: '', groupId: '', groupName: '', homepageUrl: '', platformType: 'generic' as RelayPlatformType, baseUrl: '', apiKey: '', protocols: [binding('anthropic_messages')] as ChannelProtocolBindingView[], models: [] as ChannelModelView[], enabled: true, weight: 1, maxConcurrency: 5, timeoutMs: 120000, checkinEnabled: false, checkinToken: '', checkinUserId: '', insecureHttpAcknowledged: false, clientIdentityMode: 'standard' as 'standard' | 'passthrough' })
 const relays = computed<UserRelayAccountView[]>(() => data.value?.groups.flatMap(group => group.accounts) || [])
 const checkinCount = computed(() => relays.value.filter(item => item.checkinEnabled && item.checkinConfigured).length || 0)
-const activeAccountByGroup = reactive<Record<string, string>>({})
 const credentialsLoading = ref(false)
 const showApiKey = ref(false)
 const showCheckinToken = ref(false)
@@ -58,17 +61,10 @@ const duplicateForm = reactive({ newGroup: false, name: '', accountLabel: '', gr
 const showDuplicateApiKey = ref(false)
 const showDuplicateCheckinToken = ref(false)
 const draggedAccount = ref<{ groupId: string; accountId: string } | null>(null)
+let activeAccountPointer: { group: UserRelayGroupView; accountId: string; targetId: string; pointerId: number } | null = null
 const movingAccount = ref<string | null>(null)
 const mergeTargetId = ref('')
-const activeGroupId = ref('')
-const activeGroup = (group: UserRelayGroupView) => group.accounts.find(account => account.id === activeAccountByGroup[group.id]) || group.accounts[0]
 const groupFor = (item: ChannelView) => data.value?.groups.find(group => group.id === item.userRelayGroupId) || null
-const selectedGroup = computed(() => data.value?.groups.find(group => group.id === activeGroupId.value) || data.value?.groups[0] || null)
-const selectedAccount = computed(() => selectedGroup.value ? activeGroup(selectedGroup.value) : undefined)
-
-watch(() => data.value?.groups.map(group => group.id).join('|'), () => {
-  if (!data.value?.groups.some(group => group.id === activeGroupId.value)) activeGroupId.value = data.value?.groups[0]?.id || ''
-}, { immediate: true })
 
 watch(() => form.platformType, (platform) => {
   if (editing.value) return
@@ -98,7 +94,7 @@ function toggleModelProtocol(model: ChannelModelView, protocol: ChannelProtocol)
 function isDirectModel(model: ChannelModelView) {
   return model.publicModel === model.upstreamModel && !model.endpoints.length && (!model.protocolBindings?.length || model.protocolBindings.every(binding => binding.upstreamModel === model.upstreamModel))
 }
-function reset() { Object.assign(form, { name: '', accountLabel: '', groupId: '', groupName: '', homepageUrl: '', platformType: 'generic', baseUrl: '', apiKey: '', protocols: [binding('anthropic_messages')], models: [emptyModel()], enabled: true, weight: 1, maxConcurrency: 5, timeoutMs: 120000, checkinEnabled: false, checkinToken: '', checkinUserId: '', insecureHttpAcknowledged: false, clientIdentityMode: 'standard' }); discoveredModels.value = []; mappingsExpanded.value = false; showApiKey.value = false; showCheckinToken.value = false; originalApiKey.value = ''; originalCheckinToken.value = '' }
+function reset() { Object.assign(form, { name: '', accountLabel: '', groupId: '', groupName: '', homepageUrl: '', platformType: 'generic', baseUrl: '', apiKey: '', protocols: [binding('anthropic_messages')], models: [emptyModel()], enabled: true, weight: 1, maxConcurrency: 5, timeoutMs: 120000, checkinEnabled: false, checkinToken: '', checkinUserId: '', insecureHttpAcknowledged: false, clientIdentityMode: 'standard' }); selectedPresetId.value = ''; discoveredModels.value = []; mappingsExpanded.value = false; showApiKey.value = false; showCheckinToken.value = false; originalApiKey.value = ''; originalCheckinToken.value = '' }
 function create(groupId?: string) { editing.value = null; reset(); addingToGroup.value = groupId || null; const group = groupId ? data.value?.groups.find(item => item.id === groupId) : null; if (group) Object.assign(form, { groupId: group.id, groupName: group.name, homepageUrl: group.homepageUrl || '', platformType: group.platformType }); error.value = ''; showForm.value = true }
 async function edit(item: ChannelView) {
   editing.value = item
@@ -129,6 +125,27 @@ function setAuthScheme(protocol: ChannelProtocol, value: unknown) {
 function setProbeModel(protocol: ChannelProtocol, event: Event) {
   const item = selectedProtocol(protocol)
   if (item) item.probeModel = (event.target as HTMLInputElement).value
+}
+function probeModelsFor(protocol: ChannelProtocol) {
+  return [...new Set([
+    ...(probeModelData.value?.models.filter(item => item.protocol === protocol && item.enabled).map(item => item.model) || []),
+    ...discoveredModels.value,
+    ...form.models.map(model => model.upstreamModel.trim()).filter(Boolean)
+  ])]
+}
+function applyPreset() {
+  const preset = relayProviderPresets.find(item => item.id === selectedPresetId.value)
+  if (!preset) return
+  const protocols = preset.protocols.map(item => ({ ...binding(item.protocol), authScheme: item.authScheme, baseUrlOverride: item.baseUrlOverride || null, probeModel: probeModelsFor(item.protocol)[0] || null }))
+  Object.assign(form, {
+    groupName: preset.name,
+    name: preset.name,
+    accountLabel: '账号 1',
+    homepageUrl: preset.homepageUrl,
+    baseUrl: preset.baseUrl,
+    platformType: preset.platformType,
+    protocols
+  })
 }
 function body() {
   const protocols = form.protocols.map(protocol => ({ ...protocol, id: undefined }))
@@ -165,7 +182,6 @@ function body() {
 }
 function addModel() { form.models.push(emptyModel()) }
 function removeModel(index: number) { form.models.splice(index, 1); if (!form.models.length) form.models.push(emptyModel()) }
-const probeModels = computed(() => [...new Set([...discoveredModels.value, ...form.models.map(model => model.upstreamModel.trim()).filter(Boolean)])])
 async function discoverModels() {
   if (!form.baseUrl || !form.apiKey && !editing.value) { error.value = '请先填写中转地址和 API Key'; return }
   if (!form.protocols.length) { error.value = '请至少选择一种协议'; return }
@@ -214,6 +230,25 @@ async function confirmTest() {
     return
   }
   await test(item)
+}
+async function testConnectivity(item: ChannelView) {
+  if (connectivityTesting.value) {
+    const active = relays.value.find(relay => relay.id === connectivityTesting.value)
+    toast.show(`正在检测“${active?.name || '其他中转'}”的连通性`, 'info')
+    return
+  }
+  connectivityTesting.value = item.id
+  try {
+    const result = await $fetch<{ status: 'operational' | 'degraded' | 'failed'; success: boolean; message: string; responseTimeMs: number; httpStatus: number | null }>(`/api/console/relays/${item.id}/connectivity`, { method: 'POST' })
+    if (result.success) {
+      toast.show(`${item.name} ${result.status === 'degraded' ? '可以连通，但响应较慢' : '连通正常'}（${result.responseTimeMs} ms · HTTP ${result.httpStatus}）`, result.status === 'degraded' ? 'info' : 'success')
+    } else {
+      toast.show(`${item.name} 无法连通：${result.message}`, 'error')
+    }
+  } catch (value) {
+    const failure = value as { data?: { message?: string }; message?: string }
+    toast.show(failure.data?.message || failure.message || '连通检测失败', 'error')
+  } finally { connectivityTesting.value = null }
 }
 async function sync(item: ChannelView) {
   syncing.value = item.id
@@ -347,21 +382,39 @@ async function mergeGroup() {
   } catch (value) { const failure = value as { data?: { message?: string }; message?: string }; groupError.value = failure.data?.message || failure.message || '合并站点失败' }
   finally { busy.value = false }
 }
-async function moveAccount(group: UserRelayGroupView, accountId: string, offset: number) {
-  const ids = group.accounts.map(account => account.id)
-  const index = ids.indexOf(accountId)
-  const target = index + offset
-  if (index < 0 || target < 0 || target >= ids.length) return
-  const [moved] = ids.splice(index, 1)
-  if (!moved) return
-  ids.splice(target, 0, moved)
-  try { await $fetch(`/api/console/relay-groups/${group.id}/account-order`, { method: 'PUT', body: { orderedIds: ids } }); await refresh() }
-  catch (failure) { const value = failure as { data?: { message?: string }; message?: string }; toast.show(value.data?.message || value.message || '保存账号顺序失败', 'error') }
+function startAccountDrag(group: UserRelayGroupView, accountId: string, event: PointerEvent) {
+  if (movingAccount.value || event.button !== 0) return
+  event.preventDefault()
+  activeAccountPointer = { group, accountId, targetId: accountId, pointerId: event.pointerId }
+  draggedAccount.value = { groupId: group.id, accountId }
+  window.addEventListener('pointermove', moveAccountDrag, { passive: false })
+  window.addEventListener('pointerup', finishAccountDrag, { passive: false })
+  window.addEventListener('pointercancel', cancelAccountDrag)
 }
-function startAccountDrag(groupId: string, accountId: string, event: DragEvent) {
-  draggedAccount.value = { groupId, accountId }
-  event.dataTransfer?.setData('text/plain', accountId)
-  if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
+function moveAccountDrag(event: PointerEvent) {
+  if (!activeAccountPointer || activeAccountPointer.pointerId !== event.pointerId) return
+  event.preventDefault()
+  const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-relay-account-id]')
+  if (target?.dataset.relayGroupId === activeAccountPointer.group.id && target.dataset.relayAccountId) activeAccountPointer.targetId = target.dataset.relayAccountId
+}
+function finishAccountDrag(event: PointerEvent) {
+  if (!activeAccountPointer || activeAccountPointer.pointerId !== event.pointerId) return
+  event.preventDefault()
+  const active = activeAccountPointer
+  removeAccountDragListeners()
+  activeAccountPointer = null
+  void dropAccount(active.group, active.targetId)
+}
+function cancelAccountDrag(event: PointerEvent) {
+  if (!activeAccountPointer || activeAccountPointer.pointerId !== event.pointerId) return
+  removeAccountDragListeners()
+  activeAccountPointer = null
+  draggedAccount.value = null
+}
+function removeAccountDragListeners() {
+  window.removeEventListener('pointermove', moveAccountDrag)
+  window.removeEventListener('pointerup', finishAccountDrag)
+  window.removeEventListener('pointercancel', cancelAccountDrag)
 }
 async function dropAccount(group: UserRelayGroupView, targetId: string) {
   const dragged = draggedAccount.value
@@ -377,6 +430,7 @@ async function dropAccount(group: UserRelayGroupView, targetId: string) {
   try { await $fetch(`/api/console/relay-groups/${group.id}/account-order`, { method: 'PUT', body: { orderedIds: ids } }); await refresh() }
   catch (value) { const failure = value as { data?: { message?: string }; message?: string }; toast.show(failure.data?.message || failure.message || '保存账号顺序失败', 'error') }
 }
+onBeforeUnmount(removeAccountDragListeners)
 async function openDuplicate(item: ChannelView) {
   duplicating.value = item; duplicateLoading.value = true; duplicateError.value = ''; showDuplicateApiKey.value = false; showDuplicateCheckinToken.value = false
   const group = groupFor(item)
@@ -419,37 +473,41 @@ function groupBalanceSummary(group: UserRelayGroupView) {
 
 <template>
   <div class="admin-page relay-page">
-    <header class="resource-panel-header"><div><span class="admin-kicker">PRIVATE RELAY GROUPS</span><h2>我的中转</h2><p>站点作为故障转移节点，账号在站点内按 Tab 收敛。</p></div><div class="resource-panel-actions"><button class="button button--quiet button--small" :disabled="balanceRefreshingAll" @click="refreshBalances"><IconWallet :size="15" />{{ balanceRefreshingAll ? '查询中' : '刷新余额' }}</button><button class="button button--secondary" :disabled="!checkinCount || checkingInAll" @click="checkinAll"><IconChecks :size="17" />{{ checkingInAll ? '签到中' : '一键签到' }}</button><button class="button button--primary" @click="create()"><IconPlus :size="17" />添加站点</button></div></header>
-    <nav v-if="data?.groups.length" class="relay-site-tabs" aria-label="中转站点">
-      <button v-for="group in data.groups" :key="group.id" type="button" :class="{ active: selectedGroup?.id === group.id }" @click="activeGroupId = group.id">
-        <strong>{{ group.name }}</strong>
-        <small>{{ group.accounts.filter(account => account.state.routingState === 'active').length }}/{{ group.accounts.length }} 可用 · {{ groupModelCount(group) }} 模型</small>
-      </button>
-    </nav>
-    <section v-if="selectedGroup" class="relay-group-tabs">
-      <article class="relay-group-summary">
-        <header><div><strong><a v-if="selectedGroup.homepageUrl" :href="selectedGroup.homepageUrl" target="_blank" rel="noopener noreferrer">{{ selectedGroup.name }}<IconExternalLink :size="12" /></a><template v-else>{{ selectedGroup.name }}</template></strong><small>{{ selectedGroup.platformType === 'newapi' ? 'NewAPI' : selectedGroup.platformType === 'sub2api' ? 'Sub2API' : '通用兼容站' }} · {{ selectedGroup.accounts.filter(account => account.state.routingState === 'active').length }}/{{ selectedGroup.accounts.length }} 可用 · {{ groupModelCount(selectedGroup) }} 模型 · {{ groupBalanceSummary(selectedGroup) }}</small><small>{{ groupCapabilitySummary(selectedGroup) }}</small></div><div class="relay-group-actions"><AppSelect :model-value="selectedGroup.accountOrderMode" aria-label="账号排序" @update:model-value="setGroupOrder(selectedGroup, $event)"><option value="manual">手工顺序</option><option value="balance_desc">余额降序</option><option value="balance_asc">余额升序</option></AppSelect><button class="icon-button" title="添加账号" aria-label="添加账号" @click="create(selectedGroup.id)"><IconPlus :size="15" /></button><button class="icon-button" title="刷新站点余额" aria-label="刷新站点余额" :disabled="balanceRefreshingAll || selectedGroup.platformType === 'generic'" @click="refreshUserRelayGroupBalances(selectedGroup.id)"><IconWallet :size="15" /></button><button class="icon-button" title="站点设置" aria-label="站点设置" @click="openGroupSettings(selectedGroup)"><IconSettings :size="15" /></button></div></header>
-        <nav v-if="selectedGroup.accounts.length > 1" class="relay-account-tabs" aria-label="站点账号"><div v-for="(account, index) in selectedGroup.accounts" :key="account.id" class="relay-account-tab" :class="{ active: (activeAccountByGroup[selectedGroup.id] || selectedGroup.accounts[0]?.id) === account.id, dragging: draggedAccount?.accountId === account.id }" :draggable="selectedGroup.accountOrderMode === 'manual'" @dragstart="startAccountDrag(selectedGroup.id, account.id, $event)" @dragend="draggedAccount = null" @dragover.prevent @drop.prevent="dropAccount(selectedGroup, account.id)"><IconGripVertical v-if="selectedGroup.accountOrderMode === 'manual'" class="relay-drag-handle" :size="14" /><button type="button" @click="activeAccountByGroup[selectedGroup.id] = account.id"><span>{{ account.accountLabel || account.name }}</span><small>{{ account.state.routingState === 'depleted' ? '额度耗尽，等待刷新' : account.state.routingState === 'credential_error' ? '凭据失效' : account.state.remainingBalance === null ? '余额待查' : formatBalance(account.state.remainingBalance, account.state.currency) }}</small></button><span v-if="selectedGroup.accountOrderMode === 'manual'" class="relay-tab-order"><button type="button" title="前移" aria-label="账号前移" :disabled="index === 0" @click="moveAccount(selectedGroup, account.id, -1)"><IconChevronLeft :size="13" /></button><button type="button" title="后移" aria-label="账号后移" :disabled="index === selectedGroup.accounts.length - 1" @click="moveAccount(selectedGroup, account.id, 1)"><IconChevronRight :size="13" /></button></span></div></nav>
-        <article v-if="selectedAccount" class="relay-row">
-          <div class="relay-identity"><span><IconServerBolt :size="19" /></span><div><strong>{{ selectedAccount.name }}</strong><a class="relay-url" :href="selectedAccount.baseUrl" target="_blank" rel="noopener noreferrer" :title="`打开 ${selectedAccount.baseUrl}`"><IconExternalLink :size="12" />{{ selectedAccount.baseUrl }}</a><small>仅自己 · {{ selectedAccount.models.filter(model => model.enabled).length }} 个模型</small></div></div>
-          <div class="relay-protocols"><span v-for="protocol in selectedAccount.protocols" :key="protocol.id || protocol.protocol" :data-status="protocol.verificationStatus"><i />{{ protocolLabel(protocol.protocol) }}</span></div>
-          <div class="relay-health"><strong>{{ selectedAccount.healthStatus === 'healthy' ? '可用' : selectedAccount.healthStatus === 'unhealthy' ? '需处理' : '待检测' }}</strong><small>{{ date(selectedAccount.lastHealthCheckAt) }}</small><em v-if="selectedAccount.lastHealthError" :title="selectedAccount.lastHealthError || undefined">{{ selectedAccount.lastHealthError }}</em></div>
-          <div class="relay-balance"><template v-if="selectedAccount.state.balanceError"><strong>查询失败</strong><small :title="selectedAccount.state.balanceError || undefined">{{ selectedAccount.state.balanceError }}</small></template><template v-else-if="selectedAccount.state.balanceStatus === 'success'"><strong>{{ formatBalance(selectedAccount.state.remainingBalance, selectedAccount.state.currency) }}</strong><small>购买 {{ formatBalance(selectedAccount.state.purchasedQuota, selectedAccount.state.currency) }} · 赠送 {{ formatBalance(selectedAccount.state.giftQuota, selectedAccount.state.currency) }}</small></template><template v-else><strong>余额待查</strong><small>{{ selectedGroup.platformType === 'generic' ? '通用站未配置余额接口' : '点击刷新余额' }}</small></template></div>
-          <div class="table-actions"><button class="button button--quiet button--small relay-model-button" :disabled="!selectedAccount.models.length" @click="openModels(selectedAccount)"><IconBraces :size="14" />查看模型 <span>{{ selectedAccount.models.filter(model => model.enabled).length }}</span></button><button class="icon-button" title="刷新余额" :aria-label="`${selectedAccount.name} 刷新余额`" :disabled="balanceLoading === selectedAccount.id || selectedGroup.platformType === 'generic' || (selectedGroup.platformType === 'newapi' && !selectedAccount.checkinConfigured)" @click="refreshBalance(selectedAccount)"><IconWallet :size="16" /></button><button v-if="selectedAccount.checkinEnabled && selectedAccount.checkinConfigured" class="icon-button" :class="{ 'is-complete': checkedInToday(selectedAccount) }" :title="checkedInToday(selectedAccount) ? '今日已签到' : '签到'" :aria-label="`${selectedAccount.name} ${checkedInToday(selectedAccount) ? '今日已签到' : '签到'}`" :disabled="checkingIn === selectedAccount.id || checkedInToday(selectedAccount)" @click="checkin(selectedAccount)"><IconCalendarCheck :size="17" /></button><button class="icon-button" :title="testing === selectedAccount.id ? '协议检测正在执行' : '协议检测'" :aria-label="testing === selectedAccount.id ? `${selectedAccount.name} 协议检测正在执行` : `${selectedAccount.name} 协议检测`" :aria-busy="testing === selectedAccount.id" @click="requestTest(selectedAccount)"><IconRefresh :class="{ 'is-spinning': testing === selectedAccount.id }" :size="17" /></button><button class="icon-button" title="同步模型" aria-label="同步模型" :disabled="syncing === selectedAccount.id" @click="sync(selectedAccount)"><IconCloudDownload :size="17" /></button><button class="icon-button" title="复制中转" aria-label="复制中转" @click="openDuplicate(selectedAccount)"><IconCopy :size="17" /></button><button class="icon-button" title="生成客户端配置" aria-label="生成客户端配置" @click="openConfig(selectedAccount)"><IconCode :size="17" /></button><button class="icon-button" title="编辑" aria-label="编辑中转" @click="edit(selectedAccount)"><IconEdit :size="17" /></button><button class="icon-button danger" title="删除" aria-label="删除中转" @click="deleting = selectedAccount"><IconTrash :size="17" /></button></div>
-        </article>
+    <header class="resource-panel-header"><div><span class="admin-kicker">PRIVATE RELAY GROUPS</span><h2>我的中转</h2><p>每个站点是一个故障转移节点，站点内账号按列表顺序依次使用。</p></div><div class="resource-panel-actions"><button class="button button--quiet button--small" :disabled="balanceRefreshingAll" @click="refreshBalances"><IconWallet :size="15" />{{ balanceRefreshingAll ? '查询中' : '刷新余额' }}</button><button class="button button--secondary" :disabled="!checkinCount || checkingInAll" @click="checkinAll"><IconChecks :size="17" />{{ checkingInAll ? '签到中' : '一键签到' }}</button><button class="button button--primary" @click="create()"><IconPlus :size="17" />添加站点</button></div></header>
+    <section v-if="data?.groups.length" class="relay-group-list">
+      <article v-for="group in data.groups" :key="group.id" class="relay-group-summary">
+        <header><div><strong><a v-if="group.homepageUrl" :href="group.homepageUrl" target="_blank" rel="noopener noreferrer">{{ group.name }}<IconExternalLink :size="12" /></a><template v-else>{{ group.name }}</template></strong><small>{{ group.platformType === 'newapi' ? 'NewAPI' : group.platformType === 'sub2api' ? 'Sub2API' : '通用兼容站' }} · {{ group.accounts.filter(account => account.state.routingState === 'active').length }}/{{ group.accounts.length }} 可用 · {{ groupModelCount(group) }} 模型 · {{ groupBalanceSummary(group) }}</small><small>{{ groupCapabilitySummary(group) }}</small></div><div class="relay-group-actions"><AppSelect :model-value="group.accountOrderMode" aria-label="账号排序" @update:model-value="setGroupOrder(group, $event)"><option value="manual">手工顺序</option><option value="balance_desc">余额降序</option><option value="balance_asc">余额升序</option></AppSelect><button class="icon-button" title="添加账号" aria-label="添加账号" @click="create(group.id)"><IconPlus :size="15" /></button><button class="icon-button" title="刷新站点余额" aria-label="刷新站点余额" :disabled="balanceRefreshingAll || group.platformType === 'generic'" @click="refreshUserRelayGroupBalances(group.id)"><IconWallet :size="15" /></button><button class="icon-button" title="站点设置" aria-label="站点设置" @click="openGroupSettings(group)"><IconSettings :size="15" /></button></div></header>
+        <div class="relay-account-list">
+          <article
+            v-for="(account, index) in group.accounts"
+            :key="account.id"
+            class="relay-row"
+            :class="{ 'is-draggable': group.accountOrderMode === 'manual', 'is-dragging': draggedAccount?.accountId === account.id }"
+            :data-relay-group-id="group.id"
+            :data-relay-account-id="account.id"
+          >
+            <button v-if="group.accountOrderMode === 'manual'" type="button" class="relay-row-drag" :aria-label="`拖拽调整 ${account.accountLabel || account.name} 的顺序`" title="拖拽调整账号顺序" @pointerdown="startAccountDrag(group, account.id, $event)"><IconGripVertical :size="17" /><span>{{ index + 1 }}</span></button>
+            <div class="relay-identity"><span><IconServerBolt :size="19" /></span><div><strong>{{ account.accountLabel || account.name }}</strong><a class="relay-url" :href="account.baseUrl" target="_blank" rel="noopener noreferrer" :title="`打开 ${account.baseUrl}`"><IconExternalLink :size="12" />{{ account.baseUrl }}</a><small>{{ account.name }} · 仅自己 · {{ account.models.filter(model => model.enabled).length }} 个模型</small></div></div>
+            <div class="relay-protocols"><span v-for="protocol in account.protocols" :key="protocol.id || protocol.protocol" :data-status="protocol.verificationStatus"><i />{{ protocolLabel(protocol.protocol) }}</span></div>
+            <div class="relay-health"><strong>{{ account.healthStatus === 'healthy' ? '可用' : account.healthStatus === 'unhealthy' ? '需处理' : '待检测' }}</strong><small>{{ date(account.lastHealthCheckAt) }}</small><em v-if="account.lastHealthError" :title="account.lastHealthError || undefined">{{ account.lastHealthError }}</em></div>
+            <div class="relay-balance"><template v-if="account.state.balanceError"><strong>查询失败</strong><small :title="account.state.balanceError || undefined">{{ account.state.balanceError }}</small></template><template v-else-if="account.state.balanceStatus === 'success'"><strong>{{ formatBalance(account.state.remainingBalance, account.state.currency) }}</strong><small>购买 {{ formatBalance(account.state.purchasedQuota, account.state.currency) }} · 赠送 {{ formatBalance(account.state.giftQuota, account.state.currency) }}</small></template><template v-else><strong>余额待查</strong><small>{{ group.platformType === 'generic' ? '通用站未配置余额接口' : '点击刷新余额' }}</small></template></div>
+            <div class="table-actions"><button class="button button--quiet button--small relay-model-button" :disabled="!account.models.length" @click="openModels(account)"><IconBraces :size="14" />查看模型 <span>{{ account.models.filter(model => model.enabled).length }}</span></button><button class="icon-button" title="刷新余额" :aria-label="`${account.name} 刷新余额`" :disabled="balanceLoading === account.id || group.platformType === 'generic' || (group.platformType === 'newapi' && !account.checkinConfigured)" @click="refreshBalance(account)"><IconWallet :size="16" /></button><button v-if="account.checkinEnabled && account.checkinConfigured" class="icon-button" :class="{ 'is-complete': checkedInToday(account) }" :title="checkedInToday(account) ? '今日已签到' : '签到'" :aria-label="`${account.name} ${checkedInToday(account) ? '今日已签到' : '签到'}`" :disabled="checkingIn === account.id || checkedInToday(account)" @click="checkin(account)"><IconCalendarCheck :size="17" /></button><button class="icon-button" :title="connectivityTesting === account.id ? '正在检测连通' : '检测连通'" :aria-label="`${account.name} 检测连通`" :disabled="Boolean(connectivityTesting)" @click="testConnectivity(account)"><IconPlugConnected :class="{ 'is-spinning': connectivityTesting === account.id }" :size="17" /></button><button class="icon-button" :title="testing === account.id ? '协议检测正在执行' : '协议检测'" :aria-label="testing === account.id ? `${account.name} 协议检测正在执行` : `${account.name} 协议检测`" :aria-busy="testing === account.id" @click="requestTest(account)"><IconRefresh :class="{ 'is-spinning': testing === account.id }" :size="17" /></button><button class="icon-button" title="同步模型" aria-label="同步模型" :disabled="syncing === account.id" @click="sync(account)"><IconCloudDownload :size="17" /></button><button class="icon-button" title="复制中转" aria-label="复制中转" @click="openDuplicate(account)"><IconCopy :size="17" /></button><button class="icon-button" title="生成客户端配置" aria-label="生成客户端配置" @click="openConfig(account)"><IconCode :size="17" /></button><button class="icon-button" title="编辑" aria-label="编辑中转" @click="edit(account)"><IconEdit :size="17" /></button><button class="icon-button danger" title="删除" aria-label="删除中转" @click="deleting = account"><IconTrash :size="17" /></button></div>
+          </article>
+        </div>
       </article>
     </section>
     <div v-if="relayStatus === 'pending' && !data" class="admin-empty relay-empty"><IconRefresh class="is-spinning" :size="24" /><strong>正在加载中转站点</strong></div>
     <div v-else-if="!data?.groups.length" class="admin-empty relay-empty"><IconServerBolt :size="26" /><strong>还没有私有中转</strong><p>添加一个支持 Messages、Responses 或 Chat 的站点。</p><button class="button button--primary button--small" @click="create()">添加第一个站点</button></div>
 
     <AppDrawer :open="showForm" kicker="PRIVATE RELAY" :title="editing ? '编辑中转' : '添加中转'" @close="showForm = false"><form class="admin-form" @submit.prevent="save">
+      <label v-if="!editing"><span>预设服务商</span><AppSelect v-model="selectedPresetId" @update:model-value="applyPreset"><option value="">自定义</option><optgroup label="官方服务"><option v-for="preset in relayProviderPresets.filter(item => item.category === 'official')" :key="preset.id" :value="preset.id">{{ preset.name }}</option></optgroup><optgroup label="国内官方"><option v-for="preset in relayProviderPresets.filter(item => item.category === 'cn_official')" :key="preset.id" :value="preset.id">{{ preset.name }}</option></optgroup><optgroup label="第三方与聚合"><option v-for="preset in relayProviderPresets.filter(item => item.category === 'third_party' || item.category === 'aggregator')" :key="preset.id" :value="preset.id">{{ preset.name }}</option></optgroup></AppSelect><small>选择后自动填写站点、地址和协议，API Key 不会被覆盖</small></label>
       <div v-if="!editing" class="form-grid"><label><span>站点名称 *</span><input v-model="form.groupName" :disabled="Boolean(form.groupId)" required placeholder="例如：AgentRouter"></label><label><span>平台 *</span><AppSelect v-model="form.platformType" :disabled="Boolean(form.groupId)"><option value="generic">通用兼容站</option><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option></AppSelect></label></div>
       <div class="form-grid"><label><span>账号名称 *</span><input v-model="form.name" required placeholder="例如：主账号"></label><label><span>账号标签</span><input v-model="form.accountLabel" placeholder="用于账号 Tab 和日志"></label></div>
       <label><span>Base URL *</span><input v-model="form.baseUrl" type="url" required placeholder="https://relay.example.com 或 http://relay.example.com"></label>
       <label v-if="form.baseUrl.startsWith('http://')" class="relay-http-warning"><input v-model="form.insecureHttpAcknowledged" type="checkbox"><span>我确认该站点使用明文 HTTP，API Key、请求和响应可能被读取或篡改。</span></label>
       <label><span>上游 API Key *</span><span class="relay-key-input"><span class="relay-secret-input"><input v-model="form.apiKey" :type="showApiKey ? 'text' : 'password'" required autocomplete="off"><button class="icon-button" type="button" :title="showApiKey ? '隐藏 API Key' : '显示 API Key'" @click="showApiKey = !showApiKey"><IconEyeOff v-if="showApiKey" :size="16" /><IconEye v-else :size="16" /></button></span><button type="button" class="button button--secondary button--small" :disabled="discovering || !form.baseUrl || !form.apiKey" @click="discoverModels"><IconCloudDownload :size="15" />{{ discovering ? '获取中' : '获取模型' }}</button></span></label>
       <section v-if="form.platformType === 'newapi'" class="form-section relay-checkin"><header><div><h3>NewAPI 控制台</h3><span>余额与签到</span></div><label class="switch"><input v-model="form.checkinEnabled" type="checkbox"><span />启用签到</label></header><div class="form-grid"><label><span>控制台访问令牌 *</span><span class="relay-secret-input"><input v-model="form.checkinToken" :type="showCheckinToken ? 'text' : 'password'" required autocomplete="off" placeholder="NewAPI access token"><button class="icon-button" type="button" :title="showCheckinToken ? '隐藏令牌' : '显示令牌'" @click="showCheckinToken = !showCheckinToken"><IconEyeOff v-if="showCheckinToken" :size="16" /><IconEye v-else :size="16" /></button></span></label><label><span>用户 ID（可选）</span><input v-model="form.checkinUserId" autocomplete="off" placeholder="用于 New-Api-User"></label></div></section>
-      <section class="form-section"><header><div><h3>上游协议</h3><span>每个协议使用指定模型检测，认证失败时自动补测另一种认证</span></div></header><datalist id="relay-discovered-models"><option v-for="model in probeModels" :key="model" :value="model" /></datalist><div class="protocol-picker"><div v-for="option in protocolOptions" :key="option.id" class="protocol-option" :class="{ active: selectedProtocol(option.id) }"><button type="button" @click="toggleProtocol(option.id)"><IconCheck :size="15" /><span><strong>{{ option.label }}</strong><small>{{ option.detail }}</small></span></button><div v-if="selectedProtocol(option.id)" class="protocol-option__settings"><label><span>默认认证</span><AppSelect :model-value="selectedProtocol(option.id)?.authScheme" @update:model-value="setAuthScheme(option.id, $event)"><option value="bearer">Bearer</option><option value="x_api_key">x-api-key</option></AppSelect></label><label><span>检测模型 *</span><input :value="selectedProtocol(option.id)?.probeModel || ''" list="relay-discovered-models" required placeholder="选择或输入模型" @input="setProbeModel(option.id, $event)"></label></div></div></div></section>
+      <section class="form-section"><header><div><h3>上游协议</h3><span>每个端点使用独立检测模型，认证失败时自动补测另一种认证</span></div></header><datalist v-for="option in protocolOptions" :id="`relay-probe-models-${option.id}`" :key="`models-${option.id}`"><option v-for="model in probeModelsFor(option.id)" :key="model" :value="model" /></datalist><div class="protocol-picker"><div v-for="option in protocolOptions" :key="option.id" class="protocol-option" :class="{ active: selectedProtocol(option.id) }"><button type="button" @click="toggleProtocol(option.id)"><IconCheck :size="15" /><span><strong>{{ option.label }}</strong><small>{{ option.detail }}</small></span></button><div v-if="selectedProtocol(option.id)" class="protocol-option__settings"><label><span>默认认证</span><AppSelect :model-value="selectedProtocol(option.id)?.authScheme" @update:model-value="setAuthScheme(option.id, $event)"><option value="bearer">Bearer</option><option value="x_api_key">x-api-key</option></AppSelect></label><label><span>检测模型 *</span><input :value="selectedProtocol(option.id)?.probeModel || ''" :list="`relay-probe-models-${option.id}`" required placeholder="从目录选择或手工输入" @input="setProbeModel(option.id, $event)"></label></div></div></div></section>
       <section class="form-section relay-compat-settings"><header><div><h3>兼容设置</h3><span>模型只在你点击获取或同步时更新</span></div></header><label class="switch"><input v-model="form.clientIdentityMode" type="checkbox" true-value="passthrough" false-value="standard"><span />透传真实 Claude Code / Codex 客户端身份</label></section>
       <section v-if="discoveredModels.length" class="form-section relay-discovered"><header><div><h3>已获取模型</h3><span>{{ discoveredModels.length }} 个模型将直接启用</span></div><button type="button" class="button button--quiet button--small" @click="discoveredModels = []">清空</button></header><div class="relay-model-badges"><span v-for="model in discoveredModels" :key="model" :title="model">{{ model }}</span></div></section>
       <section class="form-section relay-mappings"><header><button type="button" class="relay-section-toggle" :aria-expanded="mappingsExpanded" @click="mappingsExpanded = !mappingsExpanded"><component :is="mappingsExpanded ? IconChevronUp : IconChevronDown" :size="16" /><span><strong>模型映射</strong><small>仅在需要修改 Hub 对外模型名或协议绑定时配置</small></span></button><button v-if="mappingsExpanded" type="button" class="button button--quiet button--small" @click="addModel"><IconPlus :size="15" />添加映射</button></header><div v-if="mappingsExpanded" class="relay-model-list"><div v-for="(model, index) in form.models" :key="model.id || index" class="relay-model-entry"><div class="relay-model-row"><input v-model="model.publicModel" placeholder="Hub 模型名（留空自动同名）"><span>→</span><input v-model="model.upstreamModel" placeholder="上游模型名"><button type="button" class="icon-button danger" title="移除模型" aria-label="移除模型" @click="removeModel(index)"><IconX :size="15" /></button></div><div class="relay-model-protocols"><button v-for="protocol in form.protocols" :key="protocol.protocol" type="button" :class="{ active: modelProtocolEnabled(model, protocol.protocol) }" @click="toggleModelProtocol(model, protocol.protocol)"><IconCheck :size="12" />{{ protocolLabel(protocol.protocol) }}</button></div></div></div></section>
@@ -498,14 +556,7 @@ function groupBalanceSummary(group: UserRelayGroupView) {
 .resource-panel-header p { margin-top:.35rem; color:var(--text-muted); font-size:.78rem; }
 .resource-panel-actions { display:flex; align-items:center; gap:.55rem; }
 .relay-ledger { display:grid; gap:.65rem; }
-.relay-site-tabs { margin-bottom:.8rem; display:flex; gap:.25rem; overflow-x:auto; border-bottom:1px solid var(--line-subtle); scrollbar-width:thin; }
-.relay-site-tabs > button { min-width:170px; max-width:250px; min-height:54px; padding:.55rem .7rem; border:0; border-bottom:2px solid transparent; display:grid; align-content:center; justify-items:start; gap:.2rem; color:var(--text-muted); background:transparent; text-align:left; }
-.relay-site-tabs > button:hover { color:var(--text); background:var(--surface-soft); }
-.relay-site-tabs > button.active { border-bottom-color:var(--accent); color:var(--text); background:var(--surface); }
-.relay-site-tabs strong,.relay-site-tabs small { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.relay-site-tabs strong { font-size:.76rem; }
-.relay-site-tabs small { color:var(--text-muted); font-size:.62rem; }
-.relay-group-tabs { margin-bottom:1rem; display:grid; gap:.55rem; }
+.relay-group-list { margin-bottom:1rem; display:grid; gap:.75rem; }
 .relay-group-summary { overflow:hidden; border:1px solid var(--line-subtle); border-radius:7px; background:var(--surface); }
 .relay-group-summary > header { min-height:58px; padding:.65rem .8rem; display:flex; align-items:center; justify-content:space-between; gap:1rem; border-bottom:1px solid var(--line-subtle); }
 .relay-group-summary > header > div:first-child { min-width:0; display:grid; gap:.18rem; }
@@ -515,19 +566,15 @@ function groupBalanceSummary(group: UserRelayGroupView) {
 .relay-group-summary > header small { color:var(--text-muted); font-size:.67rem; }
 .relay-group-actions { display:flex; align-items:center; gap:.35rem; }
 .relay-group-actions select { min-width:120px; }
-.relay-account-tabs { padding:.45rem; display:flex; gap:.35rem; overflow-x:auto; }
-.relay-account-tab { min-width:150px; border:1px solid var(--line-subtle); border-radius:4px; display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:stretch; color:var(--text-muted); background:var(--surface-soft); }
-.relay-account-tab.active { border-color:var(--accent); color:var(--text); box-shadow:inset 0 -2px var(--accent); }
-.relay-account-tab.dragging { opacity:.5; }
-.relay-drag-handle { align-self:center; margin-left:.35rem; cursor:grab; }
-.relay-account-tab > button { min-width:0; min-height:44px; padding:.4rem .55rem; border:0; display:grid; justify-items:start; gap:.15rem; color:inherit; background:transparent; }
-.relay-tab-order { padding:.25rem; display:grid; align-content:center; gap:.1rem; border-left:1px solid var(--line-subtle); }
-.relay-tab-order button { width:22px; height:18px; padding:0; border:0; display:grid; place-items:center; color:var(--text-muted); background:transparent; }
-.relay-tab-order button:disabled { opacity:.25; }
-.relay-account-tab > button > span { max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.72rem; font-weight:700; }
-.relay-account-tabs small { color:var(--text-muted); font-size:.62rem; }
+.relay-account-list { display:grid; }
 .relay-row { min-height:96px; display:grid; grid-template-columns:minmax(220px,1.15fr) minmax(170px,.8fr) minmax(120px,.55fr) minmax(150px,.75fr) auto; gap:1rem; align-items:center; padding:1rem; border:1px solid var(--line-subtle); border-radius:7px; background:var(--surface); }
-.relay-group-summary > .relay-row { border-width:1px 0 0; border-radius:0; }
+.relay-account-list > .relay-row { border-width:1px 0 0; border-radius:0; }
+.relay-account-list > .relay-row:first-child { border-top:0; }
+.relay-row.is-draggable { grid-template-columns:32px minmax(220px,1.15fr) minmax(170px,.8fr) minmax(120px,.55fr) minmax(150px,.75fr) auto; }
+.relay-row.is-dragging { opacity:.45; background:var(--surface-soft); }
+.relay-row-drag { align-self:stretch; display:grid; place-items:center; align-content:center; gap:.3rem; padding:0; border:0; background:transparent; color:var(--text-muted); cursor:grab; touch-action:none; }
+.relay-row-drag:active { cursor:grabbing; }
+.relay-row-drag span { font:700 .62rem/1 var(--font-mono); }
 .relay-balance { min-width:0; display:grid; gap:.2rem; }
 .relay-balance strong { color:var(--hub-accent); font-family:var(--font-mono); font-size:.86rem; }
 .relay-balance small { overflow:hidden; color:var(--hub-text-faint); font-size:.64rem; text-overflow:ellipsis; white-space:nowrap; }
@@ -631,6 +678,6 @@ function groupBalanceSummary(group: UserRelayGroupView) {
 .relay-model-catalog small,.relay-model-meta { color:var(--text-muted); font-size:.66rem; }
 .relay-model-meta { flex:none; display:grid; justify-items:end; gap:.2rem; text-align:right; }
 .relay-model-meta code { max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-@media (max-width:900px) { .relay-row { grid-template-columns:1fr auto; } .relay-protocols,.relay-health,.relay-balance { grid-column:1 / -1; } }
-@media (max-width:640px) { .resource-panel-header { align-items:stretch; flex-direction:column; } .resource-panel-actions { width:100%; flex-wrap:wrap; } .resource-panel-actions .button { flex:1 1 auto; } .relay-group-summary > header { align-items:flex-start; flex-direction:column; } .relay-group-actions { width:100%; flex-wrap:wrap; } .relay-group-actions .app-select { flex:1 1 150px; } .protocol-picker,.key-choice,.relay-settings-grid,.relay-key-input,.relay-copy-target { grid-template-columns:1fr; } .relay-row { grid-template-columns:1fr; } .relay-row > .table-actions { justify-content:flex-end; flex-wrap:wrap; } .relay-model-row { grid-template-columns:1fr auto; } .relay-model-row > span { display:none; } .key-provision { align-items:flex-start; flex-direction:column; } .relay-model-catalog article { align-items:flex-start; flex-direction:column; gap:.45rem; } .relay-model-meta { justify-items:start; text-align:left; } .relay-model-meta code { max-width:100%; } }
+@media (max-width:900px) { .relay-row { grid-template-columns:1fr auto; } .relay-row.is-draggable { grid-template-columns:32px 1fr auto; } .relay-protocols,.relay-health,.relay-balance { grid-column:1 / -1; } .relay-row.is-draggable .relay-protocols,.relay-row.is-draggable .relay-health,.relay-row.is-draggable .relay-balance { grid-column:2 / -1; } }
+@media (max-width:640px) { .resource-panel-header { align-items:stretch; flex-direction:column; } .resource-panel-actions { width:100%; flex-wrap:wrap; } .resource-panel-actions .button { flex:1 1 auto; } .relay-group-summary > header { align-items:flex-start; flex-direction:column; } .relay-group-actions { width:100%; flex-wrap:wrap; } .relay-group-actions .app-select { flex:1 1 150px; } .protocol-picker,.key-choice,.relay-settings-grid,.relay-key-input,.relay-copy-target { grid-template-columns:1fr; } .relay-row,.relay-row.is-draggable { grid-template-columns:1fr; } .relay-row-drag { grid-template-columns:auto auto; justify-content:start; padding:.15rem 0; } .relay-row.is-draggable .relay-protocols,.relay-row.is-draggable .relay-health,.relay-row.is-draggable .relay-balance { grid-column:1; } .relay-row > .table-actions { justify-content:flex-end; flex-wrap:wrap; } .relay-model-row { grid-template-columns:1fr auto; } .relay-model-row > span { display:none; } .key-provision { align-items:flex-start; flex-direction:column; } .relay-model-catalog article { align-items:flex-start; flex-direction:column; gap:.45rem; } .relay-model-meta { justify-items:start; text-align:left; } .relay-model-meta code { max-width:100%; } }
 </style>

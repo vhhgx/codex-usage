@@ -83,9 +83,11 @@ export function userUpstreamTarget(raw: string, path: string) {
   return `${normalized.replace(/\/v1$/i, '')}${path.startsWith('/') ? path : `/${path}`}`
 }
 
-export async function pinnedUpstreamFetch(raw: string, path: string, init: Parameters<typeof undiciFetch>[1] = {}) {
-  const resolved = await resolvePublicUpstream(raw)
-  const target = userUpstreamTarget(resolved.normalized, path)
+async function pinnedResolvedFetch(
+  resolved: Awaited<ReturnType<typeof resolvePublicUpstream>>,
+  target: string,
+  init: Parameters<typeof undiciFetch>[1]
+) {
   const failures: Array<{ address: string; code: string; message: string }> = []
   const candidates = [...resolved.addresses].sort((left, right) => left.family - right.family)
   for (const selected of candidates) {
@@ -109,11 +111,21 @@ export async function pinnedUpstreamFetch(raw: string, path: string, init: Param
       await agent.close().catch(() => {})
       const detail = upstreamNetworkError(error)
       failures.push({ address: selected.address, ...detail })
-      if (init.signal?.aborted) break
+      if (init?.signal?.aborted) break
     }
   }
   const summary = failures.map(item => `${item.address} [${item.code}] ${item.message}`).join('; ')
   const failure = new Error(`所有已解析地址均连接失败：${summary || '没有可用地址'}`)
   Object.assign(failure, { code: 'UPSTREAM_ALL_ADDRESSES_FAILED', failures, target })
   throw failure
+}
+
+export async function pinnedUpstreamFetch(raw: string, path: string, init: Parameters<typeof undiciFetch>[1] = {}) {
+  const resolved = await resolvePublicUpstream(raw)
+  return pinnedResolvedFetch(resolved, userUpstreamTarget(resolved.normalized, path), init)
+}
+
+export async function pinnedUpstreamBaseFetch(raw: string, init: Parameters<typeof undiciFetch>[1] = {}) {
+  const resolved = await resolvePublicUpstream(raw)
+  return pinnedResolvedFetch(resolved, resolved.normalized, init)
 }

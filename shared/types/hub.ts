@@ -123,6 +123,19 @@ export interface ChannelProtocolBindingView {
   lastError: string | null
 }
 
+export interface ProbeModelCatalogView {
+  id: string
+  vendor: string
+  protocol: ChannelProtocol
+  endpoint: string
+  model: string
+  displayName: string
+  enabled: boolean
+  sortOrder: number
+  createdAt: number
+  updatedAt: number
+}
+
 export interface ChannelModelView {
   id?: string
   publicModel: string

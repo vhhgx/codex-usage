@@ -21,7 +21,7 @@ vi.mock('undici', () => {
   return { Agent, fetch: mocks.fetch }
 })
 
-import { isPublicUpstreamAddress, isTunFakeIpAddress, normalizeUserUpstreamUrl, pinnedUpstreamFetch, upstreamNetworkError } from '../server/utils/upstream-url'
+import { isPublicUpstreamAddress, isTunFakeIpAddress, normalizeUserUpstreamUrl, pinnedUpstreamBaseFetch, pinnedUpstreamFetch, upstreamNetworkError } from '../server/utils/upstream-url'
 
 afterEach(() => {
   vi.clearAllMocks()
@@ -85,6 +85,17 @@ describe('pinned upstream fetch', () => {
     const result = await pinnedUpstreamFetch('https://relay.test', '/v1/models')
 
     expect(result.address).toBe('198.18.0.11')
+    expect(result.response).toBe(response)
+  })
+
+  it('probes the configured base URL without rewriting its path', async () => {
+    mocks.lookup.mockResolvedValue([{ address: '1.1.1.1', family: 4 }])
+    const response = { ok: false, status: 401 }
+    mocks.fetch.mockResolvedValue(response)
+
+    const result = await pinnedUpstreamBaseFetch('https://relay.test/custom/v1')
+
+    expect(result.target).toBe('https://relay.test/custom/v1')
     expect(result.response).toBe(response)
   })
 

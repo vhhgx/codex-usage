@@ -17,6 +17,7 @@ import { channelCircuitState } from './hub-routing'
 import { getActiveSubscription } from './customer-management'
 import { getUserFailoverSourceIds, PACKAGE_SOURCE_ID, PRIVATE_POOL_SOURCE_ID, relayGroupSourceId } from './user-route-preferences'
 import { classifyRelayFailure, parseNewApiBalance, parseSub2ApiBalance, relayPlatform, relayPlatformDefinition, type RelayFailureClass } from './relay-platform'
+import { probeUpstreamConnectivity } from './upstream-connectivity'
 
 type Input = Record<string, unknown>
 const MAX_USER_RELAY_MODELS = 500
@@ -609,6 +610,11 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
         : results.filter(result => !result.ok).map(result => `${result.protocol}: ${result.errorCode ? `[${result.errorCode}] ` : ''}${result.message || '检测失败'}`).join('\n').slice(0, 2000)
   await useDatabase(event).update(channels).set({ healthStatus, lastHealthCheckAt: new Date(), lastHealthError, updatedAt: new Date() }).where(and(eq(channels.id, id), eq(channels.ownerUserId, ownerUserId)))
   return { healthy, summaryStatus, pendingClientVerification, connectivity, results }
+}
+
+export async function testUserRelayConnectivity(event: H3Event, ownerUserId: string, id: string) {
+  const relay = await ownedRelay(event, ownerUserId, id)
+  return probeUpstreamConnectivity(relay.baseUrl)
 }
 
 export async function syncUserRelayModels(event: H3Event, ownerUserId: string, id: string) {

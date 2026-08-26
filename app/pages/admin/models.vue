@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { IconCloudDownload, IconCoin, IconDeviceFloppy, IconPlus, IconRoute, IconX } from '@tabler/icons-vue'
+import { IconCloudDownload, IconCoin, IconDeviceFloppy, IconEdit, IconPlus, IconRoute, IconTrash, IconX } from '@tabler/icons-vue'
+import type { ChannelProtocol, ProbeModelCatalogView } from '#shared/types/hub'
 
 definePageMeta({ layout: 'admin', middleware: 'admin' })
 useSeoMeta({ title: '模型与价格 | Zephyr Hub' })
@@ -9,12 +10,51 @@ interface ModelDraft { strategy: 'priority' | 'weighted_round_robin'; enabled: b
 interface ModelConfig { id: string; publicModel: string; strategy: 'priority' | 'weighted_round_robin'; enabled: boolean; endpoints: string[]; imageCapable: boolean; price: null | { inputPerMillion: string; outputPerMillion: string; cachedPerMillion: string; reasoningPerMillion: string; imagePrices: Record<string, number>; effectiveAt: string } }
 interface PriceSyncResult { total: number; updated: number; unavailable: string[]; failed: Array<{ model: string; message: string }>; imageTokenPricingNotImported: string[] }
 const { data, refresh } = await useFetch<{ models: ModelConfig[] }>('/api/admin/models')
+const { data: probeData, refresh: refreshProbeModels } = await useFetch<{ models: ProbeModelCatalogView[] }>('/api/admin/probe-models')
 const drafts = reactive<Record<string, ModelDraft>>({})
 const saving = ref(new Set<string>())
 const syncingPrices = ref(false)
 const toast = useAppToast()
 const defaultImagePrices = ['1024x1024:auto', '1024x1024:high', '1536x1024:high', '1024x1536:high']
 const isImageCapable = (item: ModelConfig) => item.imageCapable
+const showProbeForm = ref(false)
+const editingProbe = ref<ProbeModelCatalogView | null>(null)
+const deletingProbe = ref<ProbeModelCatalogView | null>(null)
+const probeSaving = ref(false)
+const probeError = ref('')
+const probeForm = reactive({ vendor: '', protocol: 'anthropic_messages' as ChannelProtocol, model: '', displayName: '', enabled: true, sortOrder: 100 })
+const probeProtocolLabels: Record<ChannelProtocol, string> = { anthropic_messages: 'Messages', openai_responses: 'Responses', openai_chat: 'Chat Completions' }
+const probeEndpoint: Record<ChannelProtocol, string> = { anthropic_messages: '/v1/messages', openai_responses: '/v1/responses', openai_chat: '/v1/chat/completions' }
+
+function openProbeForm(item?: ProbeModelCatalogView) {
+  editingProbe.value = item || null
+  Object.assign(probeForm, item ? { vendor: item.vendor, protocol: item.protocol, model: item.model, displayName: item.displayName, enabled: item.enabled, sortOrder: item.sortOrder } : { vendor: '', protocol: 'anthropic_messages', model: '', displayName: '', enabled: true, sortOrder: 100 })
+  probeError.value = ''
+  showProbeForm.value = true
+}
+async function saveProbeModel() {
+  probeSaving.value = true; probeError.value = ''
+  try {
+    if (editingProbe.value) await $fetch(`/api/admin/probe-models/${editingProbe.value.id}`, { method: 'PATCH', body: probeForm })
+    else await $fetch('/api/admin/probe-models', { method: 'POST', body: probeForm })
+    showProbeForm.value = false
+    await refreshProbeModels()
+    toast.show(editingProbe.value ? '探测模型已更新' : '探测模型已添加', 'success')
+  } catch (value) {
+    const failure = value as { data?: { message?: string }; message?: string }
+    probeError.value = failure.data?.message || failure.message || '保存探测模型失败'
+  } finally { probeSaving.value = false }
+}
+async function removeProbeModel() {
+  if (!deletingProbe.value) return
+  probeSaving.value = true
+  try {
+    await $fetch(`/api/admin/probe-models/${deletingProbe.value.id}`, { method: 'DELETE' })
+    deletingProbe.value = null
+    await refreshProbeModels()
+    toast.show('探测模型已删除', 'success')
+  } finally { probeSaving.value = false }
+}
 
 function localDate(value?: string) {
   const scheduled = value ? new Date(value) : null
@@ -68,6 +108,10 @@ async function syncPrices() {
 <template>
   <div class="admin-page">
     <header class="admin-page__header"><div><span class="admin-kicker">MODEL CATALOG</span><h1>模型与价格</h1><p>选择模型池调度策略，并定义 Hub 额度结算价格。</p></div><button class="button button--secondary" :disabled="syncingPrices" title="从 Sub2API 定价目录同步" @click="syncPrices"><IconCloudDownload :size="17" />{{ syncingPrices ? '同步中' : '从上游同步价格' }}</button></header>
+    <section class="probe-catalog">
+      <header><div><span class="admin-kicker">PROBE MODELS</span><h2>协议探测模型</h2><p>按端点维护健康检测使用的模型；渠道仍可手工输入上游自定义模型。</p></div><button class="button button--primary button--small" @click="openProbeForm()"><IconPlus :size="16" />添加模型</button></header>
+      <div class="probe-model-list"><article v-for="item in probeData?.models || []" :key="item.id" :data-disabled="!item.enabled"><div><strong>{{ item.displayName }}</strong><code>{{ item.model }}</code></div><div><span>{{ item.vendor }}</span><small>{{ probeProtocolLabels[item.protocol] }} · {{ item.endpoint }} · 顺序 {{ item.sortOrder }}</small></div><div class="table-actions"><button class="icon-button" title="编辑探测模型" aria-label="编辑探测模型" @click="openProbeForm(item)"><IconEdit :size="16" /></button><button class="icon-button danger" title="删除探测模型" aria-label="删除探测模型" @click="deletingProbe = item"><IconTrash :size="16" /></button></div></article><div v-if="!probeData?.models.length" class="admin-empty">还没有探测模型</div></div>
+    </section>
     <section class="model-config-list">
       <article v-for="item in data?.models || []" :key="item.publicModel" class="model-config-row" :data-image-capable="isImageCapable(item)">
         <header><div class="model-mark"><IconRoute :size="19" /></div><div><code>{{ item.publicModel }}</code><span>{{ draft(item).enabled ? '对外可用' : '已隐藏' }}</span></div><label class="switch"><input v-model="draft(item).enabled" type="checkbox"><span /></label></header>
@@ -78,5 +122,20 @@ async function syncPrices() {
       </article>
       <div v-if="!data?.models.length" class="admin-empty admin-empty--large">添加渠道模型映射后，模型池会自动出现在这里。</div>
     </section>
+    <AppDrawer :open="showProbeForm" kicker="PROBE MODEL" :title="editingProbe ? '编辑探测模型' : '添加探测模型'" @close="showProbeForm = false"><form class="admin-form" @submit.prevent="saveProbeModel"><div class="form-grid"><label><span>厂商 *</span><input v-model="probeForm.vendor" required placeholder="Anthropic"></label><label><span>协议 / 端点 *</span><AppSelect v-model="probeForm.protocol"><option value="anthropic_messages">Messages · /v1/messages</option><option value="openai_responses">Responses · /v1/responses</option><option value="openai_chat">Chat · /v1/chat/completions</option></AppSelect></label></div><label><span>模型 ID *</span><input v-model="probeForm.model" required placeholder="claude-sonnet-5"></label><label><span>显示名称 *</span><input v-model="probeForm.displayName" required placeholder="Claude Sonnet 5"></label><div class="form-grid"><label><span>排序</span><input v-model.number="probeForm.sortOrder" type="number" min="0" max="10000"></label><label class="switch"><input v-model="probeForm.enabled" type="checkbox"><span />在渠道配置中可选</label></div><InlineNotice v-if="probeError" tone="error" title="保存失败" :message="probeError" /><footer><button type="button" class="button button--quiet" @click="showProbeForm = false">取消</button><button type="submit" class="button button--primary" :disabled="probeSaving"><IconDeviceFloppy :size="16" />{{ probeSaving ? '保存中' : '保存' }}</button></footer></form></AppDrawer>
+    <AppConfirmDialog :open="Boolean(deletingProbe)" title="删除探测模型" :message="`删除“${deletingProbe?.displayName || ''}”？已有渠道中保存的检测模型不会被修改。`" :busy="probeSaving" @close="deletingProbe = null" @confirm="removeProbeModel" />
   </div>
 </template>
+
+<style scoped>
+.probe-catalog { margin-bottom:1.25rem; border-top:1px solid var(--hub-line); border-bottom:1px solid var(--hub-line); }
+.probe-catalog > header { display:flex; align-items:flex-end; justify-content:space-between; gap:1rem; padding:1rem 0; }
+.probe-catalog h2,.probe-catalog p { margin:.2rem 0 0; }
+.probe-catalog p { color:var(--hub-text-muted); font-size:.76rem; }
+.probe-model-list { display:grid; }
+.probe-model-list article { display:grid; grid-template-columns:minmax(180px,1.1fr) minmax(240px,1fr) auto; align-items:center; gap:1rem; padding:.75rem 0; border-top:1px solid var(--hub-line-row); }
+.probe-model-list article[data-disabled="true"] { opacity:.55; }
+.probe-model-list article > div:not(.table-actions) { min-width:0; display:grid; gap:.2rem; }
+.probe-model-list code,.probe-model-list small { overflow:hidden; text-overflow:ellipsis; color:var(--hub-text-faint); font-size:.69rem; }
+@media (max-width:700px) { .probe-catalog > header { align-items:flex-start; } .probe-model-list article { grid-template-columns:1fr auto; } .probe-model-list article > div:nth-child(2) { grid-column:1 / -1; grid-row:2; } }
+</style>

@@ -205,6 +205,21 @@ export const channelProtocolBindings = pgTable('channel_protocol_bindings', {
   index('channel_protocol_bindings_enabled_idx').on(table.protocol, table.enabled)
 ])
 
+export const probeModelCatalog = pgTable('probe_model_catalog', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  vendor: text('vendor').notNull(),
+  protocol: channelProtocolEnum('protocol').notNull(),
+  endpoint: text('endpoint').notNull(),
+  model: text('model').notNull(),
+  displayName: text('display_name').notNull(),
+  enabled: boolean('enabled').notNull().default(true),
+  sortOrder: integer('sort_order').notNull().default(100),
+  ...timestamps
+}, table => [
+  uniqueIndex('probe_model_catalog_protocol_model_idx').on(table.protocol, table.model),
+  index('probe_model_catalog_protocol_enabled_idx').on(table.protocol, table.enabled, table.sortOrder)
+])
+
 export const channelModels = pgTable('channel_models', {
   id: uuid('id').primaryKey().defaultRandom(),
   channelId: uuid('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
