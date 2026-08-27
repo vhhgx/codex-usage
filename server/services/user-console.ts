@@ -1,8 +1,8 @@
 import { and, asc, count, desc, eq, gte, inArray, lte, sql } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { useDatabase } from '../db'
-import { channelModels, channels, groupChannelRules, groupMemberships, groupModelRules, groups, hubKeys, modelPrices, requestLogs, usageRollups, userPoolAccounts, userPoolGroups } from '../db/schema'
-import { hubKeyUsageDetail, requestLogDetail } from './hub-analytics'
+import { channelModels, channels, groupChannelRules, groupMemberships, groupModelRules, groups, hubKeys, modelPrices, requestLogs, usageRollups, userPoolAccounts, userPoolGroups, userRelayGroups } from '../db/schema'
+import { hubKeyUsageDetail, requestLogDetail, requestResourceFallback } from './hub-analytics'
 import { createHubKeyRecord, listHubKeys, revealHubKeySecret, updateHubKeyRecord } from './hub-admin'
 import { getHubSettings } from './hub-settings'
 import { startOfZoned } from '../utils/time-zone'
@@ -244,16 +244,78 @@ export async function getUserModels(event: H3Event, userId: string) {
 export async function listUserLogs(event: H3Event, userId: string, page = 1, pageSize = 50) {
   const db = useDatabase(event)
   const size = Math.min(100, Math.max(10, pageSize))
-  const rows = await db.select({ log: requestLogs, keyName: hubKeys.name }).from(requestLogs)
-    .leftJoin(hubKeys, eq(requestLogs.keyId, hubKeys.id)).where(eq(requestLogs.userId, userId))
+  const rows = await db.select({ log: requestLogs, keyName: hubKeys.name, channelName: channels.name, accountLabel: channels.accountLabel, channelOwnerKind: channels.ownerKind, relayGroupName: userRelayGroups.name }).from(requestLogs)
+    .leftJoin(hubKeys, eq(requestLogs.keyId, hubKeys.id))
+    .leftJoin(channels, eq(requestLogs.channelId, channels.id))
+    .leftJoin(userRelayGroups, sql`${userRelayGroups.id} = coalesce(${requestLogs.userRelayGroupId}, ${channels.userRelayGroupId})`)
+    .where(eq(requestLogs.userId, userId))
     .orderBy(desc(requestLogs.createdAt)).limit(size).offset((Math.max(1, page) - 1) * size)
   const [total] = await db.select({ value: count() }).from(requestLogs).where(eq(requestLogs.userId, userId))
-  return { items: rows.map(({ log, keyName }) => ({ id: log.id, requestId: log.requestId, keyId: log.keyId, keyName, endpoint: log.endpoint, requestedModel: log.requestedModel, upstreamModel: log.upstreamModel, channelId: null, channelName: null, status: log.status, httpStatus: log.httpStatus, totalTokens: log.totalTokens, cost: Number(log.cost), firstByteMs: log.firstByteMs, durationMs: log.durationMs, streaming: log.streaming, errorMessage: log.errorMessage, createdAt: log.createdAt.getTime() })), page: Math.max(1, page), pageSize: size, total: number(total?.value) }
+  return {
+    items: rows.map(({ log, keyName, channelName, accountLabel, channelOwnerKind, relayGroupName }) => {
+      const resourceType = log.resourceType !== 'unresolved'
+        ? log.resourceType
+        : log.supplySource === 'user_relay' || channelOwnerKind === 'user'
+          ? 'user_relay' as const
+          : log.supplySource === 'private_pool' || log.poolGroupId
+            ? 'private_pool' as const
+            : log.subscriptionId ? 'subscription' as const : 'unresolved' as const
+      const resourceId = log.resourceId || (resourceType === 'user_relay' ? log.userRelayGroupId : resourceType === 'private_pool' ? log.poolGroupId : resourceType === 'subscription' ? log.subscriptionId : null)
+      return {
+        id: log.id,
+        requestId: log.requestId,
+        keyId: log.keyId,
+        keyName,
+        endpoint: log.endpoint,
+        requestedModel: log.requestedModel,
+        upstreamModel: log.upstreamModel,
+        channelId: log.channelId,
+        channelName,
+        resourceType,
+        resourceId,
+        resourceName: log.resourceNameSnapshot || (resourceType === 'user_relay' ? relayGroupName : null) || requestResourceFallback(resourceType),
+        executionName: log.executionNameSnapshot || accountLabel || channelName,
+        userRelayGroupId: log.userRelayGroupId,
+        status: log.status,
+        httpStatus: log.httpStatus,
+        totalTokens: log.totalTokens,
+        cost: Number(log.cost),
+        firstByteMs: log.firstByteMs,
+        durationMs: log.durationMs,
+        streaming: log.streaming,
+        errorMessage: log.errorMessage,
+        createdAt: log.createdAt.getTime()
+      }
+    }),
+    page: Math.max(1, page),
+    pageSize: size,
+    total: number(total?.value)
+  }
 }
 
 export async function getUserLog(event: H3Event, userId: string, id: string) {
   const [owned] = await useDatabase(event).select({ id: requestLogs.id }).from(requestLogs).where(and(eq(requestLogs.id, id), eq(requestLogs.userId, userId))).limit(1)
   if (!owned) throw createError({ statusCode: 404, message: '请求日志不存在' })
   const detail = await requestLogDetail(event, id)
-  return { ...detail, channelId: null, channelName: null, attempts: [] }
+  const routedAttempt = detail.attempts.find(attempt => attempt.resourceType || attempt.resourceNameSnapshot || attempt.executionNameSnapshot)
+  const resourceType = detail.resourceType !== 'unresolved'
+    ? detail.resourceType
+    : routedAttempt?.resourceType || (detail.supplySource === 'user_relay' ? 'user_relay' : detail.supplySource === 'private_pool' ? 'private_pool' : detail.subscriptionId ? 'subscription' : 'unresolved')
+  return {
+    ...detail,
+    resourceType,
+    resourceName: detail.resourceNameSnapshot || routedAttempt?.resourceNameSnapshot || requestResourceFallback(resourceType),
+    executionName: detail.executionNameSnapshot || routedAttempt?.executionNameSnapshot || detail.channelName,
+    attempts: detail.attempts.map(attempt => ({
+      id: attempt.id,
+      attempt: attempt.attempt,
+      status: attempt.status,
+      httpStatus: attempt.httpStatus,
+      durationMs: attempt.durationMs,
+      errorMessage: attempt.errorMessage,
+      resourceNameSnapshot: attempt.resourceNameSnapshot,
+      executionNameSnapshot: attempt.executionNameSnapshot,
+      failureClass: attempt.failureClass
+    }))
+  }
 }

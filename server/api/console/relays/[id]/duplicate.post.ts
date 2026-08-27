@@ -1,5 +1,5 @@
-import { requireUser, writeAudit } from '../../../../../../services/admin-auth'
-import { duplicateUserRelay } from '../../../../../../services/user-relays'
+import { requireUser, writeAudit } from '../../../../services/admin-auth'
+import { duplicateUserRelay } from '../../../../services/user-relays'
 
 export default defineEventHandler(async (event) => {
   const user = await requireUser(event)

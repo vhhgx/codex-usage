@@ -52,7 +52,7 @@ function number(value: unknown) {
   return Number.isFinite(result) ? result : 0
 }
 
-function requestResourceFallback(type: 'subscription' | 'user_relay' | 'private_pool' | 'unresolved') {
+export function requestResourceFallback(type: 'subscription' | 'user_relay' | 'private_pool' | 'unresolved') {
   if (type === 'subscription') return '当前套餐'
   if (type === 'user_relay') return '个人中转'
   if (type === 'private_pool') return '我的专属号池'

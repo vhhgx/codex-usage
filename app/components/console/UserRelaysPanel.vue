@@ -108,7 +108,7 @@ async function edit(item: ChannelView) {
   mappingsExpanded.value = mapped.length > 0
   error.value = ''; credentialsLoading.value = true; showForm.value = true
   try {
-    const credentials = await $fetch<{ apiKey: string; checkinToken: string; checkinUserId: string }>(`/api/console/relay-groups/${item.userRelayGroupId}/accounts/${item.id}/credentials`, { method: 'POST' })
+    const credentials = await $fetch<{ apiKey: string; checkinToken: string; checkinUserId: string }>(`/api/console/relays/${item.id}/credentials`, { method: 'POST' })
     form.apiKey = credentials.apiKey; form.checkinToken = credentials.checkinToken; form.checkinUserId = credentials.checkinUserId || form.checkinUserId; originalApiKey.value = credentials.apiKey; originalCheckinToken.value = credentials.checkinToken
   } catch (value) { const failure = value as { data?: { message?: string }; message?: string }; error.value = failure.data?.message || failure.message || '读取中转凭据失败' }
   finally { credentialsLoading.value = false }
@@ -388,7 +388,7 @@ async function moveAccountToGroup(account: UserRelayAccountView, targetGroupId: 
   if (!editingGroup.value || typeof targetGroupId !== 'string' || !targetGroupId) return
   movingAccount.value = account.id; groupError.value = ''
   try {
-    await $fetch(`/api/console/relay-groups/${editingGroup.value.id}/accounts/${account.id}/move`, { method: 'POST', body: { targetGroupId } })
+    await $fetch(`/api/console/relays/${account.id}/move`, { method: 'POST', body: { targetGroupId } })
     editingGroup.value = null; await refresh(); announceRelayChange(); toast.show('账号已移动到目标站点', 'success')
   } catch (value) { const failure = value as { data?: { message?: string }; message?: string }; groupError.value = failure.data?.message || failure.message || '移动账号失败' }
   finally { movingAccount.value = null }
@@ -456,7 +456,7 @@ async function openDuplicate(item: ChannelView) {
   const group = groupFor(item)
   Object.assign(duplicateForm, { newGroup: false, name: `${item.name} - 副本`, accountLabel: `${item.accountLabel || item.name} - 副本`, groupName: `${group?.name || item.name} - 副本`, homepageUrl: group?.homepageUrl || item.baseUrl, platformType: group?.platformType || 'generic', baseUrl: item.baseUrl, apiKey: '', checkinToken: '', checkinUserId: item.checkinUserId || '', enabled: true })
   try {
-    const credentials = await $fetch<{ apiKey: string; checkinToken: string; checkinUserId: string }>(`/api/console/relay-groups/${item.userRelayGroupId}/accounts/${item.id}/credentials`, { method: 'POST' })
+    const credentials = await $fetch<{ apiKey: string; checkinToken: string; checkinUserId: string }>(`/api/console/relays/${item.id}/credentials`, { method: 'POST' })
     duplicateForm.apiKey = credentials.apiKey; duplicateForm.checkinToken = credentials.checkinToken; duplicateForm.checkinUserId = credentials.checkinUserId || duplicateForm.checkinUserId
   } catch (value) { const failure = value as { data?: { message?: string }; message?: string }; duplicateError.value = failure.data?.message || failure.message || '读取中转凭据失败' }
   finally { duplicateLoading.value = false }
@@ -466,7 +466,7 @@ async function duplicateRelay() {
   if (!item) return
   busy.value = true; duplicateError.value = ''
   try {
-    await $fetch(`/api/console/relay-groups/${item.userRelayGroupId}/accounts/${item.id}/duplicate`, { method: 'POST', body: { ...duplicateForm } })
+    await $fetch(`/api/console/relays/${item.id}/duplicate`, { method: 'POST', body: { ...duplicateForm } })
     duplicating.value = null; await refresh(); announceRelayChange(); toast.show(duplicateForm.newGroup ? '已复制为新站点' : '已添加副本账号', 'success')
   } catch (value) { const failure = value as { data?: { message?: string }; message?: string }; duplicateError.value = failure.data?.message || failure.message || '复制中转失败' }
   finally { busy.value = false }

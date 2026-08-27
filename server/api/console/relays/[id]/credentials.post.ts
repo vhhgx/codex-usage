@@ -1,6 +1,6 @@
-import { requireUser, writeAudit } from '../../../../../../services/admin-auth'
-import { getUserRelayCredentials } from '../../../../../../services/user-relays'
-import { enforceRateLimit } from '../../../../../../utils/rate-limit'
+import { requireUser, writeAudit } from '../../../../services/admin-auth'
+import { getUserRelayCredentials } from '../../../../services/user-relays'
+import { enforceRateLimit } from '../../../../utils/rate-limit'
 
 export default defineEventHandler(async (event) => {
   const user = await requireUser(event)
