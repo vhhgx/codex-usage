@@ -269,6 +269,7 @@ export async function listUserLogs(event: H3Event, userId: string, page = 1, pag
         endpoint: log.endpoint,
         requestedModel: log.requestedModel,
         upstreamModel: log.upstreamModel,
+        reasoningEffort: log.reasoningEffort,
         channelId: log.channelId,
         channelName,
         resourceType,

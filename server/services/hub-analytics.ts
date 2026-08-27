@@ -394,6 +394,7 @@ export async function listRequestLogs(event: H3Event, query: Record<string, stri
     endpoint: log.endpoint,
     requestedModel: log.requestedModel,
     upstreamModel: log.upstreamModel,
+    reasoningEffort: log.reasoningEffort,
     channelId: log.channelId,
     channelName,
     resourceType: log.resourceType,

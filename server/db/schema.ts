@@ -421,6 +421,7 @@ export const requestLogs = pgTable('request_logs', {
   endpoint: text('endpoint').notNull(),
   requestedModel: text('requested_model'),
   upstreamModel: text('upstream_model'),
+  reasoningEffort: text('reasoning_effort'),
   channelId: uuid('channel_id').references(() => channels.id, { onDelete: 'set null' }),
   protocolBindingId: uuid('protocol_binding_id').references(() => channelProtocolBindings.id, { onDelete: 'set null' }),
   inboundProtocol: channelProtocolEnum('inbound_protocol'),

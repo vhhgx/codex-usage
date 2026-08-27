@@ -66,6 +66,7 @@ import { getUserFailoverSourceIds } from './user-route-preferences'
 import { ChatToResponsesStream, chatToResponsesResponse, responsesToChatRequest } from './protocols/responses-chat'
 import { userModelRouteLanes, userRadarPreference } from './user-model-routing'
 import { cachedCodexRadar, selectRadarEffort } from './codex-radar'
+import { requestReasoningEffort } from '#shared/utils/request-log'
 
 const MAX_BODY_BYTES = 50 * 1024 * 1024
 const MAX_BUFFERED_BODY_BYTES = 256 * 1024 * 1024
@@ -670,6 +671,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
   const memory = reserveBodyMemory(event, Number.isFinite(declaredLength) && declaredLength > 0 ? declaredLength : 64 * 1024)
   const requestBody = await readRequestBodyLimited(event, MAX_BODY_BYTES, memory)
   const parsed = bodyModel(requestBody, contentType)
+  const requestedReasoningEffort = requestReasoningEffort(parsed.json)
   const archivedRequestBody = sanitizeArchiveBody(requestBody, contentType)
   if (!parsed.model) openAiError(400, 'model is required', 'invalid_request_error', 'model_required')
   event.context.hubRequestedModel = parsed.model
@@ -692,6 +694,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
       groupId: group.id,
       endpoint,
       requestedModel: parsed.model,
+      reasoningEffort: requestedReasoningEffort,
       inboundProtocol: endpoint === '/v1/responses' ? 'openai_responses' : 'openai_chat',
       status: replay.status >= 200 && replay.status < 400 ? 'success' : 'error',
       httpStatus: replay.status,
@@ -844,6 +847,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
       groupId: group.id,
       endpoint,
       requestedModel: parsed.model,
+      reasoningEffort: requestedReasoningEffort,
       inboundProtocol: endpoint === '/v1/responses' ? 'openai_responses' : 'openai_chat',
       status: 'pending',
       streaming,
@@ -879,6 +883,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
   let responseStarted = false
   let upstreamRequestStarted = false
   let packageAdmissionError: unknown = null
+  let effectiveReasoningEffort = requestedReasoningEffort
 
   async function releasePackageReservation() {
     if (packageAdmissionLease) {
@@ -978,6 +983,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
               } catch { /* Preserve the client effort when CodexRadar is unavailable. */ }
             }
           }
+          effectiveReasoningEffort = requestReasoningEffort(requestJson)
           const payload: Record<string, unknown> = candidate.conversionMode === 'responses_to_chat'
             ? responsesToChatRequest(requestJson, candidate.upstreamModel)
             : { ...requestJson, model: candidate.upstreamModel }
@@ -1137,6 +1143,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
             ...resourceFields(candidate),
             cacheAffinityReused: affinityWasReused,
             upstreamModel: candidate.upstreamModel,
+            reasoningEffort: effectiveReasoningEffort,
             status: streamAborted ? 'stream_aborted' : 'success',
             httpStatus: response.status,
             inputTokens: usage.inputTokens,
@@ -1211,6 +1218,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
           ...resourceFields(candidate),
           cacheAffinityReused: affinityWasReused,
           upstreamModel: candidate.upstreamModel,
+          reasoningEffort: effectiveReasoningEffort,
           status: response.ok ? 'success' : 'error',
           httpStatus: response.status,
           inputTokens: usage.inputTokens,
@@ -1293,6 +1301,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
       channelId: lastCandidate?.channel.id || null,
       protocolBindingId: lastCandidate?.protocolBinding.id || null,
       upstreamModel: lastCandidate?.upstreamModel || null,
+      reasoningEffort: effectiveReasoningEffort,
       ...(lastCandidate ? resourceFields(lastCandidate) : {}),
       status: 'error', httpStatus: 502, errorMessage: message.slice(0, 2000), durationMs: Date.now() - startedAt, failoverCount: Math.max(0, attemptCount - 1), completedAt: new Date()
     }).where(eq(requestLogs.id, log.id))

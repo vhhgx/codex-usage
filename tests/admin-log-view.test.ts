@@ -1,8 +1,17 @@
 import { describe, expect, it } from 'vitest'
 import { base64ByteLength, extractLogImages, parseLogBodyContent, reconstructLogMessages, reconstructLogRequestMessages } from '../shared/utils/admin-log-view'
 import { formatTokenCount } from '../shared/utils/number-format'
+import { requestModelMapping, requestReasoningEffort } from '../shared/utils/request-log'
 
 describe('admin request log presentation', () => {
+  it('shows only effective model mappings and reads both reasoning formats', () => {
+    expect(requestModelMapping('gpt-5.6-sol', 'glm-5.3-flash')).toBe('gpt-5.6-sol → glm-5.3-flash')
+    expect(requestModelMapping('gpt-5.6-sol', 'gpt-5.6-sol')).toBeNull()
+    expect(requestModelMapping('gpt-5.6-sol', null)).toBeNull()
+    expect(requestReasoningEffort({ reasoning: { effort: 'high' } })).toBe('high')
+    expect(requestReasoningEffort({ reasoning_effort: 'xhigh' })).toBe('xhigh')
+  })
+
   it('keeps token counts through 1M explicit, then uses M and B units', () => {
     expect(formatTokenCount(0)).toBe('0')
     expect(formatTokenCount(520_000)).toBe('520,000')

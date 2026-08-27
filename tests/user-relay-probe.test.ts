@@ -1,10 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { interpretRelayCheckinResponse, newApiBalanceQuotaValues, normalizeUserRelayOrder, sortRelayAccounts } from '../server/services/user-relays'
+import { interpretRelayCheckinResponse, newApiBalanceQuotaValues, normalizeUserRelayOrder, preferredModelDiscoveryProtocol, sortRelayAccounts } from '../server/services/user-relays'
 import { parseChannelProtocols } from '../server/services/hub-admin'
 import { mergeUserFailoverSourceIds } from '../server/services/user-route-preferences'
 import { classifyRelayFailure, relayFailureAffectsAccount, relayFailureAllowsFailover } from '../server/services/relay-platform'
 
 describe('private relay protocol settings', () => {
+  it('uses the OpenAI protocol for the shared model catalog before a Messages override', () => {
+    const messages = { protocol: 'anthropic_messages' as const, baseUrlOverride: 'https://api.deepseek.com/anthropic' }
+    const chat = { protocol: 'openai_chat' as const, baseUrlOverride: null }
+    expect(preferredModelDiscoveryProtocol([messages, chat])).toBe(chat)
+  })
+
   it('preserves the probe model explicitly selected for each protocol', () => {
     expect(parseChannelProtocols([
       { protocol: 'anthropic_messages', probeModel: 'claude-sonnet-4-6' },

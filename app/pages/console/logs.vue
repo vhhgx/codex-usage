@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { IconChevronLeft, IconChevronRight, IconCode, IconX } from '@tabler/icons-vue'
+import { IconChevronLeft, IconChevronRight, IconCode, IconRefresh, IconX } from '@tabler/icons-vue'
 import JsonTree from '~/components/admin/JsonTree.vue'
 import type { RequestLogView } from '#shared/types/hub'
 import { extractLogImages, parseLogBodyContent, reconstructLogMessages, reconstructLogRequestMessages } from '#shared/utils/admin-log-view'
 import { formatTokenCount } from '#shared/utils/number-format'
+import { requestModelMapping } from '#shared/utils/request-log'
 
 definePageMeta({ layout: 'console', middleware: 'user' })
 useSeoMeta({ title: '请求记录 | Zephyr Hub' })
@@ -13,7 +14,7 @@ interface AttemptView { id: number; attempt: number; status: string; httpStatus:
 interface Detail extends Record<string, unknown> { requestId: string; resourceType: RequestLogView['resourceType']; resourceName: string | null; executionName: string | null; requestBody: BodyView | null; responseBody: BodyView | null; requestBodyHash: string | null; responseBodyHash: string | null; attempts: AttemptView[] }
 
 const page = ref(1)
-const { data, refresh } = await useFetch<{ items: RequestLogView[]; page: number; pageSize: number; total: number }>('/api/console/logs', { query: computed(() => ({ page: page.value, pageSize: 50 })) })
+const { data, refresh, status: logsStatus } = await useFetch<{ items: RequestLogView[]; page: number; pageSize: number; total: number }>('/api/console/logs', { query: computed(() => ({ page: page.value, pageSize: 50 })) })
 watch(page, () => refresh())
 const maxPage = computed(() => Math.max(1, Math.ceil((data.value?.total || 0) / 50)))
 const detail = ref<Detail | null>(null)
@@ -33,12 +34,12 @@ const resourceType = (value: RequestLogView['resourceType']) => ({ subscription:
 
 <template>
   <div class="admin-page admin-page--logs">
-    <header class="admin-page__header"><div><span class="admin-kicker">MY REQUESTS</span><h1>请求记录</h1><p>只显示归属于你的 Key 的调用记录。</p></div></header>
+    <header class="admin-page__header"><div><span class="admin-kicker">MY REQUESTS</span><h1>请求记录</h1><p>只显示归属于你的 Key 的调用记录。</p></div><button class="button button--secondary button--small" :disabled="logsStatus === 'pending'" @click="refresh()"><IconRefresh :class="{ 'is-spinning': logsStatus === 'pending' }" :size="15" />刷新</button></header>
     <section class="admin-table-wrap"><table class="admin-table admin-table--logs"><thead><tr><th>时间 / 请求 ID</th><th>Key</th><th>模型 / 端点</th><th>资源 / 执行节点</th><th>状态</th><th>Token</th><th>成本</th><th>耗时</th></tr></thead><tbody>
       <tr v-for="item in data?.items || []" :key="item.id" @click="open(item)">
         <td><strong>{{ time(item.createdAt) }}</strong><code>{{ item.requestId }}</code></td>
         <td>{{ item.keyName || '已删除 Key' }}</td>
-        <td><code>{{ item.requestedModel || '—' }}</code><small>{{ item.endpoint.replace('/v1/', '') }}</small></td>
+        <td><code>{{ item.requestedModel || '—' }}</code><small v-if="requestModelMapping(item.requestedModel, item.upstreamModel)">映射：{{ requestModelMapping(item.requestedModel, item.upstreamModel) }}</small><small>{{ item.endpoint.replace('/v1/', '') }}<template v-if="item.reasoningEffort"> · 推理：{{ item.reasoningEffort }}</template></small></td>
         <td><strong>{{ item.resourceName || '未选路' }}</strong><small>{{ resourceType(item.resourceType) }}<template v-if="item.executionName"> · {{ item.executionName }}</template></small></td>
         <td><span class="status-dot" :data-status="item.status"><i />{{ item.httpStatus || '—' }}</span></td>
         <td>{{ formatTokenCount(item.totalTokens) }}</td><td>{{ money(item.cost) }}</td><td>{{ item.durationMs === null ? '—' : `${item.durationMs}ms` }}</td>

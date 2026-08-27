@@ -330,12 +330,16 @@ export async function getUserRelay(event: H3Event, ownerUserId: string, id: stri
   return (await listUserRelays(event, ownerUserId)).find(channel => channel.id === id)!
 }
 
-async function discoverPrivateModels(baseUrl: string, apiKey: string, timeoutMs: number, protocols: ReturnType<typeof parseChannelProtocols>) {
-  const preferred = protocols.find(binding => binding.protocol === 'openai_responses')
+export function preferredModelDiscoveryProtocol<T extends { protocol: ChannelProtocol }>(protocols: T[]) {
+  return protocols.find(binding => binding.protocol === 'openai_responses')
     || protocols.find(binding => binding.protocol === 'openai_chat')
     || protocols[0]
+}
+
+async function discoverPrivateModels(baseUrl: string, apiKey: string, timeoutMs: number, protocols: ReturnType<typeof parseChannelProtocols>) {
+  const preferred = preferredModelDiscoveryProtocol(protocols)
   if (!preferred) return []
-  const ids = await discoverUpstreamModelIds(preferred.baseUrlOverride || baseUrl, apiKey, timeoutMs, {
+  const ids = await discoverUpstreamModelIds(baseUrl, apiKey, timeoutMs, {
     authScheme: preferred.authScheme,
     apiVersion: preferred.apiVersion,
     privateUrl: true
@@ -359,8 +363,9 @@ export async function discoverUserRelayModels(event: H3Event, ownerUserId: strin
   const configured = relayId
     ? await useDatabase(event).select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, relayId))
     : []
+  const preferred = preferredModelDiscoveryProtocol(configured)
   const attempts = configured.length
-    ? configured
+    ? [preferred!, ...configured.filter(protocol => protocol !== preferred)]
     : [
         { protocol: 'openai_responses' as const, authScheme: 'bearer' as const, apiVersion: null, baseUrlOverride: null },
         { protocol: 'anthropic_messages' as const, authScheme: 'x_api_key' as const, apiVersion: '2023-06-01', baseUrlOverride: null }
@@ -368,7 +373,7 @@ export async function discoverUserRelayModels(event: H3Event, ownerUserId: strin
   let lastError: unknown
   for (const protocol of attempts) {
     try {
-      const ids = await discoverUpstreamModelIds(protocol.baseUrlOverride || baseUrl, apiKey, integer(body.timeoutMs, 1000, 600000, relay?.timeoutMs || 120000), {
+      const ids = await discoverUpstreamModelIds(baseUrl, apiKey, integer(body.timeoutMs, 1000, 600000, relay?.timeoutMs || 120000), {
         authScheme: protocol.authScheme,
         apiVersion: protocol.apiVersion,
         privateUrl: true,
@@ -533,9 +538,9 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
   const db = useDatabase(event)
   const configuredProtocols = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, id))
   const apiKey = decryptChannelSecret(relay.encryptedApiKey, relay.id, 'user', event)
-  const firstProtocol = configuredProtocols[0]
+  const modelProtocol = preferredModelDiscoveryProtocol(configuredProtocols)
   const connectivity = {
-    endpoint: userUpstreamTarget(firstProtocol?.baseUrlOverride || relay.baseUrl, '/v1/models'),
+    endpoint: userUpstreamTarget(relay.baseUrl, '/v1/models'),
     ok: false,
     reachable: false,
     status: null as number | null,
@@ -543,19 +548,19 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
     errorCode: null as string | null,
     message: null as string | null,
     modelCount: 0,
-    authScheme: (firstProtocol?.authScheme || 'bearer') as ChannelAuthScheme,
+    authScheme: (modelProtocol?.authScheme || 'bearer') as ChannelAuthScheme,
     attemptedAuthSchemes: [] as ChannelAuthScheme[],
     clientIdentityProbed: false
   }
   const connectivityStarted = Date.now()
   let discoveredModels: string[] = []
   try {
-    const identityProtocol: ChannelProtocol = firstProtocol?.protocol || (relay.modelScopes.length === 1 && relay.modelScopes[0] === 'claude' ? 'anthropic_messages' : 'openai_responses')
+    const identityProtocol: ChannelProtocol = modelProtocol?.protocol || (relay.modelScopes.length === 1 && relay.modelScopes[0] === 'claude' ? 'anthropic_messages' : 'openai_responses')
     const probe = await probeAuthSchemes(connectivity.authScheme, async (authScheme) => {
       const request = async (withIdentity: boolean) => {
-        const result = await pinnedUpstreamFetch(firstProtocol?.baseUrlOverride || relay.baseUrl, '/v1/models', {
+        const result = await pinnedUpstreamFetch(relay.baseUrl, '/v1/models', {
           method: 'GET',
-          headers: { ...upstreamAuthHeaders(authScheme, apiKey, firstProtocol?.apiVersion), ...(withIdentity ? upstreamProbeClientIdentity(identityProtocol) : {}) },
+          headers: { ...upstreamAuthHeaders(authScheme, apiKey, modelProtocol?.apiVersion), ...(withIdentity ? upstreamProbeClientIdentity(identityProtocol) : {}) },
           signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 15000))
         })
         connectivity.endpoint = result.target

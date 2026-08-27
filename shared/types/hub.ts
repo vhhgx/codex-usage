@@ -335,6 +335,7 @@ export interface RequestLogView {
   endpoint: string
   requestedModel: string | null
   upstreamModel: string | null
+  reasoningEffort: string | null
   channelId: string | null
   channelName: string | null
   resourceType: RequestResourceType
