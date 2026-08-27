@@ -78,9 +78,16 @@ export function upstreamNetworkError(error: unknown) {
   return { code: code.slice(0, 120), message: message.slice(0, 500) }
 }
 
-export function userUpstreamTarget(raw: string, path: string) {
+export function upstreamTarget(raw: string, path: string) {
   const normalized = normalizeUserUpstreamUrl(raw)
-  return `${normalized.replace(/\/v1$/i, '')}${path.startsWith('/') ? path : `/${path}`}`
+  const endpoint = path.startsWith('/') ? path : `/${path}`
+  const versionedBase = /\/v\d+(?:\.\d+)?$/i.test(new URL(normalized).pathname)
+  const suffix = versionedBase ? endpoint.replace(/^\/v1(?=\/|$)/i, '') : endpoint
+  return `${normalized}${suffix}`
+}
+
+export function userUpstreamTarget(raw: string, path: string) {
+  return upstreamTarget(raw, path)
 }
 
 async function pinnedResolvedFetch(
@@ -122,7 +129,7 @@ async function pinnedResolvedFetch(
 
 export async function pinnedUpstreamFetch(raw: string, path: string, init: Parameters<typeof undiciFetch>[1] = {}) {
   const resolved = await resolvePublicUpstream(raw)
-  return pinnedResolvedFetch(resolved, userUpstreamTarget(resolved.normalized, path), init)
+  return pinnedResolvedFetch(resolved, upstreamTarget(resolved.normalized, path), init)
 }
 
 export async function pinnedUpstreamBaseFetch(raw: string, init: Parameters<typeof undiciFetch>[1] = {}) {

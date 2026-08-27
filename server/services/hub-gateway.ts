@@ -57,7 +57,7 @@ import { acquireIdempotency, completeIdempotency, failIdempotency } from './hub-
 import { assertTrafficAccepting } from './hub-traffic'
 import { useRedis } from '../utils/redis'
 import { trustedClientIp } from '../utils/client-ip'
-import { pinnedUpstreamFetch } from '../utils/upstream-url'
+import { pinnedUpstreamFetch, upstreamTarget } from '../utils/upstream-url'
 import { effectivePriceMultiplier, policyAllows } from './group-policy'
 import { getActiveSubscription } from './customer-management'
 import { holdUserWallet, releaseUserWallet, settleUserWallet } from './user-wallet'
@@ -963,7 +963,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
         } else if (contentType.includes('multipart/form-data')) {
           outgoing = replaceMultipartModel(requestBody, contentType, candidate.upstreamModel)
         }
-        const upstreamBase = (candidate.protocolBinding.baseUrlOverride || candidate.channel.baseUrl).replace(/\/+$/, '').replace(/\/v1$/i, '')
+        const upstreamBase = candidate.protocolBinding.baseUrlOverride || candidate.channel.baseUrl
         const credential = candidate.credential || decryptChannelSecret(candidate.channel.encryptedApiKey, candidate.channel.id, candidate.channel.ownerKind, event)
         const headers = upstreamHeaders(event, credential, candidate.protocolBinding.authScheme, candidate.protocolBinding.apiVersion)
         upstreamRequestStarted = true
@@ -981,7 +981,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
                   closePinnedConnection = result.close
                   return result.response as unknown as Response
                 })()
-              : await fetch(`${upstreamBase}${endpoint}`, { method: 'POST', headers, body: outgoing as unknown as BodyInit, redirect: 'manual', signal: upstreamAbort.signal })
+              : await fetch(upstreamTarget(upstreamBase, endpoint), { method: 'POST', headers, body: outgoing as unknown as BodyInit, redirect: 'manual', signal: upstreamAbort.signal })
           } catch (error) {
             if (retryIndex >= MAX_UPSTREAM_RETRIES || upstreamAbort.signal.aborted || !shouldRetryUpstreamError(error)) throw error
             await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attemptCount, status: 'retrying', durationMs: Date.now() - attemptStarted, errorMessage: error instanceof Error ? error.message.slice(0, 2000) : 'Temporary upstream network error', failureClass: 'upstream_unavailable', ...resourceFields(candidate) })

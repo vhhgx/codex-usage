@@ -9,7 +9,7 @@ import type { H3Event } from 'h3'
 import { useDatabase } from '../db'
 import { groupModelRules, keyModelRules, requestAttempts, requestLogs, servicePlanVersions, usageRollups, userPoolAccounts, userPoolGroups, userRelayGroups, userSubscriptions, servicePlans } from '../db/schema'
 import { contentHash, decryptChannelSecret, hashCacheAffinity, hashClientIp } from '../utils/hub-crypto'
-import { pinnedUpstreamFetch } from '../utils/upstream-url'
+import { pinnedUpstreamFetch, upstreamTarget } from '../utils/upstream-url'
 import { trustedClientIp } from '../utils/client-ip'
 import { copyUpstreamClientIdentity } from '../utils/upstream-client-identity'
 import { acquireChannel, admitHubRequest, releaseChannel, settleHubRequest, type ChannelConcurrencyLease } from './hub-limits'
@@ -317,7 +317,7 @@ export async function handleAnthropicMessages(event: H3Event) {
                   closePinned = result.close
                   return result.response as unknown as Response
                 })()
-              : await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/i, '')}${path}`, { method: 'POST', headers, body: JSON.stringify(outgoing), redirect: 'manual', signal: requestController.signal })
+              : await fetch(upstreamTarget(base, path), { method: 'POST', headers, body: JSON.stringify(outgoing), redirect: 'manual', signal: requestController.signal })
           } catch (error) {
             if (retryIndex >= MAX_UPSTREAM_RETRIES || requestController.signal.aborted || !shouldRetryUpstreamError(error)) throw error
             await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'retrying', durationMs: Date.now() - attemptStarted, errorMessage: error instanceof Error ? error.message.slice(0, 2000) : 'Temporary upstream network error', failureClass: 'upstream_unavailable', ...resourceFields(candidate) })

@@ -3,7 +3,7 @@ import type { H3Event } from 'h3'
 import { useDatabase } from '../db'
 import { channelProtocolBindings, channels } from '../db/schema'
 import { decryptChannelSecret } from '../utils/hub-crypto'
-import { pinnedUpstreamFetch } from '../utils/upstream-url'
+import { pinnedUpstreamFetch, upstreamTarget } from '../utils/upstream-url'
 import { probeAuthSchemes, upstreamAuthHeaders } from '../utils/upstream-auth'
 import { recordChannelSuccess } from './hub-routing'
 
@@ -19,7 +19,7 @@ export async function checkChannelHealth(event: H3Event | undefined, channel: ty
     const errors: string[] = []
     const apiKey = decryptChannelSecret(channel.encryptedApiKey, channel.id, channel.ownerKind, event)
     for (const protocol of candidates) {
-      const base = (protocol.baseUrlOverride || channel.baseUrl).replace(/\/+$/, '').replace(/\/v1$/i, '')
+      const base = protocol.baseUrlOverride || channel.baseUrl
       try {
         const probe = await probeAuthSchemes(protocol.authScheme, async (authScheme) => {
           const headers = upstreamAuthHeaders(authScheme, apiKey, protocol.apiVersion)
@@ -30,7 +30,7 @@ export async function checkChannelHealth(event: H3Event | undefined, channel: ty
             await result.close().catch(() => {})
             return response
           }
-          const response = await fetch(`${base}/v1/models`, { headers, redirect: 'manual', signal: AbortSignal.timeout(Math.min(channel.timeoutMs, 15000)) })
+          const response = await fetch(upstreamTarget(base, '/v1/models'), { headers, redirect: 'manual', signal: AbortSignal.timeout(Math.min(channel.timeoutMs, 15000)) })
           return { ok: response.ok, status: response.status, body: await response.text() }
         })
         const final = probe.attempts.at(-1)!

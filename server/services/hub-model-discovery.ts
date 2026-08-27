@@ -3,7 +3,7 @@ import type { H3Event } from 'h3'
 import { useDatabase } from '../db'
 import { channelModelBindings, channelModels, channelProtocolBindings, channels, modelPools } from '../db/schema'
 import { decryptChannelSecret } from '../utils/hub-crypto'
-import { pinnedUpstreamFetch } from '../utils/upstream-url'
+import { pinnedUpstreamFetch, upstreamTarget } from '../utils/upstream-url'
 import type { ChannelModelView } from '#shared/types/hub'
 
 const MAX_DISCOVERED_MODELS = 2000
@@ -32,10 +32,6 @@ export function mergeDiscoveredModelMappings(ids: string[], manual: ChannelModel
   return [...new Map([...automatic, ...manual].map(model => [model.publicModel, model])).values()]
 }
 
-function upstreamBaseUrl(baseUrl: string) {
-  return baseUrl.replace(/\/+$/, '').replace(/\/v1$/i, '')
-}
-
 export async function discoverUpstreamModelIds(baseUrl: string, apiKey: string, timeoutMs = 15000, options: { authScheme?: 'bearer' | 'x_api_key'; apiVersion?: string | null; privateUrl?: boolean } = {}) {
   let response: Response
   let close: (() => Promise<void>) | null = null
@@ -48,7 +44,7 @@ export async function discoverUpstreamModelIds(baseUrl: string, apiKey: string, 
       response = result.response as unknown as Response
       close = result.close
     } else {
-      response = await fetch(`${upstreamBaseUrl(baseUrl)}/v1/models`, {
+      response = await fetch(upstreamTarget(baseUrl, '/v1/models'), {
         headers,
         redirect: 'manual',
         signal: AbortSignal.timeout(Math.min(Math.max(timeoutMs, 1000), 15000))

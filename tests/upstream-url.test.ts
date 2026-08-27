@@ -21,7 +21,7 @@ vi.mock('undici', () => {
   return { Agent, fetch: mocks.fetch }
 })
 
-import { isPublicUpstreamAddress, isTunFakeIpAddress, normalizeUserUpstreamUrl, pinnedUpstreamBaseFetch, pinnedUpstreamFetch, upstreamNetworkError } from '../server/utils/upstream-url'
+import { isPublicUpstreamAddress, isTunFakeIpAddress, normalizeUserUpstreamUrl, pinnedUpstreamBaseFetch, pinnedUpstreamFetch, upstreamNetworkError, upstreamTarget } from '../server/utils/upstream-url'
 
 afterEach(() => {
   vi.clearAllMocks()
@@ -49,6 +49,22 @@ describe('private relay SSRF protection', () => {
     expect(isTunFakeIpAddress('198.19.255.254')).toBe(true)
     expect(isTunFakeIpAddress('198.20.0.1')).toBe(false)
     expect(isTunFakeIpAddress('192.168.1.1')).toBe(false)
+  })
+})
+
+describe('upstream endpoint joining', () => {
+  it('keeps the canonical v1 prefix for an unversioned base URL', () => {
+    expect(upstreamTarget('https://relay.example.com', '/v1/chat/completions')).toBe('https://relay.example.com/v1/chat/completions')
+  })
+
+  it('does not duplicate the version segment for versioned base URLs', () => {
+    expect(upstreamTarget('https://relay.example.com/v1', '/v1/models')).toBe('https://relay.example.com/v1/models')
+    expect(upstreamTarget('https://open.bigmodel.cn/api/paas/v4', '/v1/chat/completions')).toBe('https://open.bigmodel.cn/api/paas/v4/chat/completions')
+    expect(upstreamTarget('https://open.bigmodel.cn/api/paas/v4', '/v1/models')).toBe('https://open.bigmodel.cn/api/paas/v4/models')
+  })
+
+  it('preserves v1 below a non-versioned API namespace', () => {
+    expect(upstreamTarget('https://open.bigmodel.cn/api/anthropic', '/v1/messages')).toBe('https://open.bigmodel.cn/api/anthropic/v1/messages')
   })
 })
 
