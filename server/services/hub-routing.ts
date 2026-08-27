@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto'
-import { and, asc, eq, ne } from 'drizzle-orm'
+import { and, asc, eq, ne, or } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { createError } from 'h3'
 import { useDatabase } from '../db'
-import { channelModelBindings, channelModels, channelProtocolBindings, channels, groupChannelRules, modelPools, userPoolAccounts, userPoolGroups, userRelayAccountStates, userRelayGroups } from '../db/schema'
+import { channelModelBindings, channelModelPrices, channelModels, channelProtocolBindings, channels, groupChannelRules, modelPools, userPoolAccounts, userPoolGroups, userRelayAccountStates, userRelayGroups } from '../db/schema'
+import { canonicalModelId } from '#shared/utils/model-routing'
 import { decryptChannelSecret, decryptContextSecret } from '../utils/hub-crypto'
 import { redactSensitiveText } from '../utils/upstream'
 import { useRedis } from '../utils/redis'
@@ -16,7 +17,7 @@ export interface RouteCandidate {
   upstreamModel: string
   protocolBinding: typeof channelProtocolBindings.$inferSelect
   modelBinding: typeof channelModelBindings.$inferSelect
-  conversionMode: 'passthrough' | 'anthropic_to_openai' | 'openai_to_anthropic'
+  conversionMode: 'passthrough' | 'anthropic_to_openai' | 'openai_to_anthropic' | 'responses_to_chat'
   affinityReused: boolean
   supplySource: 'platform' | 'private_pool' | 'user_relay'
   credentialSource: 'channel' | 'user_pool' | 'user_relay'
@@ -25,6 +26,9 @@ export interface RouteCandidate {
   relayGroupId?: string
   relayGroupMaxConcurrency?: number
   accountOrder?: number
+  normalizedPrice?: number | null
+  modelMappingKind: string
+  laneSubstitution: boolean
 }
 
 export interface SupplyDecision {
@@ -158,19 +162,23 @@ export async function routeCandidates(
   groupId: string | null = null,
   supplySource: 'platform' | 'private_pool' | 'user_relay' = 'platform',
   poolGroupId?: string,
-  options: { userId?: string; keyId?: string; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat'; allowConversion?: boolean; affinityKey?: string; channelId?: string; relayGroupId?: string } = {}
+  options: { userId?: string; keyId?: string; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat'; allowConversion?: boolean; affinityKey?: string; channelId?: string; relayGroupId?: string; requestedModel?: string; substitution?: boolean; orderMode?: 'manual' | 'price_asc' } = {}
 ) {
   const db = useDatabase(event)
   const requestedProtocol = options.protocol || endpointProtocol(endpoint)
-  const rows = await db.select({ channel: channels, model: channelModels, modelBinding: channelModelBindings, protocolBinding: channelProtocolBindings, relayGroup: userRelayGroups, accountState: userRelayAccountStates })
+  const modelMatch = options.substitution && options.requestedModel
+    ? or(eq(channelModels.publicModel, publicModel), and(eq(channelModels.publicModel, options.requestedModel), eq(channelModels.mappingKind, 'substitution'), eq(channelModels.canonicalModel, canonicalModelId(publicModel))))
+    : eq(channelModels.publicModel, publicModel)
+  const rows = await db.select({ channel: channels, model: channelModels, modelPrice: channelModelPrices, modelBinding: channelModelBindings, protocolBinding: channelProtocolBindings, relayGroup: userRelayGroups, accountState: userRelayAccountStates })
     .from(channelModelBindings)
     .innerJoin(channelModels, eq(channelModelBindings.channelModelId, channelModels.id))
     .innerJoin(channelProtocolBindings, eq(channelModelBindings.protocolBindingId, channelProtocolBindings.id))
     .innerJoin(channels, eq(channelModels.channelId, channels.id))
+    .leftJoin(channelModelPrices, eq(channelModels.id, channelModelPrices.channelModelId))
     .leftJoin(userRelayGroups, eq(channels.userRelayGroupId, userRelayGroups.id))
     .leftJoin(userRelayAccountStates, eq(channels.id, userRelayAccountStates.channelId))
     .where(and(
-      eq(channelModels.publicModel, publicModel),
+      modelMatch,
       eq(channelModels.enabled, true),
       eq(channelModelBindings.enabled, true),
       eq(channelProtocolBindings.enabled, true),
@@ -186,7 +194,8 @@ export async function routeCandidates(
     rows.filter((row) => {
       const protocolMatches = row.protocolBinding.protocol === requestedProtocol
         || options.allowConversion === true && requestedProtocol === 'anthropic_messages' && row.protocolBinding.protocol === 'openai_chat'
-      const capabilityEndpoint = requestedProtocol === 'anthropic_messages' && row.protocolBinding.protocol === 'openai_chat'
+        || requestedProtocol === 'openai_responses' && row.protocolBinding.protocol === 'openai_chat' && row.protocolBinding.capabilityMode === 'responses_via_chat'
+      const capabilityEndpoint = (requestedProtocol === 'anthropic_messages' || requestedProtocol === 'openai_responses') && row.protocolBinding.protocol === 'openai_chat'
         ? '/v1/chat/completions'
         : endpoint
       const sourceMatches = supplySource === 'platform'
@@ -195,6 +204,7 @@ export async function routeCandidates(
           ? row.channel.ownerKind === 'user' && row.channel.ownerUserId === options.userId
           : row.channel.ownerKind === 'platform' && row.channel.type === 'sub2api'
       return channelCanRoute(row.channel)
+        && (options.substitution === true || row.model.mappingKind !== 'substitution')
         && (supplySource !== 'user_relay' || row.protocolBinding.verificationStatus !== 'failed')
         && (supplySource !== 'user_relay' || row.accountState?.routingState === undefined || row.accountState.routingState === 'active')
         && (supplySource !== 'user_relay' || row.relayGroup?.enabled !== false)
@@ -232,13 +242,22 @@ export async function routeCandidates(
       relayGroupId: row.channel.userRelayGroupId || undefined,
       relayGroupMaxConcurrency: row.relayGroup?.maxConcurrency || undefined,
       accountOrder: row.channel.accountRank,
-      conversionMode: requestedProtocol === row.protocolBinding.protocol ? 'passthrough' : requestedProtocol === 'anthropic_messages' ? 'anthropic_to_openai' : 'openai_to_anthropic',
+      normalizedPrice: row.modelPrice?.inputPerMillion === null || row.modelPrice?.inputPerMillion === undefined || row.modelPrice?.outputPerMillion === null || row.modelPrice?.outputPerMillion === undefined ? null : Number(row.modelPrice.inputPerMillion) + Number(row.modelPrice.outputPerMillion),
+      modelMappingKind: row.model.mappingKind,
+      laneSubstitution: options.substitution === true,
+      conversionMode: requestedProtocol === row.protocolBinding.protocol ? 'passthrough' : requestedProtocol === 'anthropic_messages' ? 'anthropic_to_openai' : requestedProtocol === 'openai_responses' ? 'responses_to_chat' : 'openai_to_anthropic',
       affinityReused: false
     })
   }
   if (supplySource === 'user_relay') {
     const rowByChannel = new Map(rows.map(row => [row.channel.id, row]))
     available.sort((left, right) => {
+      if (options.orderMode === 'price_asc') {
+        if (left.normalizedPrice === null && right.normalizedPrice !== null) return 1
+        if (right.normalizedPrice === null && left.normalizedPrice !== null) return -1
+        const price = (left.normalizedPrice || 0) - (right.normalizedPrice || 0)
+        if (price) return price
+      }
       const leftRow = rowByChannel.get(left.channel.id)
       const rightRow = rowByChannel.get(right.channel.id)
       const mode = leftRow?.relayGroup?.accountOrderMode || rightRow?.relayGroup?.accountOrderMode || 'manual'
@@ -254,7 +273,15 @@ export async function routeCandidates(
       }
       return left.channel.accountRank - right.channel.accountRank || compareRouteCandidates(left, right, supplySource)
     })
-  } else available.sort((left, right) => compareRouteCandidates(left, right, supplySource))
+  } else available.sort((left, right) => {
+    if (options.orderMode === 'price_asc') {
+      if (left.normalizedPrice === null && right.normalizedPrice !== null) return 1
+      if (right.normalizedPrice === null && left.normalizedPrice !== null) return -1
+      const price = (left.normalizedPrice || 0) - (right.normalizedPrice || 0)
+      if (price) return price
+    }
+    return compareRouteCandidates(left, right, supplySource)
+  })
   const [pool] = await db.select().from(modelPools).where(eq(modelPools.publicModel, publicModel)).limit(1)
   if (pool?.enabled === false) return []
   if (halfOpen.size) {

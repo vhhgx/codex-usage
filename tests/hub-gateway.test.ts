@@ -6,7 +6,7 @@ import { resolveAnalyticsRange } from '../server/services/hub-analytics'
 import { startOfZoned, zonedDateKey } from '../server/utils/time-zone'
 import { buildKeyActivityResponse, isKeyActivityRequest, keyActivityRange } from '../server/services/key-activity'
 import { activityLogQuery } from '../shared/utils/admin-log-query'
-import { discoverUpstreamModelIds, mergeDiscoveredModelMappings, modelIdsFromPayload, userDiscoveredModelPlan } from '../server/services/hub-model-discovery'
+import { discoverUpstreamModelIds, mergeDiscoveredModelMappings, modelIdsFromPayload, modelsFromPayload, userDiscoveredModelPlan } from '../server/services/hub-model-discovery'
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -69,6 +69,10 @@ describe('OpenAI gateway normalization', () => {
     expect(fetch).toHaveBeenCalledWith('https://upstream.example.com/v1/models', expect.objectContaining({
       headers: { Authorization: 'Bearer secret' }
     }))
+  })
+
+  it('reads unambiguous per-million pricing from the model catalog', () => {
+    expect(modelsFromPayload({ data: [{ id: 'glm-5.3', pricing: { input_per_million: 2, output_per_million: '8', currency: 'cny' } }] })).toEqual([{ id: 'glm-5.3', inputPerMillion: 2, outputPerMillion: 8, cachedPerMillion: null, reasoningPerMillion: null, currency: 'CNY' }])
   })
 
   it('rejects malformed model entries without duplicating valid IDs', () => {

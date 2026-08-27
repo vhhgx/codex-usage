@@ -2,8 +2,31 @@ import { describe, expect, it } from 'vitest'
 import { anthropicToOpenAiChat, anthropicUsage, openAiChatToAnthropic } from '../server/services/protocols/anthropic-openai'
 import { pipeOpenAiChatAsAnthropic } from '../server/services/protocols/anthropic-stream'
 import { compareRouteCandidates, keyRouteSources, orderedRouteSourceNodes } from '../server/services/hub-routing'
+import { ChatToResponsesStream, chatToResponsesResponse, responsesToChatRequest } from '../server/services/protocols/responses-chat'
 
 describe('Anthropic and OpenAI protocol conversion', () => {
+  it('converts Responses instructions, tools and tool results to Chat Completions', () => {
+    const result = responsesToChatRequest({ model: 'public', instructions: 'Be precise', input: [{ role: 'user', content: [{ type: 'input_text', text: 'Read it' }] }, { type: 'function_call', call_id: 'call-1', name: 'read', arguments: '{"path":"a"}' }, { type: 'function_call_output', call_id: 'call-1', output: 'ok' }], tools: [{ type: 'function', name: 'read', parameters: { type: 'object' } }], reasoning: { effort: 'high' } }, 'upstream')
+    expect(result).toMatchObject({ model: 'upstream', reasoning_effort: 'high', messages: [{ role: 'system', content: 'Be precise' }, { role: 'user', content: 'Read it' }, { role: 'assistant' }, { role: 'tool', tool_call_id: 'call-1', content: 'ok' }] })
+  })
+
+  it('converts a Chat response and usage to a Responses response', () => {
+    const result = chatToResponsesResponse({ id: 'chatcmpl-1', model: 'glm', choices: [{ message: { content: 'done', tool_calls: [{ id: 'call-1', function: { name: 'read', arguments: '{"path":"a"}' } }] }, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 } }, 'gpt-public')
+    expect(result).toMatchObject({ id: 'resp_1', model: 'gpt-public', status: 'completed', output_text: 'done', usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6 } })
+    expect(result.output).toHaveLength(2)
+  })
+
+  it('emits Responses SSE events from Chat chunks', () => {
+    const converter = new ChatToResponsesStream('gpt-public')
+    const output = Buffer.concat([
+      converter.push(Buffer.from('data: {"id":"chatcmpl-1","model":"glm","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n\n')),
+      converter.push(Buffer.from('data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1}}\n\n'), true)
+    ]).toString()
+    expect(output).toContain('event: response.created')
+    expect(output).toContain('event: response.output_text.delta')
+    expect(output).toContain('event: response.completed')
+    expect(output).toContain('"delta":"hi"')
+  })
   it('maps system, tools, tool use and tool results to Chat Completions', () => {
     const result = anthropicToOpenAiChat({
       model: 'hub-model',

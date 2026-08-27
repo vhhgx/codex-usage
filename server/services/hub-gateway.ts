@@ -63,6 +63,9 @@ import { getActiveSubscription } from './customer-management'
 import { holdUserWallet, releaseUserWallet, settleUserWallet } from './user-wallet'
 import { visibleChannels } from './channel-access'
 import { getUserFailoverSourceIds } from './user-route-preferences'
+import { ChatToResponsesStream, chatToResponsesResponse, responsesToChatRequest } from './protocols/responses-chat'
+import { userModelRouteLanes, userRadarPreference } from './user-model-routing'
+import { cachedCodexRadar, selectRadarEffort } from './codex-radar'
 
 const MAX_BODY_BYTES = 50 * 1024 * 1024
 const MAX_BUFFERED_BODY_BYTES = 256 * 1024 * 1024
@@ -726,17 +729,26 @@ export async function handleHubRequest(event: H3Event, path: string) {
     })
     const routeOptions = { userId, keyId: key.id, protocol: inboundProtocol, affinityKey }
     const sourceIds = await getUserFailoverSourceIds(event, userId)
-    const sourceNodes = orderedRouteSourceNodes(key.routeMode, sourceIds)
+    const modelLanes = await userModelRouteLanes(event, userId, parsed.model)
     const [privatePool] = await useDatabase(event).select().from(userPoolGroups).where(and(eq(userPoolGroups.ownerUserId, userId), eq(userPoolGroups.status, 'active'))).limit(1)
     const privatePoolAvailable = Boolean(privatePool && (await useDatabase(event).select({ id: userPoolAccounts.id }).from(userPoolAccounts).where(and(eq(userPoolAccounts.poolGroupId, privatePool.id), eq(userPoolAccounts.status, 'active'), eq(userPoolAccounts.schedulable, true))).limit(1))[0])
-    const candidateBatches = await Promise.all(sourceNodes.map(async node => ({
-      node,
-      candidates: node.source === 'platform'
-        ? await routeCandidates(event, parsed.model, endpoint, group.id, 'platform', undefined, routeOptions)
-        : node.source === 'private_pool'
-          ? privatePoolAvailable ? await routeCandidates(event, parsed.model, endpoint, group.id, 'private_pool', privatePool!.id, routeOptions) : []
-        : await routeCandidates(event, parsed.model, endpoint, group.id, 'user_relay', undefined, { ...routeOptions, channelId: node.channelId, relayGroupId: node.relayGroupId })
-    })))
+    const candidateBatches: Array<{ node: ReturnType<typeof orderedRouteSourceNodes>[number]; candidates: Awaited<ReturnType<typeof routeCandidates>> }> = []
+    for (const lane of modelLanes) {
+      const laneSourceIds = [...lane.orderedSourceIds.filter(id => sourceIds.includes(id)), ...sourceIds.filter(id => !lane.orderedSourceIds.includes(id))]
+      const sourceNodes = orderedRouteSourceNodes(key.routeMode, laneSourceIds)
+      const laneBatches = await Promise.all(sourceNodes.map(async node => {
+        const laneOptions = { ...routeOptions, requestedModel: parsed.model, substitution: lane.substitution, orderMode: lane.orderMode }
+        return {
+          node,
+          candidates: node.source === 'platform'
+            ? await routeCandidates(event, lane.actualModel, endpoint, group.id, 'platform', undefined, laneOptions)
+            : node.source === 'private_pool'
+              ? privatePoolAvailable ? await routeCandidates(event, lane.actualModel, endpoint, group.id, 'private_pool', privatePool!.id, laneOptions) : []
+              : await routeCandidates(event, lane.actualModel, endpoint, group.id, 'user_relay', undefined, { ...laneOptions, channelId: node.channelId, relayGroupId: node.relayGroupId })
+        }
+      }))
+      candidateBatches.push(...laneBatches)
+    }
     const initialCandidates = candidateBatches.flatMap(batch => batch.candidates)
     if (!initialCandidates.length) {
       const message = (await getHubSettings(event)).errorMessageOverrides['503'] || `No healthy channel supports model ${parsed.model}`
@@ -954,9 +966,22 @@ export async function handleHubRequest(event: H3Event, path: string) {
       const stopUpstreamTimeout = () => clearTimeout(upstreamTimeout)
       try {
         let outgoing: Buffer<ArrayBufferLike> = requestBody
+        const upstreamEndpoint = candidate.conversionMode === 'responses_to_chat' ? '/v1/chat/completions' : endpoint
         if (parsed.json) {
-          const payload: Record<string, unknown> = { ...parsed.json, model: candidate.upstreamModel }
-          if (streaming && endpoint === '/v1/chat/completions') {
+          let requestJson: Record<string, unknown> = parsed.json
+          if (endpoint === '/v1/responses' && !candidate.laneSubstitution && candidate.modelMappingKind !== 'substitution') {
+            const preference = await userRadarPreference(event, userId)
+            if (preference.enabled) {
+              try {
+                const effort = selectRadarEffort(await cachedCodexRadar(event), parsed.model, preference.maxEffort)
+                if (effort) requestJson = { ...requestJson, reasoning: { ...(usageRecord(requestJson.reasoning) || {}), effort } }
+              } catch { /* Preserve the client effort when CodexRadar is unavailable. */ }
+            }
+          }
+          const payload: Record<string, unknown> = candidate.conversionMode === 'responses_to_chat'
+            ? responsesToChatRequest(requestJson, candidate.upstreamModel)
+            : { ...requestJson, model: candidate.upstreamModel }
+          if (streaming && upstreamEndpoint === '/v1/chat/completions') {
             payload.stream_options = { ...(usageRecord(payload.stream_options) || {}), include_usage: true }
           }
           outgoing = Buffer.from(JSON.stringify(payload))
@@ -977,11 +1002,11 @@ export async function handleHubRequest(event: H3Event, path: string) {
           try {
             response = candidate.channel.ownerKind === 'user'
               ? await (async () => {
-                  const result = await pinnedUpstreamFetch(upstreamBase, endpoint, { method: 'POST', headers, body: outgoing, signal: upstreamAbort.signal })
+                  const result = await pinnedUpstreamFetch(upstreamBase, upstreamEndpoint, { method: 'POST', headers, body: outgoing, signal: upstreamAbort.signal })
                   closePinnedConnection = result.close
                   return result.response as unknown as Response
                 })()
-              : await fetch(upstreamTarget(upstreamBase, endpoint), { method: 'POST', headers, body: outgoing as unknown as BodyInit, redirect: 'manual', signal: upstreamAbort.signal })
+              : await fetch(upstreamTarget(upstreamBase, upstreamEndpoint), { method: 'POST', headers, body: outgoing as unknown as BodyInit, redirect: 'manual', signal: upstreamAbort.signal })
           } catch (error) {
             if (retryIndex >= MAX_UPSTREAM_RETRIES || upstreamAbort.signal.aborted || !shouldRetryUpstreamError(error)) throw error
             await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attemptCount, status: 'retrying', durationMs: Date.now() - attemptStarted, errorMessage: error instanceof Error ? error.message.slice(0, 2000) : 'Temporary upstream network error', failureClass: 'upstream_unavailable', ...resourceFields(candidate) })
@@ -1025,11 +1050,13 @@ export async function handleHubRequest(event: H3Event, path: string) {
           stopUpstreamTimeout()
           responseStarted = true
           responseHeaders(event, response, requestId)
+          if (candidate.conversionMode === 'responses_to_chat') setResponseHeader(event, 'content-type', 'text/event-stream; charset=utf-8')
           const temporaryDirectory = await mkdtemp(join(tmpdir(), 'zephyr-hub-response-'))
           const temporaryPath = join(temporaryDirectory, 'body')
           const archive = createWriteStream(temporaryPath, { flags: 'wx' })
           const responseHash = createHash('sha256')
           let usageTail: Buffer<ArrayBufferLike> = Buffer.alloc(0)
+          const responseConverter = candidate.conversionMode === 'responses_to_chat' ? new ChatToResponsesStream(parsed.model) : null
           const reader = response.body.getReader()
           let clientAborted = false
           let streamError: Error | null = null
@@ -1047,10 +1074,11 @@ export async function handleHubRequest(event: H3Event, path: string) {
               if (done) break
               const chunk = Buffer.from(value)
               if (firstByteMs === null) firstByteMs = Date.now() - startedAt
-              responseHash.update(chunk)
               usageTail = appendUsageTail(usageTail, chunk)
-              if (!archive.write(chunk)) await once(archive, 'drain')
-              if (!clientAborted && !await writeResponseChunk(event.node.res, chunk)) {
+              const clientChunk = responseConverter ? responseConverter.push(chunk) : chunk
+              responseHash.update(clientChunk)
+              if (clientChunk.length && !archive.write(clientChunk)) await once(archive, 'drain')
+              if (clientChunk.length && !clientAborted && !await writeResponseChunk(event.node.res, clientChunk)) {
                 markAborted()
                 break
               }
@@ -1059,6 +1087,12 @@ export async function handleHubRequest(event: H3Event, path: string) {
                 ...(packageAdmissionLease ? [renewHubConcurrency(event, packageAdmissionLease)] : []),
                 renewChannel(event, channelLease)
               ])
+            }
+            if (responseConverter && !clientAborted) {
+              const finalChunk = responseConverter.push(Buffer.alloc(0), true)
+              responseHash.update(finalChunk)
+              if (finalChunk.length && !archive.write(finalChunk)) await once(archive, 'drain')
+              if (finalChunk.length) await writeResponseChunk(event.node.res, finalChunk)
             }
           } catch (error) {
             if (!clientAborted) streamError = error instanceof Error ? error : new Error('Upstream stream was interrupted')
@@ -1079,7 +1113,8 @@ export async function handleHubRequest(event: H3Event, path: string) {
           const usage = extractUsage(usageTail, responseContentType)
           const streamAborted = clientAborted || Boolean(streamError)
           const cost = supplyDecision.source === 'user_relay' ? 0 : await calculateCost(event, parsed.model, usage, parsed.metadata, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Number(candidate.channel.priceMultiplier)))
-          const responseObject = await storeFileSafe(event, requestId, 'response', temporaryPath, responseContentType)
+          const storedResponseContentType = candidate.conversionMode === 'responses_to_chat' ? 'text/event-stream; charset=utf-8' : responseContentType
+          const responseObject = await storeFileSafe(event, requestId, 'response', temporaryPath, storedResponseContentType)
           await rm(temporaryDirectory, { recursive: true, force: true })
           await useDatabase(event).insert(requestAttempts).values({
             requestLogId: log.id,
@@ -1150,14 +1185,22 @@ export async function handleHubRequest(event: H3Event, path: string) {
           }
         }
         stopUpstreamTimeout()
-        const responseBuffer = Buffer.concat(responseChunks)
+        const upstreamResponseBuffer = Buffer.concat(responseChunks)
         await closePinned()
         firstByteMs ??= Date.now() - startedAt
-        const usage = extractUsage(responseBuffer, responseContentType)
+        const usage = extractUsage(upstreamResponseBuffer, responseContentType)
+        let responseBuffer = upstreamResponseBuffer
+        let clientResponseContentType = responseContentType
+        if (response.ok && candidate.conversionMode === 'responses_to_chat') {
+          let payload: Record<string, unknown>
+          try { payload = JSON.parse(upstreamResponseBuffer.toString('utf8')) } catch { throw createError({ statusCode: 502, message: 'Chat 上游未返回可转换的 JSON 响应' }) }
+          responseBuffer = Buffer.from(JSON.stringify(chatToResponsesResponse(payload, parsed.model)))
+          clientResponseContentType = 'application/json; charset=utf-8'
+        }
         const cost = supplyDecision.source === 'user_relay' ? 0 : await calculateCost(event, parsed.model, usage, parsed.metadata, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Number(candidate.channel.priceMultiplier)))
-        const responseObject = await storeBodySafe(event, requestId, 'response', responseBuffer, responseContentType)
-        if (idempotency) await completeIdempotency(event, idempotency.record.id, response.status, responseContentType, responseObject)
-        await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attemptCount, status: response.ok ? 'success' : 'failed', httpStatus: response.status, durationMs: Date.now() - attemptStarted, failureClass: response.ok ? null : classifyRelayFailure(response.status, responseBuffer.toString('utf8')), ...resourceFields(candidate) })
+        const responseObject = await storeBodySafe(event, requestId, 'response', responseBuffer, clientResponseContentType)
+        if (idempotency) await completeIdempotency(event, idempotency.record.id, response.status, clientResponseContentType, responseObject)
+        await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attemptCount, status: response.ok ? 'success' : 'failed', httpStatus: response.status, durationMs: Date.now() - attemptStarted, failureClass: response.ok ? null : classifyRelayFailure(response.status, upstreamResponseBuffer.toString('utf8')), ...resourceFields(candidate) })
         await useDatabase(event).update(requestLogs).set({
           channelId: candidate.channel.id,
           protocolBindingId: candidate.protocolBinding.id,
@@ -1206,6 +1249,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
           if (relayFailureAffectsAccount(failureClass)) await recordChannelFailure(event, candidate.channel.id, `HTTP ${response.status}`)
         }
         responseHeaders(event, response, requestId)
+        if (candidate.conversionMode === 'responses_to_chat') setResponseHeader(event, 'content-type', clientResponseContentType)
         if (!response.ok) {
           setResponseHeader(event, 'content-type', 'application/json; charset=utf-8')
           return normalizeUpstreamError(responseBuffer, response.status, response.statusText, settings.errorMessageOverrides[String(response.status)] || '')
@@ -1225,7 +1269,8 @@ export async function handleHubRequest(event: H3Event, path: string) {
           errorMessage: error instanceof Error ? error.message.slice(0, 2000) : 'Unknown upstream error', failureClass: 'upstream_unavailable',
           ...resourceFields(candidate)
         })
-        await recordChannelFailure(event, candidate.channel.id, error instanceof Error ? error.message : 'upstream error')
+        const requestIncompatible = (error as { statusCode?: number }).statusCode === 422
+        if (!requestIncompatible) await recordChannelFailure(event, candidate.channel.id, error instanceof Error ? error.message : 'upstream error')
         await releaseChannel(event, channelLease)
         admittedChannel = null
         if (endpoint.startsWith('/v1/images/')) throw error

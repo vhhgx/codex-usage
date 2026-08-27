@@ -260,6 +260,20 @@
       "when": 1787757356011,
       "tag": "0036_chunky_rhino",
       "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1787811761195,
+      "tag": "0037_relay_capability_routing",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1787811801622,
+      "tag": "0038_responses_chat_conversion",
+      "breakpoints": true
     }
   ]
 }

@@ -4,12 +4,13 @@ import type { H3Event } from 'h3'
 import type { ChannelCacheSliceView, ChannelCacheView, ChannelModelView, ChannelProtocol, ChannelProtocolBindingView, ChannelType, ChannelView, HubKeyCredentialView, HubKeyView, KeyRouteMode } from '#shared/types/hub'
 import { supportsImagePricing } from '#shared/utils/model-capabilities'
 import { useDatabase } from '../db'
-import { channelGroupGrants, channelModelBindings, channelModels, channelProtocolBindings, channels, channelUserGrants, groupMemberships, groups, hubKeyCredentials, hubKeys, keyChannelRules, keyModelRules, modelPools, modelPrices, usageRollups, users } from '../db/schema'
+import { channelGroupGrants, channelModelBindings, channelModelPrices, channelModels, channelProtocolBindings, channels, channelUserGrants, groupMemberships, groups, hubKeyCredentials, hubKeys, keyChannelRules, keyModelRules, modelPools, modelPrices, usageRollups, users } from '../db/schema'
 import { createHubKey, decryptChannelSecret, decryptHubKeySecret, encryptChannelSecret, encryptHubKeySecret, encryptSecret, hashHubKey, validateHubKeySecret } from '../utils/hub-crypto'
 import { getHubSettings } from './hub-settings'
 import { channelCircuitState } from './hub-routing'
 import { invalidateChannelAccess } from './channel-access'
 import { maskHubKey } from '#shared/utils/key-display'
+import { canonicalModelId, inferMappingKind, modelRevision, modelVendorFamily } from '#shared/utils/model-routing'
 
 type UnknownRecord = Record<string, unknown>
 
@@ -93,6 +94,10 @@ function channelView(
     userRelayGroupId: row.userRelayGroupId,
     accountLabel: row.accountLabel,
     accountRank: row.accountRank,
+    providerPresetId: row.providerPresetId,
+    providerFamily: row.providerFamily,
+    productType: row.productType,
+    modelScopes: row.modelScopes,
     accessScope: row.accessScope,
     grantedUserIds,
     grantedGroupIds,
@@ -163,8 +168,9 @@ export async function listChannels(event: H3Event, owner?: { kind: 'user'; userI
     ? await db.select().from(channels).where(and(eq(channels.ownerKind, owner.kind), eq(channels.ownerUserId, owner.userId))).orderBy(asc(channels.priority), asc(channels.name))
     : await db.select().from(channels).orderBy(asc(channels.priority), asc(channels.name))
   const ids = rows.map(row => row.id)
-  const [modelRows, protocolRows, modelBindingRows, userGrantRows, groupGrantRows, ownerRows, cacheRows] = await Promise.all([
+  const [modelRows, priceRows, protocolRows, modelBindingRows, userGrantRows, groupGrantRows, ownerRows, cacheRows] = await Promise.all([
     ids.length ? db.select().from(channelModels).where(inArray(channelModels.channelId, ids)) : [],
+    ids.length ? db.select({ price: channelModelPrices, channelId: channelModels.channelId }).from(channelModelPrices).innerJoin(channelModels, eq(channelModelPrices.channelModelId, channelModels.id)).where(inArray(channelModels.channelId, ids)) : [],
     ids.length ? db.select().from(channelProtocolBindings).where(inArray(channelProtocolBindings.channelId, ids)) : [],
     ids.length ? db.select({ binding: channelModelBindings, channelId: channelModels.channelId, protocol: channelProtocolBindings.protocol })
       .from(channelModelBindings)
@@ -197,8 +203,18 @@ export async function listChannels(event: H3Event, owner?: { kind: 'user'; userI
       id: model.id,
       publicModel: model.publicModel,
       upstreamModel: model.upstreamModel,
+      canonicalModel: model.canonicalModel || canonicalModelId(model.upstreamModel),
+      vendorFamily: model.vendorFamily,
+      modelRevision: model.modelRevision,
+      mappingKind: model.mappingKind === 'alias' || model.mappingKind === 'substitution' ? model.mappingKind : 'identity',
       enabled: model.enabled,
       endpoints: model.endpoints,
+      price: priceRows.find(item => item.price.channelModelId === model.id)?.price
+        ? (() => {
+            const price = priceRows.find(item => item.price.channelModelId === model.id)!.price
+            return { inputPerMillion: price.inputPerMillion === null ? null : Number(price.inputPerMillion), outputPerMillion: price.outputPerMillion === null ? null : Number(price.outputPerMillion), cachedPerMillion: price.cachedPerMillion === null ? null : Number(price.cachedPerMillion), reasoningPerMillion: price.reasoningPerMillion === null ? null : Number(price.reasoningPerMillion), currency: price.currency, unit: price.unit, source: price.source, fetchedAt: price.fetchedAt.getTime() }
+          })()
+        : null,
       protocolBindings: modelBindingRows.filter(item => item.binding.channelModelId === model.id).map(item => ({
         id: item.binding.id,
         protocol: item.protocol,
@@ -216,6 +232,8 @@ export async function listChannels(event: H3Event, owner?: { kind: 'user'; userI
       apiVersion: binding.apiVersion,
       probeModel: binding.probeModel,
       verificationStatus: binding.verificationStatus,
+      capabilityMode: binding.capabilityMode === 'responses_via_chat' || binding.capabilityMode === 'unsupported' ? binding.capabilityMode : 'native',
+      detectedAt: binding.detectedAt?.getTime() || null,
       verifiedAt: binding.verifiedAt?.getTime() || null,
       lastError: binding.lastError
     })),
@@ -231,7 +249,7 @@ function channelType(value: unknown): ChannelType | null {
   return value === 'cpa' || value === 'sub2api' || value === 'openai_compatible' || value === 'anthropic_compatible' ? value : null
 }
 
-export function parseChannelProtocols(value: unknown, type: ChannelType): Array<Omit<ChannelProtocolBindingView, 'id' | 'verificationStatus' | 'verifiedAt' | 'lastError'>> {
+export function parseChannelProtocols(value: unknown, type: ChannelType): Array<Omit<ChannelProtocolBindingView, 'id' | 'verificationStatus' | 'verifiedAt' | 'lastError' | 'detectedAt'>> {
   const fallback: ChannelProtocol[] = type === 'anthropic_compatible'
     ? ['anthropic_messages']
     : ['openai_responses', 'openai_chat']
@@ -252,7 +270,8 @@ export function parseChannelProtocols(value: unknown, type: ChannelType): Array<
       baseUrlOverride,
       authScheme: item.authScheme === 'x_api_key' || protocol === 'anthropic_messages' && item.authScheme !== 'bearer' ? 'x_api_key' as const : 'bearer' as const,
       apiVersion: text(item.apiVersion, 100) || (protocol === 'anthropic_messages' ? '2023-06-01' : null),
-      probeModel: text(item.probeModel, 200) || null
+      probeModel: text(item.probeModel, 200) || null,
+      capabilityMode: (item.capabilityMode === 'responses_via_chat' || item.capabilityMode === 'unsupported' ? item.capabilityMode : 'native') as ChannelProtocolBindingView['capabilityMode']
     }]
   })
   return [...new Map(parsed.map(binding => [binding.protocol, binding])).values()]
@@ -280,6 +299,10 @@ export function parseChannelModels(value: unknown): ChannelModelView[] {
     return [{
       publicModel,
       upstreamModel,
+      canonicalModel: text(item?.canonicalModel, 200) || canonicalModelId(upstreamModel),
+      vendorFamily: text(item?.vendorFamily, 80) || modelVendorFamily(upstreamModel),
+      modelRevision: text(item?.modelRevision, 80) || modelRevision(upstreamModel),
+      mappingKind: item?.mappingKind === 'alias' || item?.mappingKind === 'substitution' || item?.mappingKind === 'identity' ? item.mappingKind : inferMappingKind(publicModel, upstreamModel),
       enabled: item?.enabled !== false,
       endpoints: stringArray(item?.endpoints, 10),
       protocolBindings
@@ -303,6 +326,10 @@ export async function replaceChannelModels(event: H3Event, channelId: string, mo
       channelId,
       publicModel: model.publicModel,
       upstreamModel: model.upstreamModel,
+      canonicalModel: model.canonicalModel || canonicalModelId(model.upstreamModel),
+      vendorFamily: model.vendorFamily || modelVendorFamily(model.upstreamModel),
+      modelRevision: model.modelRevision || modelRevision(model.upstreamModel),
+      mappingKind: model.mappingKind || inferMappingKind(model.publicModel, model.upstreamModel),
       enabled: model.enabled,
       endpoints: model.endpoints
     }).returning()

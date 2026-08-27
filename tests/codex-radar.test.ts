@@ -4,6 +4,7 @@ import {
   CODEX_RADAR_URL,
   parseCodexRadarPayload
 } from '../shared/utils/codex-radar'
+import { selectRadarEffort } from '../server/services/codex-radar'
 
 describe('CodexRadar parser', () => {
   it('maps the intelligence cards and upstream refresh time', () => {
@@ -106,5 +107,16 @@ describe('CodexRadar parser', () => {
       .toThrow('CodexRadar 没有可用的模型评分')
     expect(() => parseCodexRadarPayload({ points: [{ model: 'malformed' }] }))
       .toThrow('CodexRadar 没有可用的模型评分')
+  })
+
+  it('selects the highest intelligence score within the configured effort ceiling', () => {
+    const radar = { models: [
+      { id: '1', model: 'gpt-5.6-sol', reasoningEffort: 'medium', intelligenceScore: 91, passed: 1, tasks: 1, costUsd: 1, wallSeconds: 1 },
+      { id: '2', model: 'gpt-5.6-sol', reasoningEffort: 'high', intelligenceScore: 95, passed: 1, tasks: 1, costUsd: 1, wallSeconds: 1 },
+      { id: '3', model: 'gpt-5.6-sol', reasoningEffort: 'max', intelligenceScore: 99, passed: 1, tasks: 1, costUsd: 1, wallSeconds: 1 }
+    ], updatedAt: null, fetchedAt: 1, sourceUrl: 'test' }
+    expect(selectRadarEffort(radar, 'openai/gpt-5.6-sol', 'high')).toBe('high')
+    expect(selectRadarEffort(radar, 'gpt-5.6-sol', 'medium')).toBe('medium')
+    expect(selectRadarEffort(radar, 'glm-5.3', 'max')).toBeNull()
   })
 })

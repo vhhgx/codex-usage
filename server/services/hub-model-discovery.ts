@@ -1,10 +1,11 @@
 import { and, eq, inArray } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { useDatabase } from '../db'
-import { channelModelBindings, channelModels, channelProtocolBindings, channels, modelPools } from '../db/schema'
+import { channelModelBindings, channelModelPrices, channelModels, channelProtocolBindings, channels, modelPools } from '../db/schema'
 import { decryptChannelSecret } from '../utils/hub-crypto'
 import { pinnedUpstreamFetch, upstreamTarget } from '../utils/upstream-url'
 import type { ChannelModelView } from '#shared/types/hub'
+import { canonicalModelId, modelRevision, modelVendorFamily } from '#shared/utils/model-routing'
 
 const MAX_DISCOVERED_MODELS = 2000
 
@@ -22,6 +23,38 @@ export function modelIdsFromPayload(payload: unknown) {
   return [...new Set(ids)].slice(0, MAX_DISCOVERED_MODELS).sort()
 }
 
+export interface DiscoveredUpstreamModel {
+  id: string
+  inputPerMillion: number | null
+  outputPerMillion: number | null
+  cachedPerMillion: number | null
+  reasoningPerMillion: number | null
+  currency: string
+}
+
+function finitePrice(value: unknown) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null
+}
+
+export function modelsFromPayload(payload: unknown): DiscoveredUpstreamModel[] {
+  if (!payload || typeof payload !== 'object' || !Array.isArray((payload as { data?: unknown }).data)) return []
+  return (payload as { data: unknown[] }).data.flatMap((raw) => {
+    const item = typeof raw === 'string' ? { id: raw } : raw && typeof raw === 'object' ? raw as Record<string, unknown> : null
+    const id = typeof item?.id === 'string' ? item.id.trim().slice(0, 200) : ''
+    if (!id) return []
+    const pricing = item?.pricing && typeof item.pricing === 'object' ? item.pricing as Record<string, unknown> : item || {}
+    return [{
+      id,
+      inputPerMillion: finitePrice(pricing.input_per_million ?? pricing.prompt_per_million),
+      outputPerMillion: finitePrice(pricing.output_per_million ?? pricing.completion_per_million),
+      cachedPerMillion: finitePrice(pricing.cached_per_million ?? pricing.cache_read_per_million),
+      reasoningPerMillion: finitePrice(pricing.reasoning_per_million),
+      currency: typeof pricing.currency === 'string' && pricing.currency.trim() ? pricing.currency.trim().toUpperCase().slice(0, 8) : 'USD'
+    }]
+  }).filter((item, index, all) => all.findIndex(candidate => candidate.id === item.id) === index).slice(0, MAX_DISCOVERED_MODELS).sort((a, b) => a.id.localeCompare(b.id))
+}
+
 export function mergeDiscoveredModelMappings(ids: string[], manual: ChannelModelView[]) {
   const automatic: ChannelModelView[] = ids.map(publicModel => ({
     publicModel,
@@ -33,6 +66,10 @@ export function mergeDiscoveredModelMappings(ids: string[], manual: ChannelModel
 }
 
 export async function discoverUpstreamModelIds(baseUrl: string, apiKey: string, timeoutMs = 15000, options: { authScheme?: 'bearer' | 'x_api_key'; apiVersion?: string | null; privateUrl?: boolean } = {}) {
+  return (await discoverUpstreamModels(baseUrl, apiKey, timeoutMs, options)).map(item => item.id)
+}
+
+export async function discoverUpstreamModels(baseUrl: string, apiKey: string, timeoutMs = 15000, options: { authScheme?: 'bearer' | 'x_api_key'; apiVersion?: string | null; privateUrl?: boolean } = {}) {
   let response: Response
   let close: (() => Promise<void>) | null = null
   try {
@@ -63,9 +100,9 @@ export async function discoverUpstreamModelIds(baseUrl: string, apiKey: string, 
   try { payload = JSON.parse(body) } catch {
     throw createError({ statusCode: 502, message: '读取上游模型失败：/v1/models 未返回有效 JSON' })
   }
-  const ids = modelIdsFromPayload(payload)
-  if (!ids.length) throw createError({ statusCode: 502, message: '上游 /v1/models 没有返回任何可用模型' })
-  return ids
+  const models = modelsFromPayload(payload)
+  if (!models.length) throw createError({ statusCode: 502, message: '上游 /v1/models 没有返回任何可用模型' })
+  return models
 }
 
 export async function persistDiscoveredModels(event: H3Event | undefined, channelId: string, ids: string[]) {
@@ -76,6 +113,10 @@ export async function persistDiscoveredModels(event: H3Event | undefined, channe
     channelId,
     publicModel: id,
     upstreamModel: id,
+    canonicalModel: canonicalModelId(id),
+    vendorFamily: modelVendorFamily(id),
+    modelRevision: modelRevision(id),
+    mappingKind: 'identity',
     enabled: true,
     endpoints: []
   }))).onConflictDoNothing().returning({ id: channelModels.id })
@@ -148,17 +189,38 @@ export async function syncChannelModelsFromUpstream(event: H3Event, channelId: s
   const protocol = protocols.find(binding => binding.protocol === 'openai_responses')
     || protocols.find(binding => binding.protocol === 'openai_chat')
     || protocols[0]
-  const ids = await discoverUpstreamModelIds(
+  const discoveredModels = await discoverUpstreamModels(
     protocol?.baseUrlOverride || channel.baseUrl,
     decryptChannelSecret(channel.encryptedApiKey, channel.id, channel.ownerKind, event),
     channel.timeoutMs,
     { authScheme: protocol?.authScheme, apiVersion: protocol?.apiVersion, privateUrl: channel.ownerKind === 'user' }
   )
+  const ids = discoveredModels.map(item => item.id)
   const persisted = channel.ownerKind === 'user'
     ? await reconcileUserDiscoveredModels(event, channel.id, ids)
     : { ...(await persistDiscoveredModels(event, channel.id, ids)), removed: 0, reactivated: 0 }
   if (channel.ownerKind === 'user') {
     await db.update(channelProtocolBindings).set({ verificationStatus: 'unknown', verifiedAt: null, lastError: null, updatedAt: new Date() }).where(eq(channelProtocolBindings.channelId, channel.id))
+  }
+  const persistedModels = await db.select().from(channelModels).where(eq(channelModels.channelId, channel.id))
+  for (const discovered of discoveredModels) {
+    const model = persistedModels.find(item => item.upstreamModel === discovered.id && item.publicModel === discovered.id)
+    if (!model || discovered.inputPerMillion === null && discovered.outputPerMillion === null && discovered.cachedPerMillion === null && discovered.reasoningPerMillion === null) continue
+    await db.insert(channelModelPrices).values({
+      channelModelId: model.id,
+      inputPerMillion: discovered.inputPerMillion === null ? null : String(discovered.inputPerMillion),
+      outputPerMillion: discovered.outputPerMillion === null ? null : String(discovered.outputPerMillion),
+      cachedPerMillion: discovered.cachedPerMillion === null ? null : String(discovered.cachedPerMillion),
+      reasoningPerMillion: discovered.reasoningPerMillion === null ? null : String(discovered.reasoningPerMillion),
+      currency: discovered.currency,
+      source: 'upstream_models',
+      fetchedAt: new Date(),
+      updatedAt: new Date()
+    }).onConflictDoUpdate({ target: channelModelPrices.channelModelId, set: {
+      inputPerMillion: discovered.inputPerMillion === null ? null : String(discovered.inputPerMillion), outputPerMillion: discovered.outputPerMillion === null ? null : String(discovered.outputPerMillion),
+      cachedPerMillion: discovered.cachedPerMillion === null ? null : String(discovered.cachedPerMillion), reasoningPerMillion: discovered.reasoningPerMillion === null ? null : String(discovered.reasoningPerMillion),
+      currency: discovered.currency, source: 'upstream_models', fetchedAt: new Date(), updatedAt: new Date()
+    } })
   }
   return { ...persisted, models: ids }
 }

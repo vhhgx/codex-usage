@@ -1,0 +1,1 @@
+ALTER TYPE "public"."protocol_conversion_mode" ADD VALUE 'responses_to_chat';

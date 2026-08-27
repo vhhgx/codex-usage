@@ -24,7 +24,7 @@ export const channelProtocolEnum = pgEnum('channel_protocol', ['anthropic_messag
 export const channelAuthSchemeEnum = pgEnum('channel_auth_scheme', ['bearer', 'x_api_key'])
 export const protocolVerificationStatusEnum = pgEnum('protocol_verification_status', ['unknown', 'verified', 'pending_real_client', 'failed'])
 export const keyRouteModeEnum = pgEnum('key_route_mode', ['platform_only', 'private_only', 'platform_then_private', 'private_then_platform'])
-export const protocolConversionModeEnum = pgEnum('protocol_conversion_mode', ['passthrough', 'anthropic_to_openai', 'openai_to_anthropic'])
+export const protocolConversionModeEnum = pgEnum('protocol_conversion_mode', ['passthrough', 'anthropic_to_openai', 'openai_to_anthropic', 'responses_to_chat'])
 export const routingStrategyEnum = pgEnum('routing_strategy', ['priority', 'weighted_round_robin'])
 export const keyStatusEnum = pgEnum('hub_key_status', ['active', 'disabled', 'expired'])
 export const requestStatusEnum = pgEnum('request_status', ['pending', 'success', 'error', 'stream_aborted'])
@@ -131,6 +131,10 @@ export const channels = pgTable('channels', {
   userRelayGroupId: uuid('user_relay_group_id').references(() => userRelayGroups.id, { onDelete: 'cascade' }),
   accountLabel: text('account_label'),
   accountRank: integer('account_rank').notNull().default(100),
+  providerPresetId: text('provider_preset_id'),
+  providerFamily: text('provider_family'),
+  productType: text('product_type').notNull().default('generic'),
+  modelScopes: jsonb('model_scopes').$type<Array<'gpt' | 'claude' | 'other'>>().notNull().default([]),
   accessScope: channelAccessScopeEnum('access_scope').notNull().default('all'),
   createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
   credentialKeyVersion: text('credential_key_version'),
@@ -196,6 +200,8 @@ export const channelProtocolBindings = pgTable('channel_protocol_bindings', {
   apiVersion: text('api_version'),
   probeModel: text('probe_model'),
   adapterOptions: jsonb('adapter_options').$type<Record<string, unknown>>().notNull().default({}),
+  capabilityMode: text('capability_mode').notNull().default('native'),
+  detectedAt: timestamp('detected_at', { withTimezone: true }),
   verificationStatus: protocolVerificationStatusEnum('verification_status').notNull().default('unknown'),
   verifiedAt: timestamp('verified_at', { withTimezone: true }),
   lastError: text('last_error'),
@@ -225,6 +231,10 @@ export const channelModels = pgTable('channel_models', {
   channelId: uuid('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
   publicModel: text('public_model').notNull(),
   upstreamModel: text('upstream_model').notNull(),
+  canonicalModel: text('canonical_model').notNull().default(''),
+  vendorFamily: text('vendor_family').notNull().default('other'),
+  modelRevision: text('model_revision'),
+  mappingKind: text('mapping_kind').notNull().default('identity'),
   enabled: boolean('enabled').notNull().default(true),
   endpoints: jsonb('endpoints').$type<string[]>().notNull().default([]),
   ...timestamps
@@ -232,6 +242,19 @@ export const channelModels = pgTable('channel_models', {
   uniqueIndex('channel_models_channel_public_idx').on(table.channelId, table.publicModel),
   index('channel_models_public_enabled_idx').on(table.publicModel, table.enabled)
 ])
+
+export const channelModelPrices = pgTable('channel_model_prices', {
+  channelModelId: uuid('channel_model_id').primaryKey().references(() => channelModels.id, { onDelete: 'cascade' }),
+  inputPerMillion: numeric('input_per_million', { precision: 20, scale: 8 }),
+  outputPerMillion: numeric('output_per_million', { precision: 20, scale: 8 }),
+  cachedPerMillion: numeric('cached_per_million', { precision: 20, scale: 8 }),
+  reasoningPerMillion: numeric('reasoning_per_million', { precision: 20, scale: 8 }),
+  currency: text('currency').notNull().default('USD'),
+  unit: text('unit').notNull().default('per_million_tokens'),
+  source: text('source').notNull(),
+  fetchedAt: timestamp('fetched_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+}, table => [index('channel_model_prices_fetched_idx').on(table.fetchedAt)])
 
 export const channelModelBindings = pgTable('channel_model_bindings', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -636,8 +659,35 @@ export const userSubscriptions = pgTable('user_subscriptions', {
 export const userRoutePreferences = pgTable('user_route_preferences', {
   userId: uuid('user_id').primaryKey().references(() => users.id, { onDelete: 'cascade' }),
   orderedSourceIds: jsonb('ordered_source_ids').$type<string[]>().notNull().default([]),
+  radarEnabled: boolean('radar_enabled').notNull().default(false),
+  radarMaxEffort: text('radar_max_effort').notNull().default('high'),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
 })
+
+export const userModelRoutePolicies = pgTable('user_model_route_policies', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  requestedModel: text('requested_model').notNull(),
+  substitutionEnabled: boolean('substitution_enabled').notNull().default(false),
+  orderedSubstituteModels: jsonb('ordered_substitute_models').$type<string[]>().notNull().default([]),
+  ...timestamps
+}, table => [
+  uniqueIndex('user_model_route_policies_user_model_idx').on(table.userId, table.requestedModel),
+  index('user_model_route_policies_user_idx').on(table.userId)
+])
+
+export const userModelSourcePreferences = pgTable('user_model_source_preferences', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  requestedModel: text('requested_model').notNull(),
+  actualModel: text('actual_model').notNull(),
+  orderMode: text('order_mode').notNull().default('manual'),
+  orderedSourceIds: jsonb('ordered_source_ids').$type<string[]>().notNull().default([]),
+  ...timestamps
+}, table => [
+  uniqueIndex('user_model_source_preferences_route_idx').on(table.userId, table.requestedModel, table.actualModel),
+  index('user_model_source_preferences_user_idx').on(table.userId)
+])
 
 export const servicePlanVersions = pgTable('service_plan_versions', {
   id: uuid('id').primaryKey().defaultRandom(),

@@ -5,6 +5,9 @@ export type ChannelProtocol = 'anthropic_messages' | 'openai_responses' | 'opena
 export type ChannelAuthScheme = 'bearer' | 'x_api_key'
 export type ChannelClientIdentityMode = 'standard' | 'passthrough'
 export type ProtocolVerificationStatus = 'unknown' | 'verified' | 'pending_real_client' | 'failed'
+export type RelayModelScope = 'gpt' | 'claude' | 'other'
+export type RelayCapabilityMode = 'native' | 'responses_via_chat' | 'unsupported'
+export type ModelMappingKind = 'identity' | 'alias' | 'substitution'
 export type RelayPlatformType = 'generic' | 'newapi' | 'sub2api'
 export type RelayAccountOrderMode = 'manual' | 'balance_asc' | 'balance_desc'
 export type RelayAccountRoutingState = 'active' | 'depleted' | 'credential_error' | 'manual_disabled'
@@ -28,6 +31,10 @@ export interface ChannelView {
   userRelayGroupId: string | null
   accountLabel: string | null
   accountRank: number
+  providerPresetId: string | null
+  providerFamily: string | null
+  productType: string
+  modelScopes: RelayModelScope[]
   accessScope: ChannelAccessScope
   grantedUserIds: string[]
   grantedGroupIds: string[]
@@ -119,6 +126,8 @@ export interface ChannelProtocolBindingView {
   apiVersion: string | null
   probeModel: string | null
   verificationStatus: ProtocolVerificationStatus
+  capabilityMode?: RelayCapabilityMode
+  detectedAt?: number | null
   verifiedAt: number | null
   lastError: string | null
 }
@@ -140,9 +149,37 @@ export interface ChannelModelView {
   id?: string
   publicModel: string
   upstreamModel: string
+  canonicalModel?: string
+  vendorFamily?: string
+  modelRevision?: string | null
+  mappingKind?: ModelMappingKind
   enabled: boolean
   endpoints: string[]
+  price?: ChannelModelPriceView | null
   protocolBindings?: ChannelModelProtocolView[]
+}
+
+export interface ChannelModelPriceView {
+  inputPerMillion: number | null
+  outputPerMillion: number | null
+  cachedPerMillion: number | null
+  reasoningPerMillion: number | null
+  currency: string
+  unit: string
+  source: string
+  fetchedAt: number
+}
+
+export interface UserModelRoutePolicyView {
+  requestedModel: string
+  substitutionEnabled: boolean
+  orderedSubstituteModels: string[]
+  sources: Array<{ actualModel: string; orderMode: 'manual' | 'price_asc'; orderedSourceIds: string[] }>
+}
+
+export interface UserRadarPreferenceView {
+  enabled: boolean
+  maxEffort: string
 }
 
 export interface ChannelModelProtocolView {
