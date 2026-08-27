@@ -6,6 +6,8 @@ import { decryptChannelSecret } from '../utils/hub-crypto'
 import { pinnedUpstreamFetch, upstreamTarget } from '../utils/upstream-url'
 import type { ChannelModelView } from '#shared/types/hub'
 import { canonicalModelId, modelRevision, modelVendorFamily } from '#shared/utils/model-routing'
+import { alternateAuthScheme, isClientIdentityRejection, upstreamAuthHeaders } from '../utils/upstream-auth'
+import { upstreamProbeClientIdentity } from '../utils/upstream-client-identity'
 
 const MAX_DISCOVERED_MODELS = 2000
 
@@ -65,44 +67,51 @@ export function mergeDiscoveredModelMappings(ids: string[], manual: ChannelModel
   return [...new Map([...automatic, ...manual].map(model => [model.publicModel, model])).values()]
 }
 
-export async function discoverUpstreamModelIds(baseUrl: string, apiKey: string, timeoutMs = 15000, options: { authScheme?: 'bearer' | 'x_api_key'; apiVersion?: string | null; privateUrl?: boolean } = {}) {
+export async function discoverUpstreamModelIds(baseUrl: string, apiKey: string, timeoutMs = 15000, options: { authScheme?: 'bearer' | 'x_api_key'; apiVersion?: string | null; privateUrl?: boolean; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat' } = {}) {
   return (await discoverUpstreamModels(baseUrl, apiKey, timeoutMs, options)).map(item => item.id)
 }
 
-export async function discoverUpstreamModels(baseUrl: string, apiKey: string, timeoutMs = 15000, options: { authScheme?: 'bearer' | 'x_api_key'; apiVersion?: string | null; privateUrl?: boolean } = {}) {
-  let response: Response
-  let close: (() => Promise<void>) | null = null
-  try {
-    const headers: Record<string, string> = options.authScheme === 'x_api_key'
-      ? { 'x-api-key': apiKey, 'anthropic-version': options.apiVersion || '2023-06-01' }
-      : { Authorization: `Bearer ${apiKey}` }
-    if (options.privateUrl) {
-      const result = await pinnedUpstreamFetch(baseUrl, '/v1/models', { headers, signal: AbortSignal.timeout(Math.min(Math.max(timeoutMs, 1000), 15000)) })
-      response = result.response as unknown as Response
-      close = result.close
-    } else {
-      response = await fetch(upstreamTarget(baseUrl, '/v1/models'), {
-        headers,
-        redirect: 'manual',
-        signal: AbortSignal.timeout(Math.min(Math.max(timeoutMs, 1000), 15000))
-      })
+export async function discoverUpstreamModels(baseUrl: string, apiKey: string, timeoutMs = 15000, options: { authScheme?: 'bearer' | 'x_api_key'; apiVersion?: string | null; privateUrl?: boolean; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat' } = {}) {
+  const initialAuth = options.authScheme || (options.protocol === 'anthropic_messages' ? 'x_api_key' : 'bearer')
+  const protocol = options.protocol || (initialAuth === 'x_api_key' ? 'anthropic_messages' : 'openai_responses')
+  const attempts = [initialAuth, alternateAuthScheme(initialAuth)]
+  let lastFailure: { status: number; body: string } | null = null
+  for (const authScheme of attempts) {
+    for (const withIdentity of [false, true]) {
+      if (withIdentity && (!lastFailure || !isClientIdentityRejection(lastFailure.body))) continue
+      let response: Response
+      let close: (() => Promise<void>) | null = null
+      try {
+        const headers: Record<string, string> = {
+          ...(authScheme === 'bearer' ? { Authorization: `Bearer ${apiKey}` } : upstreamAuthHeaders(authScheme, apiKey, options.apiVersion)),
+          ...(withIdentity ? upstreamProbeClientIdentity(protocol) : {})
+        }
+        if (options.privateUrl) {
+          const result = await pinnedUpstreamFetch(baseUrl, '/v1/models', { headers, signal: AbortSignal.timeout(Math.min(Math.max(timeoutMs, 1000), 15000)) })
+          response = result.response as unknown as Response
+          close = result.close
+        } else {
+          response = await fetch(upstreamTarget(baseUrl, '/v1/models'), { headers, redirect: 'manual', signal: AbortSignal.timeout(Math.min(Math.max(timeoutMs, 1000), 15000)) })
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '无法连接上游'
+        throw createError({ statusCode: 502, message: `读取上游模型失败：${message}` })
+      }
+      const body = await response.text()
+      if (close) await close().catch(() => {})
+      if (response.ok) {
+        let payload: unknown
+        try { payload = JSON.parse(body) } catch { throw createError({ statusCode: 502, message: '读取上游模型失败：/v1/models 未返回有效 JSON' }) }
+        const models = modelsFromPayload(payload)
+        if (!models.length) throw createError({ statusCode: 502, message: '上游 /v1/models 没有返回任何可用模型' })
+        return models
+      }
+      lastFailure = { status: response.status, body }
+      if (!isClientIdentityRejection(body) && response.status !== 401 && response.status !== 403) break
     }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : '无法连接上游'
-    throw createError({ statusCode: 502, message: `读取上游模型失败：${message}` })
   }
-  const body = await response.text()
-  if (close) await close().catch(() => {})
-  if (!response.ok) {
-    throw createError({ statusCode: 502, message: `读取上游模型失败：HTTP ${response.status} ${body.slice(0, 300)}`.trim() })
-  }
-  let payload: unknown
-  try { payload = JSON.parse(body) } catch {
-    throw createError({ statusCode: 502, message: '读取上游模型失败：/v1/models 未返回有效 JSON' })
-  }
-  const models = modelsFromPayload(payload)
-  if (!models.length) throw createError({ statusCode: 502, message: '上游 /v1/models 没有返回任何可用模型' })
-  return models
+  if (lastFailure) throw createError({ statusCode: 502, message: `读取上游模型失败：HTTP ${lastFailure.status} ${lastFailure.body.slice(0, 300)}`.trim() })
+  throw createError({ statusCode: 502, message: '读取上游模型失败：上游未返回响应' })
 }
 
 export async function persistDiscoveredModels(event: H3Event | undefined, channelId: string, ids: string[]) {
@@ -193,7 +202,7 @@ export async function syncChannelModelsFromUpstream(event: H3Event, channelId: s
     protocol?.baseUrlOverride || channel.baseUrl,
     decryptChannelSecret(channel.encryptedApiKey, channel.id, channel.ownerKind, event),
     channel.timeoutMs,
-    { authScheme: protocol?.authScheme, apiVersion: protocol?.apiVersion, privateUrl: channel.ownerKind === 'user' }
+    { authScheme: protocol?.authScheme, apiVersion: protocol?.apiVersion, privateUrl: channel.ownerKind === 'user', protocol: protocol?.protocol }
   )
   const ids = discoveredModels.map(item => item.id)
   const persisted = channel.ownerKind === 'user'

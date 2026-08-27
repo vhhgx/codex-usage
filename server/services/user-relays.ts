@@ -371,7 +371,8 @@ export async function discoverUserRelayModels(event: H3Event, ownerUserId: strin
       const ids = await discoverUpstreamModelIds(protocol.baseUrlOverride || baseUrl, apiKey, integer(body.timeoutMs, 1000, 600000, relay?.timeoutMs || 120000), {
         authScheme: protocol.authScheme,
         apiVersion: protocol.apiVersion,
-        privateUrl: true
+        privateUrl: true,
+        protocol: protocol.protocol
       })
       return { models: ids.slice(0, MAX_USER_RELAY_MODELS) }
     } catch (error) { lastError = error }
@@ -543,21 +544,31 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
     message: null as string | null,
     modelCount: 0,
     authScheme: (firstProtocol?.authScheme || 'bearer') as ChannelAuthScheme,
-    attemptedAuthSchemes: [] as ChannelAuthScheme[]
+    attemptedAuthSchemes: [] as ChannelAuthScheme[],
+    clientIdentityProbed: false
   }
   const connectivityStarted = Date.now()
   let discoveredModels: string[] = []
   try {
+    const identityProtocol: ChannelProtocol = firstProtocol?.protocol || (relay.modelScopes.length === 1 && relay.modelScopes[0] === 'claude' ? 'anthropic_messages' : 'openai_responses')
     const probe = await probeAuthSchemes(connectivity.authScheme, async (authScheme) => {
-      const result = await pinnedUpstreamFetch(firstProtocol?.baseUrlOverride || relay.baseUrl, '/v1/models', {
-        method: 'GET',
-        headers: upstreamAuthHeaders(authScheme, apiKey, firstProtocol?.apiVersion),
-        signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 15000))
-      })
-      connectivity.endpoint = result.target
-      const body = await result.response.text()
-      const response = { ok: result.response.ok, status: result.response.status, body }
-      await result.close().catch(() => {})
+      const request = async (withIdentity: boolean) => {
+        const result = await pinnedUpstreamFetch(firstProtocol?.baseUrlOverride || relay.baseUrl, '/v1/models', {
+          method: 'GET',
+          headers: { ...upstreamAuthHeaders(authScheme, apiKey, firstProtocol?.apiVersion), ...(withIdentity ? upstreamProbeClientIdentity(identityProtocol) : {}) },
+          signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 15000))
+        })
+        connectivity.endpoint = result.target
+        const body = await result.response.text()
+        const response = { ok: result.response.ok, status: result.response.status, body }
+        await result.close().catch(() => {})
+        return response
+      }
+      let response = await request(false)
+      if (!response.ok && isClientIdentityRejection(response.body)) {
+        connectivity.clientIdentityProbed = true
+        response = await request(true)
+      }
       return response
     })
     const final = probe.attempts.at(-1)!
@@ -606,17 +617,26 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
     const started = Date.now()
     let selectedAuthScheme: ChannelAuthScheme | null = null
     let attempts: Array<{ authScheme: ChannelAuthScheme; ok: boolean; status: number | null; body: string }> = []
+    let clientIdentityUsed = false
     try {
       const probe = await probeAuthSchemes(protocol.authScheme, async (authScheme) => {
-        const clientIdentity = relay.clientIdentityMode === 'passthrough' ? upstreamProbeClientIdentity(protocol.protocol) : {}
-        const headers = { 'content-type': 'application/json', ...clientIdentity, ...upstreamAuthHeaders(authScheme, apiKey, protocol.apiVersion) }
-        const result = await pinnedUpstreamFetch(protocol.baseUrlOverride || relay.baseUrl, payload.path, {
-          method: 'POST', headers, body: JSON.stringify(payload.body), signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 30000))
-        })
-        endpoint = result.target
-        const responseBody = await result.response.text()
-        const response = { ok: result.response.ok, status: result.response.status, body: responseBody }
-        await result.close().catch(() => {})
+        const request = async (withIdentity: boolean) => {
+          const clientIdentity = withIdentity || relay.clientIdentityMode === 'passthrough' ? upstreamProbeClientIdentity(protocol.protocol) : {}
+          const headers = { 'content-type': 'application/json', ...clientIdentity, ...upstreamAuthHeaders(authScheme, apiKey, protocol.apiVersion) }
+          const result = await pinnedUpstreamFetch(protocol.baseUrlOverride || relay.baseUrl, payload.path, {
+            method: 'POST', headers, body: JSON.stringify(payload.body), signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 30000))
+          })
+          endpoint = result.target
+          const responseBody = await result.response.text()
+          const response = { ok: result.response.ok, status: result.response.status, body: responseBody }
+          await result.close().catch(() => {})
+          return response
+        }
+        let response = await request(false)
+        if (!response.ok && isClientIdentityRejection(response.body)) {
+          clientIdentityUsed = true
+          response = await request(true)
+        }
         return response
       })
       ok = probe.ok
@@ -636,7 +656,7 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
     }
     const clientIdentityRejected = attempts.some(attempt => isClientIdentityRejection(attempt.body))
     const verificationStatus = ok ? 'verified' : clientIdentityRejected ? 'pending_real_client' : 'failed'
-    results.push({ protocol: protocol.protocol, endpoint, ok, status, latencyMs: Date.now() - started, errorCode, message, authScheme: selectedAuthScheme || protocol.authScheme, attemptedAuthSchemes: attempts.map(attempt => attempt.authScheme), clientIdentityRejected, clientIdentityProbed: relay.clientIdentityMode === 'passthrough', model, verificationStatus, baseUrlOverride: protocol.baseUrlOverride, apiVersion: protocol.apiVersion })
+    results.push({ protocol: protocol.protocol, endpoint, ok, status, latencyMs: Date.now() - started, errorCode, message, authScheme: selectedAuthScheme || protocol.authScheme, attemptedAuthSchemes: attempts.map(attempt => attempt.authScheme), clientIdentityRejected, clientIdentityProbed: clientIdentityUsed || relay.clientIdentityMode === 'passthrough', model, verificationStatus, baseUrlOverride: protocol.baseUrlOverride, apiVersion: protocol.apiVersion })
     if (protocol.protocol === 'openai_responses' && ok && !configuredProtocols.length) {
       // Native Responses is preferred; Chat is only a fallback capability.
       const chatIndex = candidateProtocols.findIndex(item => item.protocol === 'openai_chat')
