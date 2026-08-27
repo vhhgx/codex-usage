@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { anthropicToOpenAiChat, anthropicUsage, openAiChatToAnthropic } from '../server/services/protocols/anthropic-openai'
 import { pipeOpenAiChatAsAnthropic } from '../server/services/protocols/anthropic-stream'
-import { compareRouteCandidates, keyRouteSources, orderedRouteSourceNodes } from '../server/services/hub-routing'
+import { compareRouteCandidates, keyRouteSources, modelMappingAllowsRouting, orderedRouteSourceNodes } from '../server/services/hub-routing'
 import { ChatToResponsesStream, chatToResponsesResponse, responsesToChatRequest } from '../server/services/protocols/responses-chat'
 
 describe('Anthropic and OpenAI protocol conversion', () => {
@@ -91,6 +91,13 @@ describe('Anthropic and OpenAI protocol conversion', () => {
     const directSecond = { channel: { priority: 20, name: 'second' }, conversionMode: 'passthrough' as const }
     expect([directSecond, convertedFirst].sort((left, right) => compareRouteCandidates(left, right, 'user_relay'))).toEqual([convertedFirst, directSecond])
     expect([convertedFirst, directSecond].sort((left, right) => compareRouteCandidates(left, right, 'platform'))).toEqual([directSecond, convertedFirst])
+  })
+
+  it('treats an explicit private relay model mapping as substitution authorization', () => {
+    expect(modelMappingAllowsRouting('substitution', 'user_relay')).toBe(true)
+    expect(modelMappingAllowsRouting('substitution', 'platform')).toBe(false)
+    expect(modelMappingAllowsRouting('substitution', 'platform', true)).toBe(true)
+    expect(modelMappingAllowsRouting('identity', 'platform')).toBe(true)
   })
 
   it('produces valid Anthropic SSE across arbitrary input chunks', async () => {

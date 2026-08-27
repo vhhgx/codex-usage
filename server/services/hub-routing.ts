@@ -61,6 +61,13 @@ export function compareRouteCandidates(left: CandidateOrderValue, right: Candida
     : conversion || priority || left.channel.name.localeCompare(right.channel.name)
 }
 
+export function modelMappingAllowsRouting(mappingKind: string, supplySource: RouteCandidate['supplySource'], substitutionLane = false) {
+  if (mappingKind !== 'substitution') return true
+  // A substitution saved on a private relay is an explicit user instruction.
+  // Platform substitutions still require a model-routing policy lane.
+  return supplySource === 'user_relay' || substitutionLane
+}
+
 export function keyRouteSources(mode: 'platform_only' | 'private_only' | 'platform_then_private' | 'private_then_platform') {
   if (mode === 'private_only') return ['private_pool', 'user_relay'] as const
   if (mode === 'platform_then_private') return ['platform', 'private_pool', 'user_relay'] as const
@@ -204,7 +211,7 @@ export async function routeCandidates(
           ? row.channel.ownerKind === 'user' && row.channel.ownerUserId === options.userId
           : row.channel.ownerKind === 'platform' && row.channel.type === 'sub2api'
       return channelCanRoute(row.channel)
-        && (options.substitution === true || row.model.mappingKind !== 'substitution')
+        && modelMappingAllowsRouting(row.model.mappingKind, supplySource, options.substitution === true)
         && (supplySource !== 'user_relay' || row.protocolBinding.verificationStatus !== 'failed')
         && (supplySource !== 'user_relay' || row.accountState?.routingState === undefined || row.accountState.routingState === 'active')
         && (supplySource !== 'user_relay' || row.relayGroup?.enabled !== false)
