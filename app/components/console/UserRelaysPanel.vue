@@ -67,8 +67,9 @@ const mergeTargetId = ref('')
 const groupFor = (item: ChannelView) => data.value?.groups.find(group => group.id === item.userRelayGroupId) || null
 
 watch(() => form.platformType, (platform) => {
-  if (editing.value) return
-  for (const protocol of form.protocols) protocol.authScheme = platform === 'generic' && protocol.protocol === 'anthropic_messages' ? 'x_api_key' : 'bearer'
+  if (!editing.value) {
+    for (const protocol of form.protocols) protocol.authScheme = platform === 'generic' && protocol.protocol === 'anthropic_messages' ? 'x_api_key' : 'bearer'
+  }
   if (platform !== 'newapi') form.checkinEnabled = false
 })
 
@@ -125,6 +126,10 @@ function setAuthScheme(protocol: ChannelProtocol, value: unknown) {
 function setProbeModel(protocol: ChannelProtocol, event: Event) {
   const item = selectedProtocol(protocol)
   if (item) item.probeModel = (event.target as HTMLInputElement).value
+}
+function setProtocolBaseUrl(protocol: ChannelProtocol, event: Event) {
+  const item = selectedProtocol(protocol)
+  if (item) item.baseUrlOverride = (event.target as HTMLInputElement).value || null
 }
 function probeModelsFor(protocol: ChannelProtocol) {
   return [...new Set([
@@ -199,12 +204,27 @@ async function save() {
   if (!form.protocols.length) { error.value = '请至少选择一种协议'; return }
   if (form.protocols.some(protocol => !protocol.probeModel?.trim())) { error.value = '请为每个协议指定检测模型'; return }
   busy.value = true; error.value = ''
+  let groupSaved = false
   try {
+    if (editing.value?.userRelayGroupId) {
+      const group = groupFor(editing.value)
+      const groupChanged = !group
+        || form.groupName !== group.name
+        || form.homepageUrl !== (group.homepageUrl || '')
+        || form.platformType !== group.platformType
+      if (groupChanged) {
+        await $fetch(`/api/console/relay-groups/${editing.value.userRelayGroupId}`, {
+          method: 'PATCH',
+          body: { name: form.groupName, homepageUrl: form.homepageUrl, platformType: form.platformType }
+        })
+        groupSaved = true
+      }
+    }
     const saved = editing.value
       ? await $fetch<ChannelView>(`/api/console/relays/${editing.value.id}`, { method: 'PATCH', body: body() })
       : await $fetch<ChannelView>('/api/console/relays', { method: 'POST', body: body() })
     showForm.value = false; await refresh(); announceRelayChange(); toast.show(editing.value ? '中转已更新' : `中转已添加，已获取 ${saved.models.filter(model => model.enabled).length} 个模型`, 'success')
-  } catch (value) { const failure = value as { data?: { message?: string }; message?: string }; error.value = failure.data?.message || failure.message || '保存失败' }
+  } catch (value) { const failure = value as { data?: { message?: string }; message?: string }; const message = failure.data?.message || failure.message || '保存失败'; error.value = groupSaved ? `站点资料已保存，但账号配置保存失败：${message}` : message }
   finally { busy.value = false }
 }
 async function test(item: ChannelView) {
@@ -501,18 +521,19 @@ function groupBalanceSummary(group: UserRelayGroupView) {
 
     <AppDrawer :open="showForm" kicker="PRIVATE RELAY" :title="editing ? '编辑中转' : '添加中转'" @close="showForm = false"><form class="admin-form" @submit.prevent="save">
       <label v-if="!editing"><span>预设服务商</span><AppSelect v-model="selectedPresetId" @update:model-value="applyPreset"><option value="">自定义</option><optgroup label="官方服务"><option v-for="preset in relayProviderPresets.filter(item => item.category === 'official')" :key="preset.id" :value="preset.id">{{ preset.name }}</option></optgroup><optgroup label="国内官方"><option v-for="preset in relayProviderPresets.filter(item => item.category === 'cn_official')" :key="preset.id" :value="preset.id">{{ preset.name }}</option></optgroup><optgroup label="第三方与聚合"><option v-for="preset in relayProviderPresets.filter(item => item.category === 'third_party' || item.category === 'aggregator')" :key="preset.id" :value="preset.id">{{ preset.name }}</option></optgroup></AppSelect><small>选择后自动填写站点、地址和协议，API Key 不会被覆盖</small></label>
-      <div v-if="!editing" class="form-grid"><label><span>站点名称 *</span><input v-model="form.groupName" :disabled="Boolean(form.groupId)" required placeholder="例如：AgentRouter"></label><label><span>平台 *</span><AppSelect v-model="form.platformType" :disabled="Boolean(form.groupId)"><option value="generic">通用兼容站</option><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option></AppSelect></label></div>
+      <div class="form-grid"><label><span>站点名称 *</span><input v-model="form.groupName" :disabled="Boolean(addingToGroup)" required placeholder="例如：AgentRouter"></label><label><span>平台 *</span><AppSelect v-model="form.platformType" :disabled="Boolean(addingToGroup)"><option value="generic">通用兼容站</option><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option></AppSelect></label></div>
+      <label><span>站点官网</span><input v-model="form.homepageUrl" type="url" :disabled="Boolean(addingToGroup)" placeholder="https://relay.example.com"><small v-if="addingToGroup">该资料由所属站点统一管理</small></label>
       <div class="form-grid"><label><span>账号名称 *</span><input v-model="form.name" required placeholder="例如：主账号"></label><label><span>账号标签</span><input v-model="form.accountLabel" placeholder="用于账号 Tab 和日志"></label></div>
       <label><span>Base URL *</span><input v-model="form.baseUrl" type="url" required placeholder="https://relay.example.com 或 http://relay.example.com"></label>
       <label v-if="form.baseUrl.startsWith('http://')" class="relay-http-warning"><input v-model="form.insecureHttpAcknowledged" type="checkbox"><span>我确认该站点使用明文 HTTP，API Key、请求和响应可能被读取或篡改。</span></label>
-      <label><span>上游 API Key *</span><span class="relay-key-input"><span class="relay-secret-input"><input v-model="form.apiKey" :type="showApiKey ? 'text' : 'password'" required autocomplete="off"><button class="icon-button" type="button" :title="showApiKey ? '隐藏 API Key' : '显示 API Key'" @click="showApiKey = !showApiKey"><IconEyeOff v-if="showApiKey" :size="16" /><IconEye v-else :size="16" /></button></span><button type="button" class="button button--secondary button--small" :disabled="discovering || !form.baseUrl || !form.apiKey" @click="discoverModels"><IconCloudDownload :size="15" />{{ discovering ? '获取中' : '获取模型' }}</button></span></label>
-      <section v-if="form.platformType === 'newapi'" class="form-section relay-checkin"><header><div><h3>NewAPI 控制台</h3><span>余额与签到</span></div><label class="switch"><input v-model="form.checkinEnabled" type="checkbox"><span />启用签到</label></header><div class="form-grid"><label><span>控制台访问令牌 *</span><span class="relay-secret-input"><input v-model="form.checkinToken" :type="showCheckinToken ? 'text' : 'password'" required autocomplete="off" placeholder="NewAPI access token"><button class="icon-button" type="button" :title="showCheckinToken ? '隐藏令牌' : '显示令牌'" @click="showCheckinToken = !showCheckinToken"><IconEyeOff v-if="showCheckinToken" :size="16" /><IconEye v-else :size="16" /></button></span></label><label><span>用户 ID（可选）</span><input v-model="form.checkinUserId" autocomplete="off" placeholder="用于 New-Api-User"></label></div></section>
-      <section class="form-section"><header><div><h3>上游协议</h3><span>每个端点使用独立检测模型，认证失败时自动补测另一种认证</span></div></header><datalist v-for="option in protocolOptions" :id="`relay-probe-models-${option.id}`" :key="`models-${option.id}`"><option v-for="model in probeModelsFor(option.id)" :key="model" :value="model" /></datalist><div class="protocol-picker"><div v-for="option in protocolOptions" :key="option.id" class="protocol-option" :class="{ active: selectedProtocol(option.id) }"><button type="button" @click="toggleProtocol(option.id)"><IconCheck :size="15" /><span><strong>{{ option.label }}</strong><small>{{ option.detail }}</small></span></button><div v-if="selectedProtocol(option.id)" class="protocol-option__settings"><label><span>默认认证</span><AppSelect :model-value="selectedProtocol(option.id)?.authScheme" @update:model-value="setAuthScheme(option.id, $event)"><option value="bearer">Bearer</option><option value="x_api_key">x-api-key</option></AppSelect></label><label><span>检测模型 *</span><input :value="selectedProtocol(option.id)?.probeModel || ''" :list="`relay-probe-models-${option.id}`" required placeholder="从目录选择或手工输入" @input="setProbeModel(option.id, $event)"></label></div></div></div></section>
+      <label><span>上游 API Key *</span><span class="relay-key-input"><span class="relay-secret-input"><input v-model="form.apiKey" :type="showApiKey ? 'text' : 'password'" :disabled="credentialsLoading" :placeholder="credentialsLoading ? '正在读取凭据…' : ''" required autocomplete="off"><button class="icon-button" type="button" :title="showApiKey ? '隐藏 API Key' : '显示 API Key'" :disabled="credentialsLoading" @click="showApiKey = !showApiKey"><IconEyeOff v-if="showApiKey" :size="16" /><IconEye v-else :size="16" /></button></span><button type="button" class="button button--secondary button--small" :disabled="credentialsLoading || discovering || !form.baseUrl || !form.apiKey" @click="discoverModels"><IconCloudDownload :size="15" />{{ discovering ? '获取中' : '获取模型' }}</button></span></label>
+      <section v-if="form.platformType === 'newapi'" class="form-section relay-checkin"><header><div><h3>NewAPI 控制台</h3><span>余额与签到</span></div><label class="switch"><input v-model="form.checkinEnabled" type="checkbox"><span />启用签到</label></header><div class="form-grid"><label><span>控制台访问令牌 *</span><span class="relay-secret-input"><input v-model="form.checkinToken" :type="showCheckinToken ? 'text' : 'password'" :disabled="credentialsLoading" :placeholder="credentialsLoading ? '正在读取凭据…' : 'NewAPI access token'" required autocomplete="off"><button class="icon-button" type="button" :title="showCheckinToken ? '隐藏令牌' : '显示令牌'" :disabled="credentialsLoading" @click="showCheckinToken = !showCheckinToken"><IconEyeOff v-if="showCheckinToken" :size="16" /><IconEye v-else :size="16" /></button></span></label><label><span>用户 ID（可选）</span><input v-model="form.checkinUserId" :disabled="credentialsLoading" autocomplete="off" placeholder="用于 New-Api-User"></label></div></section>
+      <section class="form-section"><header><div><h3>上游协议</h3><span>每个端点使用独立检测模型，认证失败时自动补测另一种认证</span></div></header><datalist v-for="option in protocolOptions" :id="`relay-probe-models-${option.id}`" :key="`models-${option.id}`"><option v-for="model in probeModelsFor(option.id)" :key="model" :value="model" /></datalist><div class="protocol-picker"><div v-for="option in protocolOptions" :key="option.id" class="protocol-option" :class="{ active: selectedProtocol(option.id) }"><button type="button" @click="toggleProtocol(option.id)"><IconCheck :size="15" /><span><strong>{{ option.label }}</strong><small>{{ option.detail }}</small></span></button><div v-if="selectedProtocol(option.id)" class="protocol-option__settings"><label><span>协议 Base URL</span><input :value="selectedProtocol(option.id)?.baseUrlOverride || ''" type="url" placeholder="留空使用主 Base URL" @input="setProtocolBaseUrl(option.id, $event)"></label><label><span>默认认证</span><AppSelect :model-value="selectedProtocol(option.id)?.authScheme" @update:model-value="setAuthScheme(option.id, $event)"><option value="bearer">Bearer</option><option value="x_api_key">x-api-key</option></AppSelect></label><label><span>检测模型 *</span><input :value="selectedProtocol(option.id)?.probeModel || ''" :list="`relay-probe-models-${option.id}`" required placeholder="从目录选择或手工输入" @input="setProbeModel(option.id, $event)"></label></div></div></div></section>
       <section class="form-section relay-compat-settings"><header><div><h3>兼容设置</h3><span>模型只在你点击获取或同步时更新</span></div></header><label class="switch"><input v-model="form.clientIdentityMode" type="checkbox" true-value="passthrough" false-value="standard"><span />透传真实 Claude Code / Codex 客户端身份</label></section>
       <section v-if="discoveredModels.length" class="form-section relay-discovered"><header><div><h3>已获取模型</h3><span>{{ discoveredModels.length }} 个模型将直接启用</span></div><button type="button" class="button button--quiet button--small" @click="discoveredModels = []">清空</button></header><div class="relay-model-badges"><span v-for="model in discoveredModels" :key="model" :title="model">{{ model }}</span></div></section>
       <section class="form-section relay-mappings"><header><button type="button" class="relay-section-toggle" :aria-expanded="mappingsExpanded" @click="mappingsExpanded = !mappingsExpanded"><component :is="mappingsExpanded ? IconChevronUp : IconChevronDown" :size="16" /><span><strong>模型映射</strong><small>仅在需要修改 Hub 对外模型名或协议绑定时配置</small></span></button><button v-if="mappingsExpanded" type="button" class="button button--quiet button--small" @click="addModel"><IconPlus :size="15" />添加映射</button></header><div v-if="mappingsExpanded" class="relay-model-list"><div v-for="(model, index) in form.models" :key="model.id || index" class="relay-model-entry"><div class="relay-model-row"><input v-model="model.publicModel" placeholder="Hub 模型名（留空自动同名）"><span>→</span><input v-model="model.upstreamModel" placeholder="上游模型名"><button type="button" class="icon-button danger" title="移除模型" aria-label="移除模型" @click="removeModel(index)"><IconX :size="15" /></button></div><div class="relay-model-protocols"><button v-for="protocol in form.protocols" :key="protocol.protocol" type="button" :class="{ active: modelProtocolEnabled(model, protocol.protocol) }" @click="toggleModelProtocol(model, protocol.protocol)"><IconCheck :size="12" />{{ protocolLabel(protocol.protocol) }}</button></div></div></div></section>
       <div class="form-grid relay-settings-grid"><label><span>权重</span><input v-model.number="form.weight" type="number" min="1"></label><label><span>最大并发</span><input v-model.number="form.maxConcurrency" type="number" min="1"></label><label><span>超时（毫秒）</span><input v-model.number="form.timeoutMs" type="number" min="1000"></label></div>
-      <p v-if="error" class="form-error">{{ error }}</p><footer><label class="switch"><input v-model="form.enabled" type="checkbox"><span />启用中转</label><div><button type="button" class="button button--secondary" @click="showForm = false">取消</button><button class="button button--primary" :disabled="busy">{{ busy ? '保存中' : '保存中转' }}</button></div></footer>
+      <p v-if="error" class="form-error">{{ error }}</p><footer><label class="switch"><input v-model="form.enabled" type="checkbox"><span />启用中转</label><div><button type="button" class="button button--secondary" @click="showForm = false">取消</button><button class="button button--primary" :disabled="busy || credentialsLoading">{{ credentialsLoading ? '读取凭据中' : busy ? '保存中' : '保存中转' }}</button></div></footer>
     </form></AppDrawer>
 
     <AppDrawer v-if="editingGroup" :open="Boolean(editingGroup)" kicker="RELAY GROUP" :title="`设置 ${editingGroup.name}`" @close="editingGroup = null"><form class="admin-form" @submit.prevent="saveGroup">
