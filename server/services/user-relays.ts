@@ -19,7 +19,6 @@ import { channelCircuitState } from './hub-routing'
 import { getActiveSubscription } from './customer-management'
 import { getUserFailoverSourceIds, PACKAGE_SOURCE_ID, PRIVATE_POOL_SOURCE_ID, relayGroupSourceId } from './user-route-preferences'
 import { classifyRelayFailure, parseNewApiBalance, parseSub2ApiBalance, relayPlatform, relayPlatformDefinition, type RelayFailureClass } from './relay-platform'
-import { probeUpstreamConnectivity } from './upstream-connectivity'
 
 type Input = Record<string, unknown>
 const MAX_USER_RELAY_MODELS = 500
@@ -707,7 +706,107 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
 
 export async function testUserRelayConnectivity(event: H3Event, ownerUserId: string, id: string) {
   const relay = await ownedRelay(event, ownerUserId, id)
-  return probeUpstreamConnectivity(relay.baseUrl)
+  const db = useDatabase(event)
+  const configured = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, id))
+  const preferred = preferredModelDiscoveryProtocol(configured)
+  const apiKey = decryptChannelSecret(relay.encryptedApiKey, relay.id, 'user', event)
+  const authScheme = preferred?.authScheme || 'bearer'
+  const apiVersion = preferred?.apiVersion || null
+  const identityProtocol = preferred?.protocol || 'openai_responses'
+  const started = Date.now()
+  let endpoint = relay.baseUrl
+  let clientIdentityProbed = false
+  let lastStatus: number | null = null
+  let lastBody = ''
+  async function saveConnectivityHealth(success: boolean, message: string) {
+    await db.update(channels).set({
+      healthStatus: success ? 'healthy' : 'unhealthy',
+      lastHealthCheckAt: new Date(),
+      lastHealthError: success ? null : message.slice(0, 2000),
+      updatedAt: new Date()
+    }).where(eq(channels.id, id))
+  }
+  try {
+    const probe = await probeAuthSchemes(authScheme, async (scheme) => {
+      const request = async (withIdentity: boolean) => {
+        const result = await pinnedUpstreamFetch(relay.baseUrl, '/v1/models', {
+          method: 'GET',
+          headers: { accept: 'application/json', ...upstreamAuthHeaders(scheme, apiKey, apiVersion), ...(withIdentity ? upstreamProbeClientIdentity(identityProtocol) : {}) },
+          signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 15000))
+        })
+        endpoint = result.target
+        const body = await result.response.text()
+        const response = { ok: result.response.ok, status: result.response.status, body }
+        await result.close().catch(() => {})
+        return response
+      }
+      let response = await request(false)
+      if (!response.ok && isClientIdentityRejection(response.body)) {
+        clientIdentityProbed = true
+        response = await request(true)
+      }
+      lastStatus = response.status
+      lastBody = response.body
+      return response
+    })
+    const final = probe.attempts.at(-1)
+    const latencyMs = Date.now() - started
+    if (probe.ok && final) {
+      let ids: string[] = []
+      try { ids = modelIdsFromPayload(JSON.parse(final.body)) } catch {}
+      if (ids.length) {
+        await persistDiscoveredModels(event, id, ids)
+        await invalidateChannelAccess(event, [id])
+        await saveConnectivityHealth(true, '')
+        return {
+          status: latencyMs <= 6000 ? 'operational' : 'degraded',
+          success: true,
+          message: '模型目录可访问',
+          endpoint,
+          responseTimeMs: latencyMs,
+          httpStatus: final.status,
+          retryCount: Math.max(0, probe.attempts.length - 1),
+          errorCode: null,
+          modelCount: ids.length,
+          attemptedAuthSchemes: probe.attempts.map(attempt => attempt.authScheme),
+          clientIdentityProbed
+        }
+      }
+      lastStatus = final.status
+      lastBody = '/v1/models 未返回可识别模型'
+    }
+    const detail = lastBody ? redactSensitiveText(lastBody).slice(0, 500) : '上游未返回响应'
+    await saveConnectivityHealth(false, detail)
+    return {
+      status: 'failed',
+      success: false,
+      message: `${lastStatus ? `HTTP ${lastStatus}: ` : ''}${detail}`,
+      endpoint,
+      responseTimeMs: latencyMs,
+      httpStatus: lastStatus,
+      retryCount: Math.max(0, probe.attempts.length - 1),
+      errorCode: lastStatus ? `HTTP_${lastStatus}` : 'UPSTREAM_ERROR',
+      modelCount: 0,
+      attemptedAuthSchemes: probe.attempts.map(attempt => attempt.authScheme),
+      clientIdentityProbed
+    }
+  } catch (error) {
+    const detail = upstreamNetworkError(error)
+    await saveConnectivityHealth(false, detail.message)
+    return {
+      status: 'failed',
+      success: false,
+      message: detail.message,
+      endpoint,
+      responseTimeMs: Date.now() - started,
+      httpStatus: lastStatus,
+      retryCount: 0,
+      errorCode: detail.code,
+      modelCount: 0,
+      attemptedAuthSchemes: [],
+      clientIdentityProbed
+    }
+  }
 }
 
 export async function testUserRelayModel(event: H3Event, ownerUserId: string, id: string, model: unknown) {

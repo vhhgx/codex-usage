@@ -6,17 +6,23 @@
   --surface: var(--hub-solid-surface);
   --surface-2: var(--hub-solid-surface-hover);
   --surface-3: var(--hub-glass-strong);
+  --surface-soft: var(--hub-solid-surface-hover);
   --text: var(--hub-text);
   --text-soft: var(--hub-text-muted);
+  --text-muted: var(--hub-text-muted);
   --text-faint: var(--hub-text-faint);
   --line: var(--hub-line);
   --line-strong: var(--hub-line-strong);
+  --line-subtle: var(--hub-line-row);
   --accent: var(--hub-accent);
   --accent-hover: var(--hub-accent-hover);
   --accent-soft: var(--hub-accent-soft);
+  --accent-text: var(--hub-accent-text);
+  --accent-line: var(--hub-accent-line);
   --danger: var(--hub-danger);
   --warning: var(--hub-warning);
   --healthy: var(--hub-success);
+  --success: var(--hub-success);
   --shadow: var(--hub-panel-shadow);
   --card-radius: var(--hub-radius-panel);
   --control-radius: var(--hub-radius-lg);
@@ -124,7 +130,7 @@ body.workspace-drawer-open { overflow: hidden; }
   flex: 0 0 auto;
   color: var(--hub-accent-bright);
   background: var(--hub-accent-soft);
-  box-shadow: var(--hub-panel-highlight), 0 8px 22px rgb(71 55 130 / 12%);
+  box-shadow: var(--hub-panel-highlight), var(--hub-panel-shadow);
 }
 
 .workspace-brand > span:last-child,
@@ -330,7 +336,7 @@ body.workspace-drawer-open { overflow: hidden; }
 .button--quiet:hover:not(:disabled) { border-color: var(--hub-accent-line); background: var(--hub-accent-soft); }
 .button--quiet { min-height: var(--hub-control-height-compact); color: var(--hub-button-quiet-fg); border-color: var(--hub-line); background: var(--hub-button-quiet-bg); }
 .button--danger { color: var(--hub-button-danger-fg); border-color: var(--hub-button-danger-bg); background: var(--hub-button-danger-bg); }
-.button--danger:hover:not(:disabled) { border-color: color-mix(in srgb, var(--hub-danger) 85%, black); background: color-mix(in srgb, var(--hub-danger) 85%, black); }
+.button--danger:hover:not(:disabled) { border-color: color-mix(in srgb, var(--hub-danger) 85%, var(--hub-solid-surface-strong)); background: color-mix(in srgb, var(--hub-danger) 85%, var(--hub-solid-surface-strong)); }
 .button--small { min-height: var(--hub-control-height-compact); padding-inline: var(--hub-space-3); font-size: var(--hub-text-xs); }
 
 .icon-button {
@@ -453,7 +459,7 @@ body.workspace-drawer-open { overflow: hidden; }
 .admin-page-tabs--embedded { margin: 0; border: 1px solid var(--hub-line); border-radius: var(--hub-radius-lg); gap: 2px; padding: 3px; background: var(--hub-input-bg); }
 .admin-page-tabs--embedded button { min-height: 30px; padding-inline: var(--hub-space-3); border: 0; border-radius: var(--hub-radius-md); }
 .admin-page-tabs--embedded button.active,
-.admin-page-tabs--embedded button[aria-selected='true'] { color: var(--hub-text); background: var(--hub-glass-strong); box-shadow: var(--hub-panel-highlight), 0 2px 8px rgb(71 60 111 / 6%); }
+.admin-page-tabs--embedded button[aria-selected='true'] { color: var(--hub-text); background: var(--hub-glass-strong); box-shadow: var(--hub-panel-highlight), var(--hub-panel-shadow); }
 
 .admin-panel,
 .glass-panel,
@@ -684,7 +690,7 @@ body.workspace-drawer-open { overflow: hidden; }
 .oauth-link-section > input,
 .oauth-callback-field textarea,
 .credential-editor textarea,
-.audit-drawer pre { color: #e7e5ef; border-color: #393746; background: #181820; }
+.audit-drawer pre { color: var(--hub-code-text); border-color: var(--hub-code-border); background: var(--hub-code-bg); }
 
 .key-activity-table td { border-color: var(--hub-line-row); background: var(--hub-solid-surface); }
 .key-activity-table th.current { color: var(--hub-accent-text); background: var(--hub-accent-soft); }
@@ -767,7 +773,7 @@ body.workspace-drawer-open { overflow: hidden; }
 .guide-code > header { border-color: var(--hub-code-border); }
 .guide-code > header > span { color: var(--hub-code-muted); }
 .guide-code button { color: var(--hub-code-text); border-color: var(--hub-code-border); background: var(--hub-code-surface); }
-.guide-code button:hover { background: color-mix(in srgb, var(--hub-code-surface) 82%, white); }
+.guide-code button:hover { background: color-mix(in srgb, var(--hub-code-surface) 82%, var(--hub-code-text)); }
 
 .admin-login { position: relative; min-height: 100dvh; color: var(--hub-text); background: var(--hub-bg); }
 .admin-login__intro { border-color: var(--hub-line); color: var(--hub-text); background: var(--hub-sidebar); backdrop-filter: var(--hub-blur-sidebar); }

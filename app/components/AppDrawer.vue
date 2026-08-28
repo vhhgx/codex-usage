@@ -39,8 +39,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 </template>
 
 <style>
-.app-drawer-backdrop { position:fixed; inset:0; z-index:var(--hub-z-modal); display:grid; place-items:stretch end; background:var(--hub-overlay-scrim, rgb(15 19 16 / 56%)); backdrop-filter:var(--hub-blur-overlay, blur(3px)); }
-.app-drawer { width:min(720px, 100vw); height:100dvh; display:grid; grid-template-rows:auto minmax(0, 1fr); overflow:hidden; color:var(--hub-text); background:var(--hub-solid-surface-strong); border-left:1px solid var(--hub-line-strong); box-shadow:-24px 0 72px rgb(0 0 0 / 24%); animation:app-drawer-in 180ms ease-out both; }
+.app-drawer-backdrop { position:fixed; inset:0; z-index:var(--hub-z-modal); display:grid; place-items:stretch end; background:var(--hub-overlay-scrim); backdrop-filter:var(--hub-blur-overlay, blur(3px)); }
+.app-drawer { width:min(720px, 100vw); height:100dvh; display:grid; grid-template-rows:auto minmax(0, 1fr); overflow:hidden; color:var(--hub-text); background:var(--hub-solid-surface-strong); border-left:1px solid var(--hub-line-strong); box-shadow:var(--hub-panel-shadow); animation:app-drawer-in 180ms ease-out both; }
 .app-drawer--wide { width:min(960px, 100vw); }
 .app-drawer__header { min-height:72px; padding:0 1.25rem; display:flex; align-items:center; justify-content:space-between; gap:1rem; border-bottom:1px solid var(--hub-line); background:color-mix(in srgb, var(--hub-solid-surface-strong) 88%, transparent); backdrop-filter:var(--hub-blur-panel); }
 .app-drawer__header > div { min-width:0; display:grid; gap:.25rem; }

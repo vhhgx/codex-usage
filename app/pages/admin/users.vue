@@ -558,14 +558,14 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleEscape))
 }
 
 .users-layer-backdrop { padding: 0; place-items: stretch end; }
-.users-detail-drawer { width: min(46rem, 58vw); height: 100dvh; overflow-y: auto; border-left: 1px solid var(--hub-line-strong); background: linear-gradient(180deg, color-mix(in srgb, var(--hub-solid-surface-strong) 94%, var(--hub-accent-soft)), var(--hub-solid-surface-strong)); box-shadow: -28px 0 80px rgb(0 0 0 / 28%); }
+.users-detail-drawer { width: min(46rem, 58vw); height: 100dvh; overflow-y: auto; border-left: 1px solid var(--hub-line-strong); background: linear-gradient(180deg, color-mix(in srgb, var(--hub-solid-surface-strong) 94%, var(--hub-accent-soft)), var(--hub-solid-surface-strong)); box-shadow: var(--hub-panel-shadow); }
 .users-drawer-header { position: sticky; top: 0; z-index: var(--hub-z-local-sticky); min-height: 5.4rem; padding: 0 1.4rem; border-bottom: 1px solid var(--hub-line); display: flex; align-items: center; justify-content: space-between; gap: 1rem; background: color-mix(in srgb, var(--hub-solid-surface-strong) 82%, transparent); backdrop-filter: var(--hub-blur-panel); }
 .users-layer-kicker { display: block; margin-bottom: .3rem; color: var(--hub-accent-text); font-family: var(--hub-font-mono); font-size: .66rem; font-weight: var(--hub-weight-medium); }
 .users-drawer-title { display: flex; align-items: baseline; gap: .65rem; }
 .users-drawer-title strong { color: var(--hub-text); font-size: .98rem; font-weight: var(--hub-weight-semibold); }
 .users-drawer-title code { color: var(--hub-text-faint); font-family: var(--hub-font-mono); font-size: .7rem; }
 .users-drawer-identity { min-height: 9rem; padding: 1.35rem 1.4rem 1.45rem; border-bottom: 1px solid var(--hub-line); display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 0 1rem; background: linear-gradient(110deg, var(--hub-accent-soft), transparent 54%); }
-.users-profile-avatar { width: 3.25rem; height: 3.25rem; display: grid; place-items: center; grid-row: 1 / span 2; border: 1px solid var(--hub-accent-line); border-radius: 8px; color: var(--hub-accent-text); background: var(--hub-accent-soft); box-shadow: var(--hub-panel-highlight), 0 14px 32px rgb(62 41 108 / 12%); }
+.users-profile-avatar { width: 3.25rem; height: 3.25rem; display: grid; place-items: center; grid-row: 1 / span 2; border: 1px solid var(--hub-accent-line); border-radius: 8px; color: var(--hub-accent-text); background: var(--hub-accent-soft); box-shadow: var(--hub-panel-highlight), var(--hub-panel-shadow); }
 .users-drawer-identity-copy { min-width: 0; }
 .users-drawer-identity h2 { margin: 0; color: var(--hub-text); font-size: 1.35rem; font-weight: var(--hub-weight-semibold); }
 .users-identity-badges { display: flex; align-items: center; gap: .65rem; margin-top: .45rem; }
@@ -665,7 +665,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleEscape))
 .users-access-note svg { flex: 0 0 auto; color: var(--hub-accent-text); }
 .users-access-note p { margin: 0; font-size: .62rem; line-height: 1.5; }
 .users-form-message { margin: .85rem 1.4rem 0; padding: .7rem .8rem; border: 1px solid var(--hub-danger-line); border-radius: 6px; color: var(--hub-danger); background: var(--hub-danger-soft); font-size: .72rem; }
-.users-modal-footer { z-index: var(--hub-z-local-raised); margin-top: 1rem; padding: .9rem 1.4rem; border-top: 1px solid var(--hub-line); display: flex; justify-content: flex-end; gap: .6rem; background: color-mix(in srgb, var(--hub-solid-surface) 84%, transparent); box-shadow: 0 -12px 30px rgb(5 5 9 / 12%); backdrop-filter: var(--hub-blur-panel); }
+.users-modal-footer { z-index: var(--hub-z-local-raised); margin-top: 1rem; padding: .9rem 1.4rem; border-top: 1px solid var(--hub-line); display: flex; justify-content: flex-end; gap: .6rem; background: color-mix(in srgb, var(--hub-solid-surface) 84%, transparent); box-shadow: var(--hub-panel-shadow); backdrop-filter: var(--hub-blur-panel); }
 
 @media (max-width: 1180px) {
   .users-toolbar { grid-template-columns: minmax(16rem, 1fr) repeat(2, minmax(8.5rem, .55fr)) auto; }

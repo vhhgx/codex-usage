@@ -189,7 +189,7 @@ onBeforeUnmount(() => {
 .relay-order__body strong { min-width:0; font-size:.78rem; }
 .relay-order__body > span { display:flex; align-items:center; gap:.35rem; color:var(--hub-text-muted); font-size:.68rem; }
 .relay-order__body > span i { width:6px; height:6px; border-radius:50%; background:var(--hub-text-faint); }
-[data-tone="active"] .relay-order__body > span i { background:#1a8b62; }
+[data-tone="active"] .relay-order__body > span i { background:var(--hub-success); }
 .relay-order__actions { grid-column:2; display:flex; align-items:center; justify-content:flex-end; gap:.2rem; }
 .relay-order__actions .icon-button { width:28px; height:28px; }
 .relay-order__grip { color:var(--hub-text-faint); cursor:grab; touch-action:none; }

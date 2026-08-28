@@ -2086,7 +2086,7 @@ onBeforeUnmount(() => { totpTimers.forEach(timer => window.clearTimeout(timer)) 
 .compact-switch { position: relative; min-width: 105px; margin-top: 6px; display: grid; grid-template-columns: 30px auto; align-items: center; gap: 6px; cursor: pointer; }
 .compact-switch input { position: absolute; left: 0; top: 0; width: 1px; height: 1px; margin: 0; opacity: 0; pointer-events: none; }
 .compact-switch > span { width: 30px; height: 17px; padding: 2px; border: 1px solid var(--hub-line-strong); border-radius: 10px; background: var(--hub-skeleton-strong); }
-.compact-switch > span::after { content: ''; display: block; width: 11px; height: 11px; border-radius: 50%; background: var(--hub-solid-surface); box-shadow: 0 1px 2px rgb(0 0 0 / 20%); }
+.compact-switch > span::after { content: ''; display: block; width: 11px; height: 11px; border-radius: 50%; background: var(--hub-solid-surface); box-shadow: var(--hub-panel-shadow); }
 .compact-switch input:checked + span { border-color: var(--hub-accent); background: var(--hub-accent); }
 .compact-switch input:checked + span::after { transform: translateX(13px); }
 .compact-switch em { color: var(--hub-text-muted); font-size: 11px; font-style: normal; font-weight: 700; white-space: nowrap; }
@@ -2347,11 +2347,11 @@ onBeforeUnmount(() => { totpTimers.forEach(timer => window.clearTimeout(timer)) 
   padding: .9rem 1.4rem;
   border-top: 1px solid var(--hub-line);
   background: color-mix(in srgb, var(--hub-solid-surface) 90%, transparent);
-  box-shadow: 0 -12px 30px rgb(5 5 9 / 12%);
+  box-shadow: var(--hub-panel-shadow);
   backdrop-filter: var(--hub-blur-panel);
 }
 .account-vault-layer > .admin-modal > .admin-form > footer > span,
-.account-vault-layer .button--primary { color: var(--hub-accent-text); border-color: var(--hub-accent-line); background: linear-gradient(180deg, color-mix(in srgb, var(--hub-accent) 24%, transparent), color-mix(in srgb, var(--hub-accent) 14%, transparent)); box-shadow: var(--hub-panel-highlight), 0 10px 28px rgb(77 50 142 / 12%); }
+.account-vault-layer .button--primary { color: var(--hub-accent-text); border-color: var(--hub-accent-line); background: linear-gradient(180deg, color-mix(in srgb, var(--hub-accent) 24%, transparent), color-mix(in srgb, var(--hub-accent) 14%, transparent)); box-shadow: var(--hub-panel-highlight), var(--hub-panel-shadow); }
 .account-vault-layer .button--primary:hover:not(:disabled) { color: var(--hub-accent-text); border-color: var(--hub-accent); background: var(--hub-accent-soft); }
 .account-vault-layer .button--secondary { color: var(--hub-button-secondary-fg); border-color: var(--hub-line-strong); background: var(--hub-button-secondary-bg); }
 .account-vault-layer .button--secondary:hover:not(:disabled) { border-color: var(--hub-accent-line); background: var(--hub-accent-soft); }
@@ -2494,7 +2494,7 @@ onBeforeUnmount(() => { totpTimers.forEach(timer => window.clearTimeout(timer)) 
   align-items: center;
   gap: .6rem;
   background: color-mix(in srgb, var(--hub-solid-surface) 84%, transparent);
-  box-shadow: 0 -12px 30px rgb(5 5 9 / 12%);
+  box-shadow: var(--hub-panel-shadow);
   backdrop-filter: var(--hub-blur-panel);
 }
 .account-editor-footer > span { margin-right: auto; color: var(--hub-text-faint); font-family: var(--hub-font-mono); font-size: .64rem; }

@@ -60,7 +60,7 @@ const model = defineModel<string>({ default: '' })
 .app-choice-option:hover:not(.is-disabled) .app-choice-surface { border-color: var(--hub-line-strong); background: var(--hub-glass-hover); }
 .app-choice-option:active:not(.is-disabled) .app-choice-surface { transform: translateY(1px) scale(.99); }
 .app-choice-option > input:focus-visible + .app-choice-surface { outline: 2px solid var(--hub-focus-ring); outline-offset: 2px; }
-.app-choice-option > input:checked + .app-choice-surface { border-color: var(--hub-accent-line); color: var(--hub-text); background: linear-gradient(100deg, var(--hub-accent-soft), color-mix(in srgb, var(--hub-accent-soft) 45%, transparent)); box-shadow: var(--hub-panel-highlight), 0 8px 24px rgb(56 37 102 / 10%); }
+.app-choice-option > input:checked + .app-choice-surface { border-color: var(--hub-accent-line); color: var(--hub-text); background: linear-gradient(100deg, var(--hub-accent-soft), color-mix(in srgb, var(--hub-accent-soft) 45%, transparent)); box-shadow: var(--hub-panel-highlight), var(--hub-panel-shadow); }
 .app-choice-icon { width: 1.8rem; height: 1.8rem; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--hub-line); border-radius: 5px; color: var(--hub-text-faint); background: var(--hub-glass-strong); transition: color var(--hub-duration-base) ease, border-color var(--hub-duration-base) ease, background-color var(--hub-duration-base) ease; }
 .app-choice-option > input:checked + .app-choice-surface .app-choice-icon { border-color: var(--hub-accent-line); color: var(--hub-accent-bright); background: var(--hub-accent-soft); }
 .app-choice-copy { min-width: 0; flex: 1; }

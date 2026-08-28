@@ -492,7 +492,7 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
 .pool-batch-layout aside > header > code { color:var(--accent); }
 .vault-delivery-preview { display:grid; gap:.35rem; max-height:270px; overflow:auto; }
 .vault-delivery-preview > div { display:flex; justify-content:space-between; gap:.5rem; padding:.45rem; border:1px solid var(--line-subtle); background:var(--surface); }
-.vault-delivery-preview > div[data-valid=false] { color:#b42318; border-color:#f2c5c0; }
+.vault-delivery-preview > div[data-valid=false] { color:var(--hub-danger); border-color:var(--hub-danger-line); }
 .vault-delivery-preview code { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .vault-delivery-preview span { flex:none; font-size:.65rem; }
 .account-editor-empty { min-height:150px; display:grid; place-items:center; color:var(--text-muted); font-size:.72rem; }
@@ -510,7 +510,7 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
 .pool-table-wrap td { vertical-align:middle; }
 .pool-table-wrap td > strong,.pool-table-wrap td > code { display:block; }
 .pool-table-wrap td > code { margin-top:.25rem; color:var(--text-muted); font-size:.68rem; }
-.pool-error { max-width:240px; overflow:hidden; color:#b42318 !important; text-overflow:ellipsis; white-space:nowrap; }
+.pool-error { max-width:240px; overflow:hidden; color:var(--hub-danger) !important; text-overflow:ellipsis; white-space:nowrap; }
 .credential-editor { display:grid; gap:.85rem; }
 .credential-editor > header,.oauth-link-section > header { display:flex; align-items:center; justify-content:space-between; gap:1rem; }
 .credential-editor > header > div,.oauth-link-section > header > div:first-child { display:grid; gap:.25rem; }
@@ -533,7 +533,7 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
 .oauth-link-section { display:grid; gap:.6rem; padding:.8rem; border:1px solid var(--line-subtle); background:var(--surface-soft); }
 .oauth-link-section > header > div:last-child { display:flex; gap:.35rem; }
 .oauth-link-section input { min-width:0; width:100%; }
-.form-notice { padding:.65rem .8rem; border:1px solid #b8e3d2; color:#147d5a; background:#effaf5; font-size:.72rem; }
+.form-notice { padding:.65rem .8rem; border:1px solid var(--hub-success-line); color:var(--hub-success); background:var(--hub-success-soft); font-size:.72rem; }
 .pool-empty { min-height:220px; display:grid; place-items:center; align-content:center; gap:.5rem; text-align:center; }
 .pool-empty p { margin:0; color:var(--text-muted); }
 @media (max-width:700px) { .resource-panel-header { flex-direction:column; } .resource-panel-actions { width:100%; justify-content:flex-start; } .resource-panel-actions .button { flex:1; justify-content:center; } .import-account-row > header { grid-template-columns:22px minmax(0,1fr); } .import-account-row > header code { grid-column:2; } .delivery-config-grid,.pool-batch-layout { grid-template-columns:1fr; } .pool-account-importer > footer { flex-wrap:wrap; } .pool-account-importer > footer > span { width:100%; } }

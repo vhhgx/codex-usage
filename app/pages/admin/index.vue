@@ -241,7 +241,7 @@ async function reload() {
 .overview-period-scroller::-webkit-scrollbar { display: none; }
 .overview-period-scroller button { min-height: 2.05rem; padding: 0 .8rem; border: 1px solid transparent; border-radius: var(--hub-radius-sm); color: var(--hub-text-faint); font-size: .76rem; font-weight: var(--hub-weight-medium); }
 .overview-period-scroller button.active,
-.overview-period-scroller button[aria-selected='true'] { border-color: var(--hub-line); color: var(--hub-text); background: var(--hub-glass-strong); box-shadow: var(--hub-panel-highlight), 0 4px 12px rgb(0 0 0 / 14%); }
+.overview-period-scroller button[aria-selected='true'] { border-color: var(--hub-line); color: var(--hub-text); background: var(--hub-glass-strong); box-shadow: var(--hub-panel-highlight), var(--hub-panel-shadow); }
 .overview-page-actions > .overview-export-button { min-height: 2.25rem; padding: 0 .72rem; gap: .4rem; border-color: var(--hub-line); border-radius: var(--hub-radius-lg); color: var(--hub-text-muted); background: var(--hub-input-bg); font-size: var(--hub-text-xs); font-weight: var(--hub-weight-regular); backdrop-filter: var(--hub-blur-control); }
 .overview-page-actions > .overview-export-button--csv { width: 4.3875rem; }
 .overview-page-actions > .overview-export-button--json { width: 4.8875rem; }
