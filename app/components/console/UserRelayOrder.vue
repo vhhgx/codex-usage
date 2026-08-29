@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { IconChevronLeft, IconChevronRight, IconGripVertical, IconPackage, IconServerBolt, IconUserShield } from '@tabler/icons-vue'
 
+const props = withDefaults(defineProps<{ pollingEnabled?: boolean }>(), { pollingEnabled: true })
+
 interface RelayOrderItem {
   id: string
   sourceId: string | null
@@ -17,6 +19,7 @@ const toast = useAppToast()
 const orderedIds = ref<string[]>([])
 const draggingId = ref<string | null>(null)
 const saving = ref(false)
+const hydrated = ref(false)
 let refreshTimer: number | undefined
 let activePointer: { id: string; pointerId: number } | null = null
 let pointerStartOrder: string[] = []
@@ -122,22 +125,60 @@ function move(id: string, offset: number) {
 }
 
 async function refreshStatus() {
-  if (!draggingId.value && !saving.value) await refresh()
+  if (draggingId.value || saving.value) return
+  // Polling is best-effort. A transient 401/network error must not become an
+  // unhandled rejection in the page and should not interrupt a drag operation.
+  try { await refresh() } catch {}
 }
 
-onMounted(() => {
-  window.addEventListener('user-relays-changed', refreshStatus)
+function stopPolling() {
+  if (refreshTimer === undefined) return
+  window.clearInterval(refreshTimer)
+  refreshTimer = undefined
+}
+
+function startPolling() {
+  if (!props.pollingEnabled || document.visibilityState === 'hidden' || refreshTimer !== undefined) return
   refreshTimer = window.setInterval(refreshStatus, 10_000)
+}
+
+function handleVisibilityChange() {
+  if (document.visibilityState === 'hidden') {
+    stopPolling()
+    return
+  }
+  if (props.pollingEnabled) {
+    void refreshStatus()
+    startPolling()
+  }
+}
+
+watch(() => props.pollingEnabled, (enabled) => {
+  if (!import.meta.client) return
+  if (enabled) {
+    void refreshStatus()
+    startPolling()
+  } else {
+    stopPolling()
+  }
+})
+
+onMounted(() => {
+  hydrated.value = true
+  window.addEventListener('user-relays-changed', refreshStatus)
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+  startPolling()
 })
 onBeforeUnmount(() => {
   window.removeEventListener('user-relays-changed', refreshStatus)
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
   removePointerListeners()
-  if (refreshTimer) window.clearInterval(refreshTimer)
+  stopPolling()
 })
 </script>
 
 <template>
-  <section v-if="sources.length" class="relay-order" aria-labelledby="relay-order-title">
+  <section v-if="hydrated && sources.length" class="relay-order" aria-labelledby="relay-order-title">
     <header><div><span class="admin-kicker">FAILOVER ORDER</span><h2 id="relay-order-title" class="text-balance">故障转移顺序</h2></div><small>{{ saving ? '保存中…' : `${sources.length} 个来源` }}</small></header>
     <div class="relay-order__track">
       <article
@@ -179,8 +220,7 @@ onBeforeUnmount(() => {
 .relay-order > header h2 { margin-top:.2rem; font-size:.95rem; }
 .relay-order > header small { color:var(--hub-text-faint); font-size:.68rem; font-variant-numeric:tabular-nums; }
 .relay-order__track { min-width:0; padding:.75rem; display:flex; flex-wrap:nowrap; gap:.6rem; overflow-x:auto; overscroll-behavior-inline:contain; scrollbar-width:thin; }
-.relay-order__item { width:220px; min-height:92px; flex:0 0 220px; display:grid; grid-template-columns:32px minmax(0,1fr); grid-template-rows:1fr auto; gap:.55rem; padding:.7rem; border:1px solid var(--hub-line); border-radius:7px; background:var(--hub-solid-surface-hover); cursor:grab; user-select:none; }
-.relay-order__item:active { cursor:grabbing; }
+.relay-order__item { width:220px; min-height:92px; flex:0 0 220px; display:grid; grid-template-columns:32px minmax(0,1fr); grid-template-rows:1fr auto; gap:.55rem; padding:.7rem; border:1px solid var(--hub-line); border-radius:7px; background:var(--hub-solid-surface-hover); user-select:none; }
 .relay-order__item.is-dragging { opacity:.45; }
 .relay-order__rank { grid-row:1 / -1; display:grid; place-items:start center; padding-top:.15rem; color:var(--hub-accent); font-family:var(--font-mono); font-size:.72rem; font-weight:800; }
 .relay-order__body { min-width:0; display:grid; align-content:start; gap:.35rem; }

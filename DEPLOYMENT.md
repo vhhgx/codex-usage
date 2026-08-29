@@ -1,8 +1,18 @@
 # Zephyr Hub 云服务器部署指南
 
-本文以仓库中的 `deploy/hong-kong/docker-compose.yml` 为生产部署入口。目录名虽然是
-`hong-kong`，但这套 Compose 可以部署在任意 Linux 云服务器。它会在同一个私有 Docker
-网络中运行 Hub、PostgreSQL、Redis、MinIO 和 Nginx，只有 80/443 端口对公网开放。
+本文提供两种生产 Compose 入口，目录名虽然是 `hong-kong`，但两者都可以部署在任意
+Linux 云服务器：
+
+- `deploy/hong-kong/docker-compose.yml`：完整容器方案，由 Docker 内的 Nginx 发布 80/443。
+- `deploy/hong-kong/docker-compose-hongkong.yml`：香港主机方案，Nginx 由宿主机管理，
+  Hub 仅映射到宿主机 `127.0.0.1:8371`（可用 `HUB_BIND_ADDRESS` 覆盖）。
+
+香港服务器默认使用第二个 Host Stack，项目路径固定为 `/root/apps/zephry-hub`。Host
+Stack 的每条 Compose 命令都必须显式指定
+`--env-file /root/apps/zephry-hub/deploy/hong-kong/.env` 和
+`-f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml`；不要依赖 Compose
+自动选择文件。完整容器方案仍可用于其他服务器，其命令应显式选择
+`deploy/hong-kong/docker-compose.yml`。两套入口不能同时启动，否则会争用 80/443。
 
 ## 1. 部署结构
 
@@ -17,10 +27,11 @@
 ```
 
 生产环境不要直接使用根目录的 `docker-compose.hub.yml`。该文件只为本地开发启动
-PostgreSQL、Redis 和 MinIO，不包含 Hub 应用和 Nginx。生产环境使用：
+PostgreSQL、Redis 和 MinIO，不包含 Hub 应用和 Nginx。生产环境在上述两个文件中选择一个，
+不要把 `docker-compose-hongkong.yml` 当作 Compose 的默认文件名（Docker 不会自动读取它）。
 
 ```text
-deploy/hong-kong/docker-compose.yml
+deploy/hong-kong/docker-compose-hongkong.yml
 ```
 
 ## 2. 部署前准备
@@ -39,7 +50,7 @@ deploy/hong-kong/docker-compose.yml
 - `80/tcp`：用于 HTTP 跳转和证书签发。
 - `443/tcp`：Hub HTTPS 服务。
 
-不要向公网开放 `3000`、`5432`、`6379`、`9000`、`9001`、CPA 管理端口或 Sub2API
+不要向公网开放 `3000`、`8371`、`5432`、`6379`、`9000`、`9001`、CPA 管理端口或 Sub2API
 管理端口。
 
 安装 Git、Docker 和 Compose 插件：
@@ -63,14 +74,13 @@ docker compose version
 git push --set-upstream origin feature/hub-gateway
 ```
 
-在云服务器创建部署目录并克隆：
+在香港服务器创建部署目录并克隆：
 
 ```bash
-sudo mkdir -p /opt/zephyr-hub
-sudo chown "$USER:$USER" /opt/zephyr-hub
+sudo mkdir -p /root/apps
 git clone --branch feature/hub-gateway --single-branch \
-  https://github.com/vhhgx/codex-usage.git /opt/zephyr-hub
-cd /opt/zephyr-hub/deploy/hong-kong
+  https://github.com/vhhgx/codex-usage.git /root/apps/zephry-hub
+cd /root/apps/zephry-hub/deploy/hong-kong
 ```
 
 如果仓库是私有仓库，应使用只读 Deploy Key 或 GitHub Token，不要把凭据写入仓库。
@@ -80,13 +90,13 @@ cd /opt/zephyr-hub/deploy/hong-kong
 生产环境变量文件必须与生产 Compose 放在同一个目录：
 
 ```text
-/opt/zephyr-hub/deploy/hong-kong/.env
+/root/apps/zephry-hub/deploy/hong-kong/.env
 ```
 
 创建并限制权限：
 
 ```bash
-cd /opt/zephyr-hub/deploy/hong-kong
+cd /root/apps/zephry-hub/deploy/hong-kong
 cp .env.example .env
 chmod 600 .env
 nano .env
@@ -213,17 +223,31 @@ MINIO_KMS_SECRET_KEY
 
 ## 5. 配置 HTTPS
 
-先将域名的 A/AAAA 记录指向云服务器。确认 DNS 生效后安装 Certbot：
+先将域名的 A/AAAA 记录指向云服务器。确认 DNS 生效后安装 Certbot。`standalone`
+签发需要独占 80 端口；如果 Nginx 已经启动，应先停止它：
 
 ```bash
 sudo apt install -y certbot
-sudo certbot certonly --standalone -d hub.example.com
+nginx_was_active=0
+if sudo systemctl is-active --quiet nginx; then
+  nginx_was_active=1
+  sudo systemctl stop nginx
+fi
+if sudo certbot certonly --standalone -d hub.example.com; then
+  certbot_status=0
+else
+  certbot_status=$?
+fi
+if [ "$nginx_was_active" -eq 1 ]; then
+  sudo systemctl start nginx
+fi
+test "$certbot_status" -eq 0
 ```
 
 复制证书到生产目录：
 
 ```bash
-cd /opt/zephyr-hub/deploy/hong-kong
+cd /root/apps/zephry-hub/deploy/hong-kong
 mkdir -p tls
 sudo cp /etc/letsencrypt/live/hub.example.com/fullchain.pem tls/fullchain.pem
 sudo cp /etc/letsencrypt/live/hub.example.com/privkey.pem tls/privkey.pem
@@ -231,38 +255,61 @@ sudo chown "$USER:$USER" tls/fullchain.pem tls/privkey.pem
 chmod 600 tls/privkey.pem
 ```
 
-将 `hub.example.com` 替换为真实域名。建议同时把 `nginx.conf` 中两处
-`server_name _;` 改成真实域名。
+将 `hub.example.com` 替换为真实域名。Host Stack 使用
+`deploy/hong-kong/nginx-host.conf`，应把其中两处 `server_name _;` 改成真实域名，再按
+`deploy/hong-kong/README.md` 安装到宿主机 Nginx。完整容器方案才使用 `nginx.conf`。
 
-证书续期后，需要再次复制证书并重载 Nginx：
+Host Stack 继续使用 `standalone` 验证时，自动续期也必须临时释放 80 端口。安装以下
+Certbot hook；deploy hook 只在证书确实更新后复制文件，post hook 会恢复 Nginx：
 
 ```bash
-sudo certbot renew
-sudo cp /etc/letsencrypt/live/hub.example.com/fullchain.pem \
-  /opt/zephyr-hub/deploy/hong-kong/tls/fullchain.pem
-sudo cp /etc/letsencrypt/live/hub.example.com/privkey.pem \
-  /opt/zephyr-hub/deploy/hong-kong/tls/privkey.pem
-cd /opt/zephyr-hub/deploy/hong-kong
-docker compose restart nginx
+sudo install -d -m 755 /etc/letsencrypt/renewal-hooks/pre /etc/letsencrypt/renewal-hooks/deploy /etc/letsencrypt/renewal-hooks/post
+sudo tee /etc/letsencrypt/renewal-hooks/pre/zephyr-stop-nginx >/dev/null <<'EOF'
+#!/bin/sh
+if systemctl is-active --quiet nginx; then
+  touch /run/zephyr-certbot-nginx-was-active
+  systemctl stop nginx
+fi
+EOF
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/zephyr-copy-certificate >/dev/null <<'EOF'
+#!/bin/sh
+install -m 644 "$RENEWED_LINEAGE/fullchain.pem" /root/apps/zephry-hub/deploy/hong-kong/tls/fullchain.pem
+install -m 600 "$RENEWED_LINEAGE/privkey.pem" /root/apps/zephry-hub/deploy/hong-kong/tls/privkey.pem
+EOF
+sudo tee /etc/letsencrypt/renewal-hooks/post/zephyr-start-nginx >/dev/null <<'EOF'
+#!/bin/sh
+if [ -e /run/zephyr-certbot-nginx-was-active ]; then
+  rm -f /run/zephyr-certbot-nginx-was-active
+  systemctl start nginx
+fi
+EOF
+sudo chmod 755 /etc/letsencrypt/renewal-hooks/pre/zephyr-stop-nginx /etc/letsencrypt/renewal-hooks/deploy/zephyr-copy-certificate /etc/letsencrypt/renewal-hooks/post/zephyr-start-nginx
+sudo certbot renew --dry-run
 ```
 
-生产环境应把该过程配置为 Certbot deploy hook。
+上面的命令适用于默认 Host Stack。完整容器方案更新证书后改为执行
+`docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose.yml restart nginx`。
+完整容器方案不要直接复用上述 systemd hook，应为容器 Nginx 单独配置续期 hook。
 
 ## 6. 首次启动
 
-先检查 Compose 展开结果。该命令会在变量缺失时直接报错：
+先静默检查 Host Stack 配置有效性。该命令会在变量缺失时直接报错，但不会展开并输出环境变量：
 
 ```bash
-cd /opt/zephyr-hub/deploy/hong-kong
-docker compose config
+cd /root/apps/zephry-hub
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml config --quiet
 ```
 
-构建并启动完整服务：
+构建并启动 Host Stack：
 
 ```bash
-docker compose up -d --build
-docker compose ps -a
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml up -d --build
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml ps -a
 ```
+
+如选择包含容器 Nginx 的完整方案，则显式执行
+`docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose.yml up -d --build`；
+不要同时运行 Host Stack。
 
 会启动以下服务：
 
@@ -271,7 +318,7 @@ docker compose ps -a
 - `minio`：持久化加密正文。
 - `minio-init`：创建 Bucket 和 30 天生命周期，成功后退出是正常行为。
 - `app`：运行数据库迁移后启动 Zephyr Hub。
-- `nginx`：对外提供 HTTPS。
+- `nginx`：对外提供 HTTPS（仅完整容器方案；主机方案由宿主机 Nginx 提供）。
 
 应用镜像启动时会自动执行：
 
@@ -286,9 +333,9 @@ node server/migrate.mjs
 检查数据库、Redis 和容器状态：
 
 ```bash
-docker compose exec postgres pg_isready -U zephyr -d zephyr_hub
-docker compose exec redis redis-cli ping
-docker compose ps -a
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml exec postgres pg_isready -U zephyr -d zephyr_hub
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml exec redis redis-cli ping
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml ps -a
 ```
 
 正常结果应包含：
@@ -301,7 +348,7 @@ PONG
 检查应用容器内部健康状态：
 
 ```bash
-docker compose exec app node -e \
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml exec app node -e \
   "fetch('http://127.0.0.1:3000/api/health').then(async r => { console.log(r.status, await r.text()); process.exit(r.ok ? 0 : 1) })"
 ```
 
@@ -318,12 +365,12 @@ Nginx 配置会故意对公网隐藏 `/api/health` 并返回 `404`，所以公�
 查看启动日志：
 
 ```bash
-docker compose logs --tail=200 postgres
-docker compose logs --tail=200 redis
-docker compose logs --tail=200 minio
-docker compose logs --tail=200 app
-docker compose logs --tail=200 nginx
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml logs --tail=200 postgres redis minio app
 ```
+
+Host Stack 没有 `nginx` Compose 服务；请在宿主机执行 `sudo nginx -t`、
+`sudo systemctl status nginx` 和 `sudo journalctl -u nginx`。完整容器方案的 Nginx 日志使用
+`docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose.yml logs --tail=200 nginx`。
 
 访问：
 
@@ -338,7 +385,7 @@ https://hub.example.com/login
 
 ### 8.1 全新部署
 
-直接执行完整 Compose 即可。PostgreSQL 初始为空，应用会自动执行全部 Drizzle 迁移并在
+直接执行上述 Host Stack Compose 即可。PostgreSQL 初始为空，应用会自动执行全部 Drizzle 迁移并在
 第一次管理员登录时初始化管理员。
 
 ### 8.2 迁移当前本地数据
@@ -361,14 +408,14 @@ docker compose -f docker-compose.hub.yml exec -T postgres \
 在云服务器先启动基础设施：
 
 ```bash
-cd /opt/zephyr-hub/deploy/hong-kong
-docker compose up -d postgres redis minio minio-init
+cd /root/apps/zephry-hub
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml up -d postgres redis minio minio-init
 ```
 
 恢复 PostgreSQL：
 
 ```bash
-docker compose exec -T postgres pg_restore \
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml exec -T postgres pg_restore \
   --clean --if-exists --no-owner --no-privileges \
   -U zephyr -d zephyr_hub < /path/to/zephyr_hub.dump
 ```
@@ -376,9 +423,13 @@ docker compose exec -T postgres pg_restore \
 恢复后启动应用，让应用执行缺少的迁移：
 
 ```bash
-docker compose up -d --build app nginx
-docker compose logs --tail=200 app
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml up -d --build app
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml logs --tail=200 app
 ```
+
+上述命令已经使用默认 Host Stack，宿主机 Nginx 不由 Compose 管理。完整容器方案恢复时
+改用 `docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose.yml ...`，
+并在启动服务列表中加入 `nginx`。
 
 Redis 中的数据不需要跨服务器迁移。Hub 会根据 PostgreSQL 记录重新对账额度和状态。
 
@@ -400,6 +451,23 @@ scripts/migrate.mjs
 生成后续迁移时使用的快照和日志。Dockerfile 会把迁移文件复制到运行镜像，应用启动前会
 自动执行尚未运行的迁移。
 
+如果不用 Docker 而直接运行构建产物，请使用仓库提供的启动脚本：
+
+```bash
+npm run build
+npm run start:production
+```
+
+该脚本会先执行 `scripts/migrate.mjs`，再启动 Nitro，并自动读取根目录 `.env` 或
+`deploy/hong-kong/.env`（也可通过 `HUB_ENV_FILE` 指定）。不要直接执行
+`node .output/server/index.mjs`，否则新增迁移不会随启动执行。PM2 可直接使用
+`ecosystem.config.cjs`；它已指向同一启动脚本并设置了生产端口：
+
+```bash
+pm2 start ecosystem.config.cjs
+pm2 save
+```
+
 规则：
 
 - 不要删除、重命名或修改已经执行过的迁移文件。
@@ -413,25 +481,26 @@ scripts/migrate.mjs
 更新前先在后台“系统设置”开启流量排空，并等待活动请求归零，然后执行备份：
 
 ```bash
-cd /opt/zephyr-hub/deploy/hong-kong
-docker compose --profile backup run --rm backup
+cd /root/apps/zephry-hub
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml --profile backup run --rm backup
 ```
 
 拉取代码并滚动重建：
 
 ```bash
+cd /root/apps/zephry-hub
 git pull --ff-only
-docker compose up -d --build
-docker compose ps -a
-docker compose logs --tail=200 app
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml up -d --build
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml ps -a
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml logs --tail=200 app
 ```
 
 确认 `/api/ready` 正常后关闭流量排空。
 
-`docker compose up -d --build` 会保留数据卷。不要执行：
+上述 `up -d --build` 会保留数据卷。不要执行：
 
 ```bash
-docker compose down -v
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml down -v
 ```
 
 `-v` 会删除 PostgreSQL、Redis、MinIO、备份和 Prometheus 数据卷。
@@ -441,7 +510,7 @@ docker compose down -v
 生产 Compose 包含备份工具，备份 PostgreSQL 和 MinIO，并生成 SHA-256 清单：
 
 ```bash
-docker compose --profile backup run --rm backup
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml --profile backup run --rm backup
 ```
 
 备份默认保存在 Docker 的 `backup-data` 数据卷中。生产环境还应把备份复制到独立服务器
@@ -450,19 +519,23 @@ docker compose --profile backup run --rm backup
 验证备份：
 
 ```bash
-docker compose --profile backup run --rm \
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml --profile backup run --rm \
   --entrypoint verify-backup.sh backup /backups/<timestamp>
 ```
 
 恢复操作会清理目标数据库，必须先排空流量、停止应用并确认目标：
 
 ```bash
-docker compose stop app
-docker compose --profile backup run --rm \
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml stop app
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml --profile backup run --rm \
   -e RESTORE_CONFIRM=zephyr_hub \
   --entrypoint restore.sh backup /backups/<timestamp>
-docker compose up -d app nginx
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml up -d app
+sudo systemctl reload nginx
 ```
+
+完整容器方案改用 `docker-compose.yml`，并在最后一个 `up` 命令中加入 `nginx`，不执行
+宿主机 `systemctl reload nginx`。
 
 恢复后检查迁移、readiness、账号管理、渠道健康和 Hub Key 调用，再恢复正式流量。
 
@@ -478,10 +551,9 @@ Hub 提供：
 启用仓库自带 Prometheus：
 
 ```bash
-cd /opt/zephyr-hub/deploy/hong-kong
-printf '%s' '<NUXT_METRICS_TOKEN 的实际值>' > .metrics-token
-chmod 600 .metrics-token
-docker compose --profile monitoring up -d
+printf '%s' '<NUXT_METRICS_TOKEN 的实际值>' > /root/apps/zephry-hub/deploy/hong-kong/.metrics-token
+chmod 644 /root/apps/zephry-hub/deploy/hong-kong/.metrics-token
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml --profile monitoring up -d
 ```
 
 Prometheus 默认只加入私有 Docker 网络，不发布公网端口。
@@ -503,8 +575,8 @@ NUXT_DATABASE_URL=postgres://zephyr:<same-password>@postgres:5432/zephyr_hub
 ### Redis 连接失败
 
 ```bash
-docker compose exec redis redis-cli ping
-docker compose logs --tail=200 redis
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml exec redis redis-cli ping
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml logs --tail=200 redis
 ```
 
 生产 Compose 已将应用的 Redis 地址设置为 `redis://redis:6379/0`，不要改为
@@ -513,8 +585,8 @@ docker compose logs --tail=200 redis
 ### App 不健康
 
 ```bash
-docker compose logs --tail=300 app
-docker compose exec app node -e \
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml logs --tail=300 app
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml exec app node -e \
   "fetch('http://127.0.0.1:3000/api/health').then(r => console.log(r.status)).catch(console.error)"
 ```
 
@@ -529,19 +601,23 @@ deploy/hong-kong/tls/fullchain.pem
 deploy/hong-kong/tls/privkey.pem
 ```
 
-然后检查：
+完整容器方案使用以下命令检查容器 Nginx：
 
 ```bash
-docker compose logs --tail=200 nginx
-docker compose run --rm nginx nginx -t
+cd /root/apps/zephry-hub/deploy/hong-kong
+docker compose --env-file .env -f docker-compose.yml logs --tail=200 nginx
+docker compose --env-file .env -f docker-compose.yml run --rm nginx nginx -t
 ```
+
+默认 Host Stack 请在宿主机运行
+`sudo nginx -t` 并查看系统服务日志。
 
 ### Sub2API/CPA 返回 502
 
 从应用容器测试目标地址：
 
 ```bash
-docker compose exec app node -e \
+HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml exec app node -e \
   "fetch('https://sub.example.com').then(r => console.log(r.status)).catch(console.error)"
 ```
 
@@ -558,11 +634,11 @@ sudo ss -ltnp | grep -E ':80|:443'
 
 ## 14. 部署验收清单
 
-- `docker compose config` 无缺失变量或警告。
+- Host Stack 的显式 `docker compose --env-file ... -f docker-compose-hongkong.yml config --quiet` 无缺失变量或警告。
 - PostgreSQL 返回 `accepting connections`。
 - Redis 返回 `PONG`。
 - `minio-init` 退出码为 `0`。
-- `app` 和 `nginx` 状态健康。
+- `app` 状态健康；若选择完整容器方案，`nginx` 也应健康，主机方案则检查宿主机 Nginx。
 - `https://<domain>/api/ready` 返回成功。
 - 管理员可以登录并立即修改初始密码。
 - 账号管理、接码管理和号池配置可以读取数据。

@@ -20,12 +20,18 @@ interface ImportRow { key: string; name: string; email: string | null; notes: st
 interface OAuthForm { name: string; authorizationUrl: string; flowId: string; callbackUrl: string; expiresAt: number | null }
 type PageTab = 'accounts' | 'receivers'
 type ImportMode = 'manual' | 'upload' | 'batch' | 'convert'
+type PoolDrawer = 'import' | 'oauth' | 'edit' | 'receiver'
+type ReceiverCreateMode = 'single' | 'batch'
+type PoolData = { pool: Pool | null; accounts: Account[] }
+type ReceiverData = { items: SmsReceiverView[] }
+type VaultData = { items: AccountVaultView[] }
+type UsageData = { items: Array<{ accountId: string; quotaStatus: string; planType: string | null; windows: Array<{ label: string; remainingPercent: number | null; remaining: number | null; resetAt: number | null }>; error?: string }>; generatedAt: number }
 
-const { data, refresh, status: poolStatus } = useLazyFetch<{ pool: Pool | null; accounts: Account[] }>('/api/console/pool')
-const { data: receiverData, refresh: refreshReceivers } = useLazyFetch<{ items: SmsReceiverView[] }>('/api/console/pool/sms-receivers')
-const { data: vaultData, refresh: refreshVault } = useLazyFetch<{ items: AccountVaultView[] }>('/api/console/pool/account-vault')
-const { data: usageData, refresh: refreshUsage } = useLazyFetch<{ items: Array<{ accountId: string; quotaStatus: string; planType: string | null; windows: Array<{ label: string; remainingPercent: number | null; remaining: number | null; resetAt: number | null }>; error?: string }>; generatedAt: number }>('/api/console/pool/usage')
-const { data: planData } = useLazyFetch<{ subscription: null | { status: string; plan: { entitlementSnapshot?: Record<string, unknown>; version?: { supplyMode?: string; maxPoolAccounts?: number | null } | null } } }>('/api/console/plan')
+const { data, status: poolStatus } = useLazyFetch<PoolData>('/api/console/pool')
+const { data: receiverData } = useLazyFetch<ReceiverData>('/api/console/pool/sms-receivers')
+const { data: vaultData } = useLazyFetch<VaultData>('/api/console/pool/account-vault')
+const { data: usageData } = useLazyFetch<UsageData>('/api/console/pool/usage')
+const { data: planData, status: planStatus } = useLazyFetch<{ subscription: null | { status: string; plan: { entitlementSnapshot?: Record<string, unknown>; version?: { supplyMode?: string; maxPoolAccounts?: number | null } | null } } }>('/api/console/plan')
 const authSession = useState<{ user?: { role?: string } } | null>('auth-session', () => null)
 const toast = useAppToast()
 const provisioning = ref(false)
@@ -33,8 +39,9 @@ const saving = ref(false)
 const loading = ref(false)
 const verifying = ref<string | null>(null)
 const deleting = ref<Account | null>(null)
+const deletingReceiver = ref<SmsReceiverView | null>(null)
 const editing = ref<Account | null>(null)
-const drawer = ref<'import' | 'oauth' | 'edit' | 'receiver' | null>(null)
+const drawer = ref<PoolDrawer | null>(null)
 const activeTab = ref<PageTab>('accounts')
 const importMode = ref<ImportMode>('manual')
 const search = ref('')
@@ -48,7 +55,7 @@ const oauthError = ref('')
 const oauth = reactive<OAuthForm>({ name: '', authorizationUrl: '', flowId: '', callbackUrl: '', expiresAt: null })
 const editForm = reactive({ displayName: '', schedulable: false })
 const editReceiverId = ref('')
-const receiverCreateMode = ref<'single' | 'batch'>('single')
+const receiverCreateMode = ref<ReceiverCreateMode>('single')
 const editingReceiver = ref<SmsReceiverView | null>(null)
 const receiverImportText = ref('')
 const receiverError = ref('')
@@ -61,6 +68,7 @@ const deliveryText = ref('')
 const deliveryFields = ref<AccountDeliveryField[]>(['email', 'password'])
 const deliverySource = ref<AccountVaultSource | ''>('')
 const deliveryError = ref('')
+let drawerEpoch = 0
 
 const pool = computed(() => data.value?.pool || null)
 const accounts = computed(() => data.value?.accounts || [])
@@ -72,11 +80,12 @@ const filteredAccounts = computed(() => {
   return accounts.value.filter(item => `${item.displayName} ${item.email || ''} ${item.platform} ${item.accountType} ${item.source}`.toLowerCase().includes(query))
 })
 const poolEntitlement = computed(() => {
-  if (['admin', 'super_admin'].includes(authSession.value?.user?.role || '')) return { allowed: true, maxAccounts: null }
+  if (['admin', 'super_admin'].includes(authSession.value?.user?.role || '')) return { allowed: true as boolean | null, pending: false, maxAccounts: null }
+  if (planStatus.value === 'pending' && !planData.value) return { allowed: null, pending: true, maxAccounts: null }
   const subscription = planData.value?.subscription
   const snapshot = subscription?.plan.entitlementSnapshot || {}
   const version = subscription?.plan.version || null
-  return { allowed: subscription?.status === 'active', maxAccounts: Number(snapshot.maxPoolAccounts ?? version?.maxPoolAccounts) || null }
+  return { allowed: subscription?.status === 'active', pending: false, maxAccounts: Number(snapshot.maxPoolAccounts ?? version?.maxPoolAccounts) || null }
 })
 const importReady = computed(() => importRows.value.length > 0)
 const receivers = computed(() => receiverData.value?.items || [])
@@ -106,20 +115,99 @@ const deliveryPreview = computed(() => {
   })
 })
 
+async function reloadPoolData() { data.value = await $fetch<PoolData>('/api/console/pool') }
+async function reloadReceiverData(signal?: AbortSignal) { receiverData.value = await $fetch<ReceiverData>('/api/console/pool/sms-receivers', { signal }) }
+async function reloadVaultData() { vaultData.value = await $fetch<VaultData>('/api/console/pool/account-vault') }
+async function reloadUsageData() { usageData.value = await $fetch<UsageData>('/api/console/pool/usage') }
+
+async function refreshReceiversBestEffort(notifyOnFailure = true) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 10_000)
+  try {
+    await reloadReceiverData(controller.signal)
+  } catch {
+    if (notifyOnFailure) toast.show('接码列表刷新失败，请稍后重试', 'info')
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
 function failureMessage(value: unknown, fallback: string) {
   const failure = value as { data?: { message?: string }; message?: string }
   return failure.data?.message || failure.message || fallback
 }
+function drawerIsBusy() {
+  return saving.value || receiverBusy.value
+}
+function openDrawer(kind: PoolDrawer) {
+  if (drawerIsBusy()) {
+    toast.show('当前操作正在处理，请等待完成', 'info')
+    return false
+  }
+  drawerEpoch += 1
+  drawer.value = kind
+  return true
+}
+function closeDrawer() {
+  const closing = drawer.value
+  drawerEpoch += 1
+  drawer.value = null
+  if (closing === 'edit') editing.value = null
+  if (closing === 'receiver') editingReceiver.value = null
+}
+function requestCloseDrawer() {
+  if (drawerIsBusy()) {
+    toast.show(drawer.value === 'receiver' ? '接码配置正在保存，请等待完成' : '账号操作正在处理，请等待完成', 'info')
+    return
+  }
+  closeDrawer()
+}
+function isCurrentDrawer(kind: PoolDrawer, epoch: number) {
+  return drawerEpoch === epoch && drawer.value === kind
+}
+function moveTab<T extends string>(event: KeyboardEvent, current: T, order: readonly T[], activate: (tab: T) => void, idPrefix: string) {
+  const direction = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0
+  if (!direction && event.key !== 'Home' && event.key !== 'End') return
+  event.preventDefault()
+  const currentIndex = order.indexOf(current)
+  if (currentIndex < 0) return
+  const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? order.length - 1 : (currentIndex + direction + order.length) % order.length
+  const next = order[nextIndex]
+  if (!next) return
+  activate(next)
+  void nextTick(() => document.getElementById(`${idPrefix}-${next}`)?.focus())
+}
+function selectPageTab(tab: PageTab) {
+  activeTab.value = tab
+  search.value = ''
+}
+function onPageTabKeydown(event: KeyboardEvent, current: PageTab) {
+  moveTab(event, current, ['accounts', 'receivers'] as const, selectPageTab, 'pool-tab')
+}
+function onImportTabKeydown(event: KeyboardEvent, current: ImportMode) {
+  moveTab(event, current, ['manual', 'upload', 'batch', 'convert'] as const, switchImportMode, 'pool-import-tab')
+}
+function switchReceiverCreateMode(mode: ReceiverCreateMode) {
+  if (receiverBusy.value) return
+  receiverCreateMode.value = mode
+}
+function onReceiverCreateTabKeydown(event: KeyboardEvent, current: ReceiverCreateMode) {
+  moveTab(event, current, ['single', 'batch'] as const, switchReceiverCreateMode, 'receiver-create-tab')
+}
 async function provision() {
   provisioning.value = true
   error.value = ''
-  try { await $fetch('/api/console/pool/provision', { method: 'POST' }); await refresh(); await refreshUsage() }
+  try { await $fetch('/api/console/pool/provision', { method: 'POST' }); await Promise.all([reloadPoolData(), reloadUsageData()]) }
   catch (value) { error.value = failureMessage(value, '创建号池失败') }
   finally { provisioning.value = false }
 }
 async function refreshPool() {
   loading.value = true
-  try { await Promise.all([refresh(), refreshUsage()]) } finally { loading.value = false }
+  try {
+    await Promise.all([reloadPoolData(), reloadUsageData(), reloadVaultData()])
+    if (activeTab.value === 'receivers') await refreshReceiversBestEffort(false)
+    else void refreshReceiversBestEffort(false)
+  } finally { loading.value = false }
 }
 function usageLabel(accountId: string) {
   const usage = accountUsage.value.get(accountId)
@@ -235,9 +323,11 @@ function resetImporter() {
   Object.assign(manualForm, { email: '', displayName: '', source: '', status: 'Codex', password: '', emailCodeUrl: '', totpSecret: '', smsReceiverId: '', remark: '' })
 }
 function openImport(mode: ImportMode = 'manual') {
-  resetImporter(); importMode.value = mode; drawer.value = 'import'
+  if (!openDrawer('import')) return
+  resetImporter(); importMode.value = mode
 }
 function switchImportMode(mode: ImportMode) {
+  if (saving.value) return
   importMode.value = mode; error.value = ''; deliveryError.value = ''; importNotice.value = ''
 }
 function toggleDeliveryField(field: AccountDeliveryField) {
@@ -254,31 +344,45 @@ function moveDeliveryField(field: AccountDeliveryField, offset: -1 | 1) {
   deliveryFields.value = current
 }
 async function saveManualAccount() {
+  if (saving.value || drawer.value !== 'import') return
+  const requestEpoch = drawerEpoch
+  const payload = { ...manualForm, smsReceiverId: manualForm.smsReceiverId || null }
   saving.value = true; error.value = ''
   try {
-    await $fetch('/api/console/pool/account-vault', { method: 'POST', body: { ...manualForm, smsReceiverId: manualForm.smsReceiverId || null } })
-    await Promise.all([refreshVault(), refreshReceivers()])
-    drawer.value = null
+    await $fetch('/api/console/pool/account-vault', { method: 'POST', body: payload })
+    if (!isCurrentDrawer('import', requestEpoch)) return
+    await reloadVaultData()
+    if (!isCurrentDrawer('import', requestEpoch)) return
+    closeDrawer()
     toast.show('账号资料已创建', 'success')
-  } catch (value) { error.value = failureMessage(value, '保存账号失败') } finally { saving.value = false }
+    void refreshReceiversBestEffort()
+  } catch (value) { if (isCurrentDrawer('import', requestEpoch)) error.value = failureMessage(value, '保存账号失败') }
+  finally { saving.value = false }
 }
 async function importDelivery() {
+  if (saving.value || drawer.value !== 'import') return
   deliveryError.value = ''
   if (!deliverySource.value) { deliveryError.value = '请选择账号来源'; return }
   if (deliveryConfigurationError.value) { deliveryError.value = deliveryConfigurationError.value; return }
   if (!deliveryPreview.value.length) { deliveryError.value = '请输入发货内容'; return }
+  const requestEpoch = drawerEpoch
+  const payload = { text: deliveryText.value, fields: [...deliveryFields.value], source: deliverySource.value }
   saving.value = true
   try {
-    const result = await $fetch<{ created: number; skipped: number; failed: Array<{ index: number; email: string; message: string }> }>('/api/console/pool/account-vault/delivery-import', { method: 'POST', body: { text: deliveryText.value, fields: deliveryFields.value, source: deliverySource.value } })
-    await Promise.all([refreshVault(), refreshReceivers()])
+    const result = await $fetch<{ created: number; skipped: number; failed: Array<{ index: number; email: string; message: string }> }>('/api/console/pool/account-vault/delivery-import', { method: 'POST', body: payload })
+    if (!isCurrentDrawer('import', requestEpoch)) return
+    await reloadVaultData()
+    if (!isCurrentDrawer('import', requestEpoch)) return
     if (result.failed.length) {
       deliveryError.value = result.failed.slice(0, 5).map(item => `第 ${item.index + 1} 行${item.email ? `（${item.email}）` : ''}：${item.message}`).join('\n')
       toast.show(`导入完成：新增 ${result.created}，跳过 ${result.skipped}，失败 ${result.failed.length}`, 'error')
       return
     }
-    drawer.value = null
+    closeDrawer()
     toast.show(`发货账号已导入：新增 ${result.created}，跳过 ${result.skipped}`, 'success')
-  } catch (value) { deliveryError.value = failureMessage(value, '发货账号导入失败') } finally { saving.value = false }
+    void refreshReceiversBestEffort()
+  } catch (value) { if (isCurrentDrawer('import', requestEpoch)) deliveryError.value = failureMessage(value, '发货账号导入失败') }
+  finally { saving.value = false }
 }
 async function submitImport() {
   if (importMode.value === 'manual') return saveManualAccount()
@@ -287,87 +391,125 @@ async function submitImport() {
 }
 async function importAccounts() {
   if (!importRows.value.length) parseImportText(importText.value)
-  if (!importRows.value.length) return
+  if (!importRows.value.length || saving.value || drawer.value !== 'import') return
+  const requestEpoch = drawerEpoch
+  const payload = { accounts: importRows.value.map(row => ({ ...row, displayName: row.name })) }
   saving.value = true; error.value = ''
   try {
-    const result = await $fetch<{ mode: 'accounts'; created: Account[]; failed: Array<{ name: string; error: string }> }>('/api/console/pool/accounts', { method: 'POST', body: { accounts: importRows.value.map(row => ({ ...row, displayName: row.name })) } })
+    const result = await $fetch<{ mode: 'accounts'; created: Account[]; failed: Array<{ name: string; error: string }> }>('/api/console/pool/accounts', { method: 'POST', body: payload })
+    if (!isCurrentDrawer('import', requestEpoch)) return
     importNotice.value = `批量导入完成：成功 ${result.created?.length || 0}，失败 ${result.failed?.length || 0}`
     if (result.failed?.length) error.value = result.failed.map(item => `${item.name}：${item.error}`).join('；')
-    await Promise.all([refresh(), refreshVault()])
-    if (!result.failed?.length) drawer.value = null
+    await Promise.all([reloadPoolData(), reloadVaultData()])
+    if (!isCurrentDrawer('import', requestEpoch)) return
+    if (!result.failed?.length) closeDrawer()
     toast.show(importNotice.value, result.failed?.length ? 'error' : 'success')
-  } catch (value) { error.value = failureMessage(value, '导入账号失败') } finally { saving.value = false }
+  } catch (value) { if (isCurrentDrawer('import', requestEpoch)) error.value = failureMessage(value, '导入账号失败') }
+  finally { saving.value = false }
 }
 function openOAuth() {
-  Object.assign(oauth, { name: '', authorizationUrl: '', flowId: '', callbackUrl: '', expiresAt: null }); oauthError.value = ''; drawer.value = 'oauth'
+  if (!openDrawer('oauth')) return
+  Object.assign(oauth, { name: '', authorizationUrl: '', flowId: '', callbackUrl: '', expiresAt: null }); oauthError.value = ''
 }
 async function startOAuth() {
+  if (saving.value || drawer.value !== 'oauth') return
+  const requestEpoch = drawerEpoch
   saving.value = true; oauthError.value = ''
   try {
     const result = await $fetch<{ authorizationUrl: string; flowId: string; expiresAt: number }>('/api/console/pool/oauth/start', { method: 'POST' })
+    if (!isCurrentDrawer('oauth', requestEpoch)) return
     Object.assign(oauth, result)
-  } catch (value) { oauthError.value = failureMessage(value, '生成授权链接失败') } finally { saving.value = false }
+  } catch (value) { if (isCurrentDrawer('oauth', requestEpoch)) oauthError.value = failureMessage(value, '生成授权链接失败') }
+  finally { saving.value = false }
 }
 async function completeOAuth() {
   if (!oauth.flowId || !oauth.callbackUrl.trim()) { oauthError.value = '请粘贴 localhost 开头的完整回调 URL'; return }
+  if (saving.value || drawer.value !== 'oauth') return
+  const requestEpoch = drawerEpoch
+  const payload = { flowId: oauth.flowId, callbackUrl: oauth.callbackUrl, name: oauth.name }
   saving.value = true; oauthError.value = ''
   try {
-    await $fetch('/api/console/pool/oauth/complete', { method: 'POST', body: { flowId: oauth.flowId, callbackUrl: oauth.callbackUrl, name: oauth.name } })
-    drawer.value = null; await refresh(); toast.show('OpenAI 账号已授权并保持不可调度，请先验活', 'success')
-  } catch (value) { oauthError.value = failureMessage(value, '完成 OpenAI 授权失败') } finally { saving.value = false }
+    await $fetch('/api/console/pool/oauth/complete', { method: 'POST', body: payload })
+    if (!isCurrentDrawer('oauth', requestEpoch)) return
+    await reloadPoolData()
+    if (!isCurrentDrawer('oauth', requestEpoch)) return
+    closeDrawer(); toast.show('OpenAI 账号已授权并保持不可调度，请先验活', 'success')
+  } catch (value) { if (isCurrentDrawer('oauth', requestEpoch)) oauthError.value = failureMessage(value, '完成 OpenAI 授权失败') }
+  finally { saving.value = false }
 }
-function openEdit(account: Account) { editing.value = account; Object.assign(editForm, { displayName: account.displayName, schedulable: account.schedulable }); editReceiverId.value = receiverForAccount(account.id)?.id || ''; error.value = ''; drawer.value = 'edit' }
+function openEdit(account: Account) { if (!openDrawer('edit')) return; editing.value = account; Object.assign(editForm, { displayName: account.displayName, schedulable: account.schedulable }); editReceiverId.value = receiverForAccount(account.id)?.id || ''; error.value = '' }
 async function saveEdit() {
-  if (!editing.value) return
+  if (!editing.value || saving.value || drawer.value !== 'edit') return
+  const requestEpoch = drawerEpoch
+  const accountId = editing.value.id
+  const accountPayload = { displayName: editForm.displayName, schedulable: editForm.schedulable }
+  const receiverPayload = { receiverId: editReceiverId.value || null }
   saving.value = true; error.value = ''
-  try { await Promise.all([$fetch(`/api/console/pool/accounts/${editing.value.id}`, { method: 'PATCH', body: { displayName: editForm.displayName, schedulable: editForm.schedulable } }), $fetch(`/api/console/pool/accounts/${editing.value.id}/receiver`, { method: 'PUT', body: { receiverId: editReceiverId.value || null } })]); drawer.value = null; await Promise.all([refresh(), refreshReceivers()]); toast.show('账号配置已更新', 'success') }
-  catch (value) { error.value = failureMessage(value, '保存账号失败') } finally { saving.value = false }
+  try {
+    await Promise.all([$fetch(`/api/console/pool/accounts/${accountId}`, { method: 'PATCH', body: accountPayload }), $fetch(`/api/console/pool/accounts/${accountId}/receiver`, { method: 'PUT', body: receiverPayload })])
+    if (!isCurrentDrawer('edit', requestEpoch)) return
+    await Promise.all([reloadPoolData(), reloadReceiverData()])
+    if (!isCurrentDrawer('edit', requestEpoch)) return
+    closeDrawer(); toast.show('账号配置已更新', 'success')
+  } catch (value) { if (isCurrentDrawer('edit', requestEpoch)) error.value = failureMessage(value, '保存账号失败') }
+  finally { saving.value = false }
 }
 async function verify(account: Account, activate = false) {
   verifying.value = account.id; error.value = ''
-  try { await $fetch(`/api/console/pool/accounts/${account.id}/verify`, { method: 'POST' }); if (activate) await $fetch(`/api/console/pool/accounts/${account.id}`, { method: 'PATCH', body: { schedulable: true } }); await refresh(); toast.show(activate ? '账号已验活并启用' : '账号验活完成', 'success') }
+  try { await $fetch(`/api/console/pool/accounts/${account.id}/verify`, { method: 'POST' }); if (activate) await $fetch(`/api/console/pool/accounts/${account.id}`, { method: 'PATCH', body: { schedulable: true } }); await reloadPoolData(); toast.show(activate ? '账号已验活并启用' : '账号验活完成', 'success') }
   catch (value) { toast.show(failureMessage(value, '账号验活失败'), 'error') } finally { verifying.value = null }
 }
 async function remove() {
   if (!deleting.value) return
   loading.value = true
-  try { await $fetch(`/api/console/pool/accounts/${deleting.value.id}`, { method: 'DELETE' }); deleting.value = null; await refresh(); toast.show('账号已删除', 'success') }
+  try { await $fetch(`/api/console/pool/accounts/${deleting.value.id}`, { method: 'DELETE' }); deleting.value = null; await reloadPoolData(); toast.show('账号已删除', 'success') }
   catch (value) { toast.show(failureMessage(value, '删除账号失败'), 'error') } finally { loading.value = false }
 }
 function openUrl() { if (oauth.authorizationUrl) window.open(oauth.authorizationUrl, '_blank', 'noopener,noreferrer') }
 function selectOAuthUrl(event: Event) { (event.target as HTMLInputElement).select() }
 async function copyUrl() { if (oauth.authorizationUrl) { await navigator.clipboard.writeText(oauth.authorizationUrl); toast.show('授权链接已复制', 'success') } }
 function openReceiverCreate(item?: SmsReceiverView) {
+  if (!openDrawer('receiver')) return
   editingReceiver.value = item || null
   receiverCreateMode.value = 'single'
   receiverImportText.value = ''
   receiverError.value = ''
   Object.assign(receiverForm, { phone: item?.phone || '', fetchUrl: '', note: item?.note || '', active: item?.status !== 'disabled' })
-  drawer.value = 'receiver'
 }
 async function saveReceiver() {
+  if (receiverBusy.value || drawer.value !== 'receiver') return
+  const requestEpoch = drawerEpoch
+  const editingId = editingReceiver.value?.id || null
+  const mode = receiverCreateMode.value
+  const importPayload = { text: receiverImportText.value }
+  const body = { phone: receiverForm.phone, note: receiverForm.note, status: receiverForm.active ? 'active' : 'disabled', ...(receiverForm.fetchUrl ? { fetchUrl: receiverForm.fetchUrl } : {}) }
   receiverBusy.value = true; receiverError.value = ''
   try {
-    if (!editingReceiver.value && receiverCreateMode.value === 'batch') {
-      const result = await $fetch<SmsReceiverImportResult>('/api/console/pool/sms-receivers/import', { method: 'POST', body: { text: receiverImportText.value } })
+    if (!editingId && mode === 'batch') {
+      const result = await $fetch<SmsReceiverImportResult>('/api/console/pool/sms-receivers/import', { method: 'POST', body: importPayload })
+      if (!isCurrentDrawer('receiver', requestEpoch)) return
       if (result.failed.length) receiverError.value = result.failed.slice(0, 5).map(item => `第 ${item.line} 行：${item.error}`).join('\n')
+      await reloadReceiverData()
+      if (!isCurrentDrawer('receiver', requestEpoch)) return
+      if (!result.failed.length) closeDrawer()
       toast.show(`接码导入：成功 ${result.created.length}，跳过 ${result.skipped.length}，失败 ${result.failed.length}`, result.failed.length ? 'error' : 'success')
-      if (!result.failed.length) drawer.value = null
     } else {
-      const body = { phone: receiverForm.phone, note: receiverForm.note, status: receiverForm.active ? 'active' : 'disabled', ...(receiverForm.fetchUrl ? { fetchUrl: receiverForm.fetchUrl } : {}) }
-      if (editingReceiver.value) await $fetch(`/api/console/pool/sms-receivers/${editingReceiver.value.id}`, { method: 'PATCH', body })
+      if (editingId) await $fetch(`/api/console/pool/sms-receivers/${editingId}`, { method: 'PATCH', body })
       else await $fetch('/api/console/pool/sms-receivers', { method: 'POST', body })
-      drawer.value = null; toast.show('接码资源已保存', 'success')
+      if (!isCurrentDrawer('receiver', requestEpoch)) return
+      await reloadReceiverData()
+      if (!isCurrentDrawer('receiver', requestEpoch)) return
+      closeDrawer(); toast.show('接码资源已保存', 'success')
     }
-    await refreshReceivers()
-  } catch (value) { receiverError.value = failureMessage(value, '保存接码资源失败') } finally { receiverBusy.value = false }
+  } catch (value) { if (isCurrentDrawer('receiver', requestEpoch)) receiverError.value = failureMessage(value, '保存接码资源失败') }
+  finally { receiverBusy.value = false }
 }
 async function toggleReceiver(item: SmsReceiverView, active: boolean) {
-  try { await $fetch(`/api/console/pool/sms-receivers/${item.id}`, { method: 'PATCH', body: { status: active ? 'active' : 'disabled' } }); await refreshReceivers() }
+  try { await $fetch(`/api/console/pool/sms-receivers/${item.id}`, { method: 'PATCH', body: { status: active ? 'active' : 'disabled' } }); await reloadReceiverData() }
   catch (value) { toast.show(failureMessage(value, '更新接码状态失败'), 'error') }
 }
 async function refreshReceiverCode(item: SmsReceiverView) {
-  try { const { result } = await $fetch<{ result: SmsCodeResult }>(`/api/console/pool/sms-receivers/${item.id}/refresh`, { method: 'POST' }); receiverCodes[item.id] = result; await refreshReceivers() }
+  try { const { result } = await $fetch<{ result: SmsCodeResult }>(`/api/console/pool/sms-receivers/${item.id}/refresh`, { method: 'POST' }); receiverCodes[item.id] = result; await reloadReceiverData() }
   catch (value) { toast.show(failureMessage(value, '获取验证码失败'), 'error') }
 }
 async function refreshAccountCode(account: Account) {
@@ -375,42 +517,58 @@ async function refreshAccountCode(account: Account) {
   catch (value) { toast.show(failureMessage(value, '获取验证码失败'), 'error') }
 }
 async function deleteReceiver(item: SmsReceiverView) {
-  if (!confirm(`确定删除接码 ${item.phone}？`)) return
-  try { await $fetch(`/api/console/pool/sms-receivers/${item.id}`, { method: 'DELETE' }); await refreshReceivers(); toast.show('接码资源已删除', 'success') }
-  catch (value) { toast.show(failureMessage(value, '删除接码失败'), 'error') }
+  if (receiverBusy.value) {
+    toast.show('接码操作正在处理，请等待完成', 'info')
+    return
+  }
+  deletingReceiver.value = item
 }
+async function confirmDeleteReceiver() {
+  const item = deletingReceiver.value
+  if (!item || receiverBusy.value) return
+  receiverBusy.value = true
+  try {
+    await $fetch(`/api/console/pool/sms-receivers/${item.id}`, { method: 'DELETE' })
+    await reloadReceiverData()
+    deletingReceiver.value = null
+    toast.show('接码资源已删除', 'success')
+  } catch (value) { toast.show(failureMessage(value, '删除接码失败'), 'error') }
+  finally { receiverBusy.value = false }
+}
+onBeforeUnmount(() => { drawerEpoch += 1 })
 const date = (value: number | null) => value ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'short' }).format(value) : '尚未验活'
 const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value === 'conversion' ? '凭据转换' : '凭据导入'
 </script>
 
 <template>
-  <div class="admin-page pool-page">
-    <header class="resource-panel-header"><div><span class="admin-kicker">PRIVATE POOL</span><h2>专属号池</h2><p>账号与接码资源只进入自己的隔离分组，用量与公共号池保持同样的额度窗口展示。</p></div><div v-if="poolStatus !== 'pending' || data" class="resource-panel-actions"><button v-if="pool" class="button button--quiet button--small" :disabled="loading" @click="refreshPool"><IconRefresh :size="15" />刷新用量</button><template v-if="activeTab === 'accounts'"><button class="button button--secondary" :disabled="!pool || saving" @click="openOAuth"><IconLogin2 :size="17" />Auth 登录</button><button class="button button--primary" :disabled="!pool || saving" @click="openImport('manual')"><IconPlus :size="17" />导入账号</button></template><button v-else class="button button--primary" :disabled="!pool" @click="openReceiverCreate()"><IconPlus :size="17" />新增接码</button><button v-if="!pool" class="button button--primary" :disabled="provisioning || !poolEntitlement.allowed" @click="provision"><IconShieldLock :size="17" />{{ provisioning ? '创建中…' : '创建专属号池' }}</button></div></header>
-    <nav v-if="pool" class="admin-page-tabs pool-tabs" role="tablist" aria-label="专属资源管理"><button type="button" role="tab" :aria-selected="activeTab === 'accounts'" :class="{ active: activeTab === 'accounts' }" @click="activeTab = 'accounts'; search = ''"><IconShieldLock :size="17" />账号管理</button><button type="button" role="tab" :aria-selected="activeTab === 'receivers'" :class="{ active: activeTab === 'receivers' }" @click="activeTab = 'receivers'; search = ''"><IconDeviceMobile :size="17" />接码管理</button></nav>
-    <template v-if="pool && activeTab === 'accounts'">
+  <div class="pool-page">
+    <header class="resource-panel-header"><div><span class="admin-kicker">PRIVATE POOL</span><h2>专属号池</h2><p>账号与接码资源只进入自己的隔离分组，用量与公共号池保持同样的额度窗口展示。</p></div><div v-if="poolStatus !== 'pending' || data" class="resource-panel-actions"><button v-if="pool" class="button button--quiet button--small" :disabled="loading || saving || receiverBusy" @click="refreshPool"><IconRefresh :size="15" />刷新用量</button><template v-if="activeTab === 'accounts'"><button class="button button--secondary" :disabled="!pool || saving || receiverBusy" @click="openOAuth"><IconLogin2 :size="17" />Auth 登录</button><button class="button button--primary" :disabled="!pool || saving || receiverBusy" @click="openImport('manual')"><IconPlus :size="17" />导入账号</button></template><button v-else class="button button--primary" :disabled="!pool || saving || receiverBusy" @click="openReceiverCreate()"><IconPlus :size="17" />新增接码</button><button v-if="!pool" class="button button--primary" :disabled="provisioning || poolEntitlement.pending || poolEntitlement.allowed !== true" @click="provision"><IconShieldLock :size="17" />{{ provisioning ? '创建中…' : poolEntitlement.pending ? '读取套餐' : '创建专属号池' }}</button></div></header>
+    <nav v-if="pool" class="admin-page-tabs pool-tabs" role="tablist" aria-label="专属资源管理" aria-orientation="horizontal"><button id="pool-tab-accounts" type="button" role="tab" aria-controls="pool-panel-accounts" :aria-selected="activeTab === 'accounts'" :tabindex="activeTab === 'accounts' ? 0 : -1" :class="{ active: activeTab === 'accounts' }" @keydown="onPageTabKeydown($event, 'accounts')" @click="selectPageTab('accounts')"><IconShieldLock :size="17" />账号管理</button><button id="pool-tab-receivers" type="button" role="tab" aria-controls="pool-panel-receivers" :aria-selected="activeTab === 'receivers'" :tabindex="activeTab === 'receivers' ? 0 : -1" :class="{ active: activeTab === 'receivers' }" @keydown="onPageTabKeydown($event, 'receivers')" @click="selectPageTab('receivers')"><IconDeviceMobile :size="17" />接码管理</button></nav>
+    <section v-if="pool && activeTab === 'accounts'" id="pool-panel-accounts" class="pool-tab-panel" role="tabpanel" aria-labelledby="pool-tab-accounts" tabindex="0">
       <p class="pool-status-line"><span>{{ pool.status === 'active' ? '运行中' : '需处理' }}</span><span>{{ pool.displayName }}</span><span class="tabular-nums">账号 {{ pool.accountCount }}<template v-if="pool.maxAccounts"> / {{ pool.maxAccounts }}</template></span><span class="tabular-nums">可调度 {{ pool.availableAccountCount }}</span><span class="tabular-nums">待授权 {{ vaultAccounts.length }}</span><span>仅自己可用，不跨用户故障转移</span></p>
       <section class="pool-toolbar"><label class="admin-search"><IconSearch :size="16" /><input v-model="search" type="search" placeholder="搜索账号、邮箱或平台"></label><button class="icon-button" title="刷新账号" aria-label="刷新账号" :disabled="loading" @click="refreshPool"><IconRefresh :class="{ 'is-spinning': loading }" :size="17" /></button></section>
       <section v-if="vaultAccounts.length" class="pool-vault-section"><header><div><strong>账号资料</strong><small>手动与批量导入，等待授权进入专属分组</small></div><code>{{ vaultAccounts.length }}</code></header><div class="admin-table-wrap pool-table-wrap"><table class="admin-table"><thead><tr><th>账号</th><th>来源</th><th>凭据</th><th>接码</th><th>状态</th></tr></thead><tbody><tr v-for="item in vaultAccounts.filter(row => !search || `${row.email} ${row.displayName || ''} ${row.source}`.toLowerCase().includes(search.toLowerCase()))" :key="item.id"><td><strong>{{ item.displayName || item.email }}</strong><code>{{ item.email }}</code></td><td>{{ accountSourceLabels[item.source] }}</td><td>{{ item.credentialKind === 'tokens' ? 'AT / RT' : item.credentialKind === 'email_code_url' ? '邮箱链接' : '密码' }}<code v-if="item.hasTotpSecret">含 2FA</code></td><td><strong>{{ item.smsReceiver?.phone || '自动分配失败' }}</strong></td><td><span class="status-dot" data-status="disabled"><i />待授权</span><code>{{ item.status }}</code></td></tr></tbody></table></div></section>
     <section class="admin-table-wrap pool-table-wrap"><table class="admin-table upstream-table"><thead><tr><th>账号</th><th>平台 / 类型</th><th>来源</th><th>接码</th><th>用量</th><th>调度</th><th>最近验活</th><th aria-label="操作" /></tr></thead><tbody><tr v-for="item in filteredAccounts" :key="item.id"><td><strong>{{ item.displayName }}</strong><code>{{ item.email || '未提供邮箱' }}</code></td><td>{{ item.platform }}<code>{{ item.accountType }}</code></td><td>{{ sourceLabel(item.source) }}<code>专属分组</code></td><td><strong>{{ receiverForAccount(item.id)?.phone || '未绑定' }}</strong><code v-if="accountCodes[item.id]?.code">验证码 {{ accountCodes[item.id]?.code }}</code></td><td><strong>{{ usageLabel(item.id) }}</strong><code v-if="!usageWindows(item.id).length">{{ usageDetail(item.id) }}</code><code v-for="window in usageWindows(item.id)" :key="window.label">{{ window.label }} · {{ window.remainingPercent === null ? (window.remaining ?? '—') : `${window.remainingPercent.toFixed(1)}%` }}</code></td><td><span class="status-dot" :data-status="item.schedulable ? 'active' : 'disabled'"><i />{{ item.schedulable ? '调度中' : '不可调度' }}</span><code>{{ item.status }}</code></td><td><strong>{{ date(item.lastVerifiedAt) }}</strong><code v-if="item.lastError" class="pool-error" :title="item.lastError">{{ item.lastError }}</code></td><td><div class="table-actions"><button v-if="receiverForAccount(item.id)" class="icon-button" title="获取并复制验证码" aria-label="获取并复制验证码" @click="refreshAccountCode(item)"><IconMessageCode :size="16" /></button><button class="icon-button" title="仅验证" aria-label="仅验证账号" :disabled="verifying === item.id" @click="verify(item)"><IconCircleCheck :size="16" /></button><button v-if="!item.schedulable" class="icon-button" title="验证并启用" aria-label="验证并启用账号" :disabled="verifying === item.id" @click="verify(item, true)"><IconPlayerPlay :size="16" /></button><button class="icon-button" title="编辑账号" aria-label="编辑账号" @click="openEdit(item)"><IconEdit :size="16" /></button><button class="icon-button danger" title="删除账号" aria-label="删除账号" @click="deleting = item"><IconTrash :size="16" /></button></div></td></tr><tr v-if="!filteredAccounts.length"><td colspan="8"><div class="admin-empty">{{ search ? '没有匹配的账号' : '还没有专属账号' }}</div></td></tr></tbody></table></section>
-    </template>
-    <template v-else-if="pool && activeTab === 'receivers'">
+    </section>
+    <section v-else-if="pool && activeTab === 'receivers'" id="pool-panel-receivers" class="pool-tab-panel" role="tabpanel" aria-labelledby="pool-tab-receivers" tabindex="0">
       <p class="pool-status-line"><span class="tabular-nums">接码资源 {{ receiverSummary.total }}</span><span class="tabular-nums">空余名额 {{ receiverSummary.available }}</span><span>每个号码最多绑定 3 个账号</span><span>仅当前账号可见，接口 URL 加密保存</span></p>
-      <section class="pool-toolbar"><label class="admin-search"><IconSearch :size="16" /><input v-model="search" type="search" placeholder="搜索手机号、供应商或备注"></label><button class="icon-button" title="刷新接码列表" aria-label="刷新接码列表" @click="() => refreshReceivers()"><IconRefresh :size="17" /></button></section>
+      <section class="pool-toolbar"><label class="admin-search"><IconSearch :size="16" /><input v-model="search" type="search" placeholder="搜索手机号、供应商或备注"></label><button class="icon-button" title="刷新接码列表" aria-label="刷新接码列表" @click="reloadReceiverData()"><IconRefresh :size="17" /></button></section>
       <section class="admin-table-wrap pool-table-wrap"><table class="admin-table"><thead><tr><th>手机号</th><th>供应商</th><th>绑定</th><th>状态</th><th>最新验证码</th><th>最近刷新</th><th aria-label="操作" /></tr></thead><tbody><tr v-for="item in receivers.filter(receiver => !search || `${receiver.phone} ${receiver.providerHost} ${receiver.note || ''}`.toLowerCase().includes(search.toLowerCase()))" :key="item.id"><td><strong>{{ item.phone }}</strong><code>{{ item.note || '无备注' }}</code></td><td><code>{{ item.providerHost }}</code></td><td><strong>{{ item.bindingCount }}/3</strong><code>{{ item.availableSlots }} 个空余</code></td><td><label class="compact-switch"><input type="checkbox" :checked="item.status === 'active'" @change="toggleReceiver(item, ($event.target as HTMLInputElement).checked)"><span aria-hidden="true" /><em>{{ item.status === 'active' ? '可用' : '停用' }}</em></label></td><td><strong>{{ receiverCodes[item.id]?.code || '—' }}</strong><code>{{ receiverCodes[item.id]?.message || '尚未获取' }}</code></td><td><strong>{{ item.lastFetchedAt ? date(item.lastFetchedAt) : '尚未刷新' }}</strong><code v-if="item.lastFetchError" class="pool-error">{{ item.lastFetchError }}</code></td><td><div class="table-actions"><button class="icon-button" title="刷新验证码" aria-label="刷新验证码" :disabled="item.status !== 'active'" @click="refreshReceiverCode(item)"><IconRefresh :size="16" /></button><button class="icon-button" title="编辑接码" aria-label="编辑接码" @click="openReceiverCreate(item)"><IconEdit :size="16" /></button><button class="icon-button danger" title="删除接码" aria-label="删除接码" :disabled="item.bindingCount > 0 && !item.readyForDeletion" @click="deleteReceiver(item)"><IconTrash :size="16" /></button></div></td></tr><tr v-if="!receivers.length"><td colspan="7"><div class="admin-empty">还没有接码资源</div></td></tr></tbody></table></section>
-    </template>
+    </section>
     <div v-else-if="poolStatus === 'pending' && !data" class="admin-panel pool-empty"><IconRefresh class="is-spinning" :size="24" /><h2>正在加载专属号池</h2></div>
-    <div v-else-if="!provisioning" class="admin-panel pool-empty"><IconShieldLock :size="26" /><h2>{{ poolEntitlement.allowed ? '还没有专属号池' : '当前套餐不可用' }}</h2><p>{{ poolEntitlement.allowed ? `启用后，账号只会进入你的专属分组${poolEntitlement.maxAccounts ? `，最多 ${poolEntitlement.maxAccounts} 个` : ''}。` : '请联系管理员检查套餐状态。' }}</p></div>
+    <div v-else-if="!provisioning && poolEntitlement.pending" class="admin-panel pool-empty"><IconRefresh class="is-spinning" :size="26" /><h2>正在读取套餐权限</h2><p>确认套餐状态后才能创建专属号池。</p></div>
+    <div v-else-if="!provisioning" class="admin-panel pool-empty"><IconShieldLock :size="26" /><h2>{{ poolEntitlement.allowed === true ? '还没有专属号池' : '当前套餐不可用' }}</h2><p>{{ poolEntitlement.allowed === true ? `启用后，账号只会进入你的专属分组${poolEntitlement.maxAccounts ? `，最多 ${poolEntitlement.maxAccounts} 个` : ''}。` : '请联系管理员检查套餐状态。' }}</p></div>
 
-    <AppDrawer :open="drawer === 'import'" wide kicker="ACCOUNT RECORD" title="新增账号" @close="drawer = null">
-      <form class="admin-form pool-account-importer" @submit.prevent="submitImport">
-        <nav class="admin-page-tabs import-mode-tabs" role="tablist" aria-label="新增账号方式">
-          <button type="button" role="tab" :aria-selected="importMode === 'manual'" :class="{ active: importMode === 'manual' }" @click="switchImportMode('manual')">手动</button>
-          <button type="button" role="tab" :aria-selected="importMode === 'upload'" :class="{ active: importMode === 'upload' }" @click="switchImportMode('upload')">上传</button>
-          <button type="button" role="tab" :aria-selected="importMode === 'batch'" :class="{ active: importMode === 'batch' }" @click="switchImportMode('batch')">批量导入</button>
-          <button type="button" role="tab" :aria-selected="importMode === 'convert'" :class="{ active: importMode === 'convert' }" @click="switchImportMode('convert')">凭据转换</button>
+    <AppDrawer :open="drawer === 'import'" wide kicker="ACCOUNT RECORD" title="新增账号" @close="requestCloseDrawer">
+      <form class="admin-form pool-account-importer" :aria-busy="saving" :inert="saving" @submit.prevent="submitImport">
+        <nav class="admin-page-tabs import-mode-tabs" role="tablist" aria-label="新增账号方式" aria-orientation="horizontal">
+          <button id="pool-import-tab-manual" type="button" role="tab" aria-controls="pool-import-panel-manual" :aria-selected="importMode === 'manual'" :tabindex="importMode === 'manual' ? 0 : -1" :class="{ active: importMode === 'manual' }" @keydown="onImportTabKeydown($event, 'manual')" @click="switchImportMode('manual')">手动</button>
+          <button id="pool-import-tab-upload" type="button" role="tab" aria-controls="pool-import-panel-upload" :aria-selected="importMode === 'upload'" :tabindex="importMode === 'upload' ? 0 : -1" :class="{ active: importMode === 'upload' }" @keydown="onImportTabKeydown($event, 'upload')" @click="switchImportMode('upload')">上传</button>
+          <button id="pool-import-tab-batch" type="button" role="tab" aria-controls="pool-import-panel-batch" :aria-selected="importMode === 'batch'" :tabindex="importMode === 'batch' ? 0 : -1" :class="{ active: importMode === 'batch' }" @keydown="onImportTabKeydown($event, 'batch')" @click="switchImportMode('batch')">批量导入</button>
+          <button id="pool-import-tab-convert" type="button" role="tab" aria-controls="pool-import-panel-convert" :aria-selected="importMode === 'convert'" :tabindex="importMode === 'convert' ? 0 : -1" :class="{ active: importMode === 'convert' }" @keydown="onImportTabKeydown($event, 'convert')" @click="switchImportMode('convert')">凭据转换</button>
         </nav>
 
-        <section v-if="importMode === 'manual'" class="pool-import-section">
+        <section v-if="importMode === 'manual'" id="pool-import-panel-manual" class="pool-import-section" role="tabpanel" aria-labelledby="pool-import-tab-manual" tabindex="0">
           <header><div><span>ACCOUNT</span><h3>账号资料</h3></div><small>身份、登录凭据与接码</small></header>
           <div class="form-grid"><label><span>邮箱 *</span><input v-model="manualForm.email" type="email" required autocomplete="off"></label><label><span>姓名</span><input v-model="manualForm.displayName" maxlength="120"></label></div>
           <div class="form-grid"><label><span>来源 *</span><AppSelect v-model="manualForm.source" required><option value="" disabled>请选择来源</option><option v-for="source in ACCOUNT_VAULT_SOURCES.filter(item => item !== 'unknown')" :key="source" :value="source">{{ accountSourceLabels[source] }}</option></AppSelect></label><label><span>账号状态</span><AppSelect v-model="manualForm.status"><option v-for="status in ACCOUNT_VAULT_STATUSES" :key="status" :value="status">{{ status }}</option></AppSelect></label></div>
@@ -420,7 +578,7 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
           <label><span>备注</span><textarea v-model="manualForm.remark" maxlength="2000" rows="4" /></label>
         </section>
 
-        <section v-else-if="importMode === 'batch'" class="pool-import-section pool-batch-import">
+        <section v-else-if="importMode === 'batch'" id="pool-import-panel-batch" class="pool-import-section pool-batch-import" role="tabpanel" aria-labelledby="pool-import-tab-batch" tabindex="0">
           <header><div><span>BATCH</span><h3>批量数据</h3></div><small>结构化发货文本</small></header>
           <div class="delivery-config-grid"><label><span>来源 *</span><AppSelect v-model="deliverySource" :disabled="saving"><option value="" disabled>请选择来源</option><option v-for="source in ACCOUNT_VAULT_SOURCES.filter(item => item !== 'unknown')" :key="source" :value="source">{{ accountSourceLabels[source] }}</option></AppSelect></label><fieldset class="delivery-field-picker"><legend>本批包含的字段</legend><div><label v-for="field in deliveryFieldOptions" :key="field.value"><input type="checkbox" :checked="deliveryFields.includes(field.value)" :disabled="field.value === 'email' || saving" @change="toggleDeliveryField(field.value)"><span>{{ field.label }}</span></label></div></fieldset></div>
           <fieldset class="delivery-field-order"><legend>字段顺序</legend><ol><li v-for="(field, index) in deliveryFields" :key="field"><code>{{ index + 1 }}</code><span>{{ deliveryFieldLabels[field] }}</span><button type="button" title="上移字段" :disabled="index === 0 || saving" @click="moveDeliveryField(field, -1)"><IconArrowUp :size="14" /></button><button type="button" title="下移字段" :disabled="index === deliveryFields.length - 1 || saving" @click="moveDeliveryField(field, 1)"><IconArrowDown :size="14" /></button></li></ol><small>每行按照以上顺序使用 <code>----</code> 分隔。</small></fieldset>
@@ -428,7 +586,7 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
           <div class="pool-batch-layout"><label><span>发货内容 *</span><textarea v-model="deliveryText" required rows="12" spellcheck="false" :placeholder="selectedDeliveryFormat.placeholder" /></label><aside><header><div><span>PREVIEW</span><h3>导入预览</h3><small>{{ selectedDeliveryFormat.label }}</small></div><code>{{ deliveryPreview.length }}</code></header><div v-if="deliveryPreview.length" class="vault-delivery-preview"><div v-for="item in deliveryPreview.slice(0, 50)" :key="item.index" :data-valid="item.valid"><code>{{ item.email }}</code><span>{{ item.kind }}</span></div><small v-if="deliveryPreview.length > 50">另有 {{ deliveryPreview.length - 50 }} 条待导入</small></div><div v-else class="account-editor-empty">暂无可预览账号</div></aside></div>
         </section>
 
-        <section v-else class="pool-import-section credential-editor">
+        <section v-else :id="`pool-import-panel-${importMode}`" class="pool-import-section credential-editor" role="tabpanel" :aria-labelledby="`pool-import-tab-${importMode}`" tabindex="0">
           <header><div><span>{{ importMode === 'upload' ? 'UPLOAD' : 'CREDENTIALS' }}</span><h3>{{ importMode === 'upload' ? '上传内容' : '凭据来源' }}</h3><small>{{ importMode === 'upload' ? 'Sub2API 账号 JSON' : 'Session 或认证 JSON' }}</small></div><label class="button button--quiet button--small"><IconCloudUpload :size="15" />选择文件<input type="file" accept="application/json,.json" :multiple="importMode === 'convert'" hidden @change="credentialFile"></label></header>
           <label v-if="importMode === 'upload'"><span>号池平台 *</span><AppSelect model-value="sub2api" disabled><option value="sub2api">Sub2API</option></AppSelect><small>用户专属号池固定导入当前账号的 Sub2API 隔离分组。</small></label>
           <div class="credential-selection" :data-selected="Boolean(credentialFileName)"><IconFileCode :size="20" /><div><strong>{{ credentialFileName || '尚未选择文件' }}</strong><small>{{ importRows.length ? `已解析 ${importRows.length} 个账号` : importMode === 'upload' ? '支持完整导出包、批量账号或单账号 JSON' : '最多 20 个 JSON 文件' }}</small></div></div>
@@ -439,21 +597,31 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
         </section>
 
         <p v-if="importNotice" class="form-notice">{{ importNotice }}</p><p v-if="error || deliveryError" class="form-error pre-line">{{ error || deliveryError }}</p>
-        <footer><span v-if="importMode === 'batch'">{{ deliveryPreview.length }} 个账号</span><span v-else-if="importMode === 'upload' || importMode === 'convert'">{{ importRows.length }} 个账号</span><button type="button" class="button button--secondary" @click="drawer = null">取消</button><button class="button button--primary" :disabled="saving || (importMode === 'batch' ? !deliverySource || Boolean(deliveryConfigurationError) || !deliveryPreview.length : (importMode === 'upload' || importMode === 'convert') ? !importReady : false)">{{ saving ? '处理中' : importMode === 'manual' ? '保存账号' : importMode === 'batch' ? '确认导入' : '导入并停用' }}</button></footer>
+        <footer><span v-if="importMode === 'batch'">{{ deliveryPreview.length }} 个账号</span><span v-else-if="importMode === 'upload' || importMode === 'convert'">{{ importRows.length }} 个账号</span><button type="button" class="button button--secondary" :disabled="saving" @click="requestCloseDrawer">取消</button><button class="button button--primary" :disabled="saving || (importMode === 'batch' ? !deliverySource || Boolean(deliveryConfigurationError) || !deliveryPreview.length : (importMode === 'upload' || importMode === 'convert') ? !importReady : false)">{{ saving ? '处理中' : importMode === 'manual' ? '保存账号' : importMode === 'batch' ? '确认导入' : '导入并停用' }}</button></footer>
       </form>
     </AppDrawer>
 
-    <AppDrawer :open="drawer === 'oauth'" kicker="SUB2API OAUTH" title="Auth 登录" @close="drawer = null"><form class="admin-form" @submit.prevent="oauth.flowId ? completeOAuth() : startOAuth"><template v-if="!oauth.flowId"><p class="pool-drawer-copy">通过 OpenAI Auth 完成授权，账号会进入当前专属分组，授权完成后先保持不可调度。</p><div class="form-grid"><label><span>账号名称</span><input v-model="oauth.name" placeholder="留空时使用 OpenAI 账号邮箱"></label></div></template><template v-else><section class="oauth-link-section"><header><div><h3>授权链接</h3><span>{{ oauth.expiresAt ? `有效至 ${date(oauth.expiresAt)}` : '15 分钟内有效' }}</span></div><div><button type="button" class="button button--quiet button--small" @click="copyUrl"><IconCopy :size="15" />复制</button><button type="button" class="button button--secondary button--small" @click="openUrl"><IconExternalLink :size="15" />打开</button></div></header><input :value="oauth.authorizationUrl" readonly aria-label="OpenAI 授权链接" @focus="selectOAuthUrl"></section><label><span>localhost 回调 URL *</span><textarea v-model="oauth.callbackUrl" rows="5" required spellcheck="false" placeholder="http://localhost:1455/auth/callback?code=...&state=..."></textarea></label></template><p v-if="oauthError" class="form-error">{{ oauthError }}</p><footer><button type="button" class="button button--secondary" @click="drawer = null">取消</button><button v-if="oauth.flowId" type="button" class="button button--quiet" @click="openOAuth">重新生成</button><button class="button button--primary" :disabled="saving || (Boolean(oauth.flowId) && !oauth.callbackUrl.trim())"><IconLogin2 :size="16" />{{ saving ? '处理中' : oauth.flowId ? '完成授权' : '生成授权链接' }}</button></footer></form></AppDrawer>
+    <AppDrawer :open="drawer === 'oauth'" kicker="SUB2API OAUTH" title="Auth 登录" @close="requestCloseDrawer"><form class="admin-form" :aria-busy="saving" :inert="saving" @submit.prevent="oauth.flowId ? completeOAuth() : startOAuth"><template v-if="!oauth.flowId"><p class="pool-drawer-copy">通过 OpenAI Auth 完成授权，账号会进入当前专属分组，授权完成后先保持不可调度。</p><div class="form-grid"><label><span>账号名称</span><input v-model="oauth.name" placeholder="留空时使用 OpenAI 账号邮箱"></label></div></template><template v-else><section class="oauth-link-section"><header><div><h3>授权链接</h3><span>{{ oauth.expiresAt ? `有效至 ${date(oauth.expiresAt)}` : '15 分钟内有效' }}</span></div><div><button type="button" class="button button--quiet button--small" @click="copyUrl"><IconCopy :size="15" />复制</button><button type="button" class="button button--secondary button--small" @click="openUrl"><IconExternalLink :size="15" />打开</button></div></header><input :value="oauth.authorizationUrl" readonly aria-label="OpenAI 授权链接" @focus="selectOAuthUrl"></section><label><span>localhost 回调 URL *</span><textarea v-model="oauth.callbackUrl" rows="5" required spellcheck="false" placeholder="http://localhost:1455/auth/callback?code=...&state=..."></textarea></label></template><p v-if="oauthError" class="form-error">{{ oauthError }}</p><footer><button type="button" class="button button--secondary" :disabled="saving" @click="requestCloseDrawer">取消</button><button v-if="oauth.flowId" type="button" class="button button--quiet" :disabled="saving" @click="openOAuth">重新生成</button><button class="button button--primary" :disabled="saving || (Boolean(oauth.flowId) && !oauth.callbackUrl.trim())"><IconLogin2 :size="16" />{{ saving ? '处理中' : oauth.flowId ? '完成授权' : '生成授权链接' }}</button></footer></form></AppDrawer>
 
-    <AppDrawer v-if="editing" :open="drawer === 'edit'" kicker="SUB2API ACCOUNT" :title="`编辑 ${editing.displayName}`" @close="drawer = null"><form class="admin-form" @submit.prevent="saveEdit"><label><span>账号名称 *</span><input v-model="editForm.displayName" required maxlength="160"></label><label><span>接码手机号</span><AppSelect v-model="editReceiverId"><option value="">不绑定接码</option><option v-for="item in receivers.filter(receiver => receiver.status === 'active' && (receiver.availableSlots > 0 || receiver.id === receiverForAccount(editing!.id)?.id))" :key="item.id" :value="item.id">{{ item.phone }} · {{ item.availableSlots }} 个空余</option></AppSelect></label><label class="switch"><input v-model="editForm.schedulable" type="checkbox"><span />允许调度</label><p class="pool-drawer-copy">平台、账号类型和所属分组由专属号池托管，不能在用户侧修改。</p><p v-if="error" class="form-error">{{ error }}</p><footer><button type="button" class="button button--secondary" @click="drawer = null">取消</button><button class="button button--primary" :disabled="saving">{{ saving ? '保存中' : '保存配置' }}</button></footer></form></AppDrawer>
-    <AppDrawer :open="drawer === 'receiver'" kicker="SMS RECEIVER" :title="editingReceiver ? '编辑接码' : '新增接码'" @close="drawer = null"><form class="admin-form" @submit.prevent="saveReceiver"><nav v-if="!editingReceiver" class="admin-page-tabs import-mode-tabs" role="tablist" aria-label="接码新增方式"><button type="button" role="tab" :aria-selected="receiverCreateMode === 'single'" :class="{ active: receiverCreateMode === 'single' }" @click="receiverCreateMode = 'single'">单个添加</button><button type="button" role="tab" :aria-selected="receiverCreateMode === 'batch'" :class="{ active: receiverCreateMode === 'batch' }" @click="receiverCreateMode = 'batch'">批量导入</button></nav><template v-if="editingReceiver || receiverCreateMode === 'single'"><label><span>接码手机号 *</span><input v-model="receiverForm.phone" required maxlength="40" inputmode="tel"></label><label><span>{{ editingReceiver ? '接码接口 URL（留空保持不变）' : '接码接口 URL *' }}</span><input v-model="receiverForm.fetchUrl" type="url" :required="!editingReceiver" maxlength="3000" placeholder="https://"></label><label><span>备注</span><input v-model="receiverForm.note" maxlength="500"></label><label class="switch"><input v-model="receiverForm.active" type="checkbox"><span />启用接码</label></template><label v-else><span>批量内容 *</span><textarea v-model="receiverImportText" rows="10" required spellcheck="false" placeholder="手机号|接码接口 URL&#10;手机号|接码接口 URL"></textarea></label><p v-if="receiverError" class="form-error pre-line">{{ receiverError }}</p><footer><button type="button" class="button button--secondary" @click="drawer = null">取消</button><button class="button button--primary" :disabled="receiverBusy">{{ receiverBusy ? '保存中' : editingReceiver ? '保存接码' : receiverCreateMode === 'batch' ? '批量导入' : '新增接码' }}</button></footer></form></AppDrawer>
+    <AppDrawer v-if="editing" :open="drawer === 'edit'" kicker="SUB2API ACCOUNT" :title="`编辑 ${editing.displayName}`" @close="requestCloseDrawer"><form class="admin-form" :aria-busy="saving" :inert="saving" @submit.prevent="saveEdit"><label><span>账号名称 *</span><input v-model="editForm.displayName" required maxlength="160"></label><label><span>接码手机号</span><AppSelect v-model="editReceiverId"><option value="">不绑定接码</option><option v-for="item in receivers.filter(receiver => receiver.status === 'active' && (receiver.availableSlots > 0 || receiver.id === receiverForAccount(editing!.id)?.id))" :key="item.id" :value="item.id">{{ item.phone }} · {{ item.availableSlots }} 个空余</option></AppSelect></label><label class="switch"><input v-model="editForm.schedulable" type="checkbox"><span />允许调度</label><p class="pool-drawer-copy">平台、账号类型和所属分组由专属号池托管，不能在用户侧修改。</p><p v-if="error" class="form-error">{{ error }}</p><footer><button type="button" class="button button--secondary" :disabled="saving" @click="requestCloseDrawer">取消</button><button class="button button--primary" :disabled="saving">{{ saving ? '保存中' : '保存配置' }}</button></footer></form></AppDrawer>
+    <AppDrawer :open="drawer === 'receiver'" kicker="SMS RECEIVER" :title="editingReceiver ? '编辑接码' : '新增接码'" @close="requestCloseDrawer">
+      <form class="admin-form" :aria-busy="receiverBusy" :inert="receiverBusy" @submit.prevent="saveReceiver">
+        <nav v-if="!editingReceiver" class="admin-page-tabs import-mode-tabs" role="tablist" aria-label="接码新增方式" aria-orientation="horizontal"><button id="receiver-create-tab-single" type="button" role="tab" aria-controls="receiver-create-panel-single" :aria-selected="receiverCreateMode === 'single'" :tabindex="receiverCreateMode === 'single' ? 0 : -1" :class="{ active: receiverCreateMode === 'single' }" @keydown="onReceiverCreateTabKeydown($event, 'single')" @click="switchReceiverCreateMode('single')">单个添加</button><button id="receiver-create-tab-batch" type="button" role="tab" aria-controls="receiver-create-panel-batch" :aria-selected="receiverCreateMode === 'batch'" :tabindex="receiverCreateMode === 'batch' ? 0 : -1" :class="{ active: receiverCreateMode === 'batch' }" @keydown="onReceiverCreateTabKeydown($event, 'batch')" @click="switchReceiverCreateMode('batch')">批量导入</button></nav>
+        <section v-if="editingReceiver || receiverCreateMode === 'single'" id="receiver-create-panel-single" class="receiver-create-panel" :role="editingReceiver ? undefined : 'tabpanel'" :aria-labelledby="editingReceiver ? undefined : 'receiver-create-tab-single'" :tabindex="editingReceiver ? undefined : 0"><label><span>接码手机号 *</span><input v-model="receiverForm.phone" required maxlength="40" inputmode="tel"></label><label><span>{{ editingReceiver ? '接码接口 URL（留空保持不变）' : '接码接口 URL *' }}</span><input v-model="receiverForm.fetchUrl" type="url" :required="!editingReceiver" maxlength="3000" placeholder="https://"></label><label><span>备注</span><input v-model="receiverForm.note" maxlength="500"></label><label class="switch"><input v-model="receiverForm.active" type="checkbox"><span />启用接码</label></section>
+        <section v-else id="receiver-create-panel-batch" class="receiver-create-panel" role="tabpanel" aria-labelledby="receiver-create-tab-batch" tabindex="0"><label><span>批量内容 *</span><textarea v-model="receiverImportText" rows="10" required spellcheck="false" placeholder="手机号|接码接口 URL&#10;手机号|接码接口 URL"></textarea></label></section>
+        <p v-if="receiverError" class="form-error pre-line">{{ receiverError }}</p><footer><button type="button" class="button button--secondary" :disabled="receiverBusy" @click="requestCloseDrawer">取消</button><button class="button button--primary" :disabled="receiverBusy">{{ receiverBusy ? '保存中' : editingReceiver ? '保存接码' : receiverCreateMode === 'batch' ? '批量导入' : '新增接码' }}</button></footer>
+      </form>
+    </AppDrawer>
     <AppConfirmDialog :open="Boolean(deleting)" title="删除账号" :message="`删除“${deleting?.displayName || ''}”后，该账号会从专属号池移除。`" :busy="loading" @close="deleting = null" @confirm="remove" />
+    <AppConfirmDialog :open="Boolean(deletingReceiver)" title="删除接码" :message="`删除“${deletingReceiver?.phone || ''}”后，该接码资源将无法继续接收验证码。`" confirm-label="删除接码" confirm-tone="danger" :busy="receiverBusy" @close="deletingReceiver = null" @confirm="confirmDeleteReceiver" />
   </div>
 </template>
 
 <style scoped>
 .pool-page { width:100%; }
 .pool-tabs { margin-bottom:1rem; }
+.pool-tab-panel { min-width:0; }
+.receiver-create-panel { display:grid; gap:.75rem; }
 .pool-status-line { margin:0 0 .75rem; display:flex; flex-wrap:wrap; align-items:center; gap:.25rem .55rem; color:var(--text-muted); font-size:.7rem; line-height:1.5; }
 .pool-status-line > span { display:inline-flex; align-items:center; gap:.25rem; }
 .pool-status-line > span + span::before { content:'·'; margin-right:.3rem; color:var(--line-strong); }

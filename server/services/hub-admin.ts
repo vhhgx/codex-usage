@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm'
 import type { H3Event } from 'h3'
-import type { ChannelCacheSliceView, ChannelCacheView, ChannelModelView, ChannelProtocol, ChannelProtocolBindingView, ChannelType, ChannelView, HubKeyCredentialView, HubKeyView, KeyRouteMode } from '#shared/types/hub'
+import type { ChannelCacheSliceView, ChannelCacheView, ChannelModelView, ChannelProtocol, ChannelProtocolBindingView, ChannelType, ChannelView, HubKeyCredentialView, HubKeyView, KeyRouteMode, RelayCapabilityMode } from '#shared/types/hub'
 import { supportsImagePricing } from '#shared/utils/model-capabilities'
 import { useDatabase } from '../db'
 import { channelGroupGrants, channelModelBindings, channelModelPrices, channelModels, channelProtocolBindings, channels, channelUserGrants, groupMemberships, groups, hubKeyCredentials, hubKeys, keyChannelRules, keyModelRules, modelPools, modelPrices, usageRollups, users } from '../db/schema'
@@ -18,6 +18,10 @@ function text(value: unknown, max = 500) {
   return typeof value === 'string' ? value.trim().slice(0, max) : ''
 }
 
+function normalizeCapabilityMode(value: unknown): RelayCapabilityMode {
+  return value === 'responses_via_chat' || value === 'unsupported' ? value : 'native'
+}
+
 function integer(value: unknown, min: number, max: number, fallback: number) {
   const parsed = Number(value)
   return Number.isInteger(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback
@@ -27,6 +31,13 @@ function nullableInteger(value: unknown, min = 0) {
   if (value === null || value === undefined || value === '') return null
   const parsed = Number(value)
   return Number.isSafeInteger(parsed) && parsed >= min ? parsed : null
+}
+
+export function channelUpdateInvalidatesHealth(body: Record<string, unknown>) {
+  return 'baseUrl' in body
+    || 'protocols' in body
+    || 'clientIdentityMode' in body
+    || Boolean(text(body.apiKey, 2000))
 }
 
 function nullableMoney(value: unknown) {
@@ -271,7 +282,9 @@ export function parseChannelProtocols(value: unknown, type: ChannelType): Array<
       authScheme: item.authScheme === 'x_api_key' || protocol === 'anthropic_messages' && item.authScheme !== 'bearer' ? 'x_api_key' as const : 'bearer' as const,
       apiVersion: text(item.apiVersion, 100) || (protocol === 'anthropic_messages' ? '2023-06-01' : null),
       probeModel: text(item.probeModel, 200) || null,
-      capabilityMode: (item.capabilityMode === 'responses_via_chat' || item.capabilityMode === 'unsupported' ? item.capabilityMode : 'native') as ChannelProtocolBindingView['capabilityMode']
+      capabilityMode: item.capabilityMode === undefined
+        ? undefined
+        : (item.capabilityMode === 'responses_via_chat' || item.capabilityMode === 'unsupported' ? item.capabilityMode : 'native') as ChannelProtocolBindingView['capabilityMode']
     }]
   })
   return [...new Map(parsed.map(binding => [binding.protocol, binding])).values()]
@@ -311,42 +324,179 @@ export function parseChannelModels(value: unknown): ChannelModelView[] {
   return [...new Map(parsed.map(model => [model.publicModel, model])).values()]
 }
 
+export function channelProtocolBindingConfigurationChanged(
+  current: Pick<typeof channelProtocolBindings.$inferSelect, 'enabled' | 'baseUrlOverride' | 'authScheme' | 'apiVersion' | 'probeModel' | 'capabilityMode'>,
+  desired: Pick<ChannelProtocolBindingView, 'enabled' | 'baseUrlOverride' | 'authScheme' | 'apiVersion' | 'probeModel' | 'capabilityMode'>
+) {
+  const transportChanged = current.enabled !== desired.enabled
+    || current.baseUrlOverride !== desired.baseUrlOverride
+    || current.authScheme !== desired.authScheme
+    || current.apiVersion !== desired.apiVersion
+    || current.probeModel !== desired.probeModel
+  const currentMode = normalizeCapabilityMode(current.capabilityMode)
+  const requestedMode: RelayCapabilityMode = desired.capabilityMode || currentMode
+  // capabilityMode is derived by protocol detection. Older clients may omit
+  // it (or send the native default) while editing an otherwise unchanged
+  // binding; retain a previously detected conversion/unsupported state.
+  const effectiveMode: RelayCapabilityMode = !transportChanged && currentMode !== 'native' && requestedMode === 'native'
+    ? currentMode
+    : requestedMode
+  return transportChanged || effectiveMode !== currentMode
+}
+
+export function channelProtocolSetChanged(
+  current: Array<Pick<typeof channelProtocolBindings.$inferSelect, 'protocol' | 'enabled' | 'baseUrlOverride' | 'authScheme' | 'apiVersion' | 'probeModel' | 'capabilityMode'>>,
+  desired: Array<Pick<ChannelProtocolBindingView, 'protocol' | 'enabled' | 'baseUrlOverride' | 'authScheme' | 'apiVersion' | 'probeModel' | 'capabilityMode'>>
+) {
+  if (current.length !== desired.length) return true
+  return desired.some((item) => {
+    const previous = current.find(binding => binding.protocol === item.protocol)
+    return !previous || channelProtocolBindingConfigurationChanged(previous, item)
+  })
+}
+
 export async function replaceChannelProtocols(event: H3Event, channelId: string, protocols: ReturnType<typeof parseChannelProtocols>) {
   const db = useDatabase(event)
-  await db.delete(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, channelId))
-  if (!protocols.length) return []
-  return db.insert(channelProtocolBindings).values(protocols.map(protocol => ({ ...protocol, channelId }))).returning()
+  const existing = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, channelId))
+  const desired = [...new Map(protocols.map(protocol => [protocol.protocol, protocol])).values()]
+  const desiredProtocols = new Set(desired.map(protocol => protocol.protocol))
+  const removed = existing.filter(binding => !desiredProtocols.has(binding.protocol))
+  if (removed.length) await db.delete(channelProtocolBindings).where(inArray(channelProtocolBindings.id, removed.map(binding => binding.id)))
+
+  const rows: Array<typeof channelProtocolBindings.$inferSelect> = []
+  for (const protocol of desired) {
+    const current = existing.find(binding => binding.protocol === protocol.protocol)
+    const currentCapabilityMode = normalizeCapabilityMode(current?.capabilityMode)
+    const capabilityMode: RelayCapabilityMode = protocol.capabilityMode || currentCapabilityMode
+    const transportChanged = Boolean(current && (
+      current.enabled !== protocol.enabled
+      || current.baseUrlOverride !== protocol.baseUrlOverride
+      || current.authScheme !== protocol.authScheme
+      || current.apiVersion !== protocol.apiVersion
+      || current.probeModel !== protocol.probeModel
+    ))
+    const derivedCapabilityMode: RelayCapabilityMode = !transportChanged && current && currentCapabilityMode !== 'native' && capabilityMode === 'native'
+      ? currentCapabilityMode
+      : capabilityMode
+    const verificationChanged = !current || channelProtocolBindingConfigurationChanged(current, { ...protocol, capabilityMode: derivedCapabilityMode })
+    const values = {
+      enabled: protocol.enabled,
+      baseUrlOverride: protocol.baseUrlOverride,
+      authScheme: protocol.authScheme,
+      apiVersion: protocol.apiVersion,
+      probeModel: protocol.probeModel,
+      capabilityMode: derivedCapabilityMode,
+      // Preserve a successful (or pending-real-client) result when the
+      // transport configuration is unchanged. Editing a channel name, price,
+      // or other unrelated field must not silently remove it from routing.
+      ...(verificationChanged
+        ? { verificationStatus: 'unknown' as const, detectedAt: null, verifiedAt: null, lastError: null }
+        : { verificationStatus: current!.verificationStatus, detectedAt: current!.detectedAt, verifiedAt: current!.verifiedAt, lastError: current!.lastError }),
+      updatedAt: new Date()
+    }
+    if (current) {
+      await db.update(channelProtocolBindings).set(values).where(eq(channelProtocolBindings.id, current.id))
+      rows.push({ ...current, ...values })
+    } else {
+      const [created] = await db.insert(channelProtocolBindings).values({ ...protocol, ...values, channelId }).returning()
+      if (created) rows.push(created)
+    }
+  }
+  return rows
+}
+
+/**
+ * Resolve a per-protocol upstream model while distinguishing inherited values
+ * from an explicit protocol override. The UI sends the existing bindings back
+ * when editing a model, so blindly preferring that value leaves bindings on
+ * the old upstream model after a top-level mapping change.
+ */
+export function resolveChannelModelBindingUpstreamModel(input: {
+  currentModel: string | null | undefined
+  nextModel: string
+  currentBinding: string | null | undefined
+  override: string | null | undefined
+}) {
+  const { currentModel, nextModel, currentBinding, override } = input
+  if (currentModel && currentModel !== nextModel && currentBinding === currentModel) {
+    // An override equal to the old top-level value is the stale value emitted
+    // by the edit form; an actually different value is an intentional lane
+    // override and must remain untouched.
+    if (!override || override === currentModel) return nextModel
+  }
+  return override || currentBinding || nextModel
 }
 
 export async function replaceChannelModels(event: H3Event, channelId: string, models: ChannelModelView[], protocols: Array<typeof channelProtocolBindings.$inferSelect>) {
   const db = useDatabase(event)
-  await db.delete(channelModels).where(eq(channelModels.channelId, channelId))
-  for (const model of models) {
-    const [created] = await db.insert(channelModels).values({
-      channelId,
+  const existingModels = await db.select().from(channelModels).where(eq(channelModels.channelId, channelId))
+  const existingBindings = await db.select({ binding: channelModelBindings, protocol: channelProtocolBindings.protocol })
+    .from(channelModelBindings)
+    .innerJoin(channelProtocolBindings, eq(channelModelBindings.protocolBindingId, channelProtocolBindings.id))
+    .where(inArray(channelModelBindings.channelModelId, existingModels.map(model => model.id)))
+  const bindingsByModel = new Map<string, Map<ChannelProtocol, typeof existingBindings[number]['binding']>>()
+  for (const row of existingBindings) {
+    const byProtocol = bindingsByModel.get(row.binding.channelModelId) || new Map<ChannelProtocol, typeof row.binding>()
+    byProtocol.set(row.protocol, row.binding)
+    bindingsByModel.set(row.binding.channelModelId, byProtocol)
+  }
+
+  const desired = [...new Map(models.filter(model => model.publicModel && model.upstreamModel).map(model => [model.publicModel, model])).values()]
+  const desiredPublicModels = new Set(desired.map(model => model.publicModel))
+  const removed = existingModels.filter(model => !desiredPublicModels.has(model.publicModel))
+  if (removed.length) await db.delete(channelModels).where(inArray(channelModels.id, removed.map(model => model.id)))
+
+  for (const model of desired) {
+    const current = existingModels.find(item => item.publicModel === model.publicModel)
+    const values = {
       publicModel: model.publicModel,
       upstreamModel: model.upstreamModel,
-      canonicalModel: model.canonicalModel || canonicalModelId(model.upstreamModel),
-      vendorFamily: model.vendorFamily || modelVendorFamily(model.upstreamModel),
-      modelRevision: model.modelRevision || modelRevision(model.upstreamModel),
-      mappingKind: model.mappingKind || inferMappingKind(model.publicModel, model.upstreamModel),
+      canonicalModel: model.canonicalModel || current?.canonicalModel || canonicalModelId(model.upstreamModel),
+      vendorFamily: model.vendorFamily || current?.vendorFamily || modelVendorFamily(model.upstreamModel),
+      modelRevision: model.modelRevision || current?.modelRevision || modelRevision(model.upstreamModel),
+      mappingKind: model.mappingKind || current?.mappingKind || inferMappingKind(model.publicModel, model.upstreamModel),
       enabled: model.enabled,
-      endpoints: model.endpoints
-    }).returning()
-    if (!created) continue
+      endpoints: model.endpoints,
+      updatedAt: new Date()
+    }
+    let persisted = current
+    if (current) {
+      await db.update(channelModels).set(values).where(eq(channelModels.id, current.id))
+      persisted = { ...current, ...values }
+    } else {
+      const [created] = await db.insert(channelModels).values({ channelId, ...values }).returning()
+      persisted = created
+    }
+    if (!persisted) continue
+
+    const currentByProtocol = bindingsByModel.get(persisted.id) || new Map<ChannelProtocol, typeof existingBindings[number]['binding']>()
+    const explicitBindings = model.protocolBindings !== undefined
     const overrides = new Map((model.protocolBindings || []).map(binding => [binding.protocol, binding]))
-    const bindings = protocols.flatMap((protocol) => {
-      const override = overrides.get(protocol.protocol)
-      if (model.protocolBindings?.length && !override) return []
-      return [{
-        channelModelId: created.id,
-        protocolBindingId: protocol.id,
-        upstreamModel: override?.upstreamModel || model.upstreamModel,
-        enabled: override?.enabled ?? model.enabled,
-        capabilities: override?.capabilities || { streaming: true, tools: true }
-      }]
-    })
-    if (bindings.length) await db.insert(channelModelBindings).values(bindings)
+    if (explicitBindings) {
+      const staleBindings = [...currentByProtocol.entries()].filter(([protocol]) => !overrides.has(protocol) || !protocols.some(item => item.protocol === protocol))
+      if (staleBindings.length) await db.delete(channelModelBindings).where(inArray(channelModelBindings.id, staleBindings.map(([, binding]) => binding.id)))
+    }
+    for (const protocol of protocols) {
+      const override = explicitBindings ? overrides.get(protocol.protocol) : undefined
+      if (explicitBindings && !override) continue
+      const currentBinding = currentByProtocol.get(protocol.protocol)
+      const bindingValues = {
+        upstreamModel: resolveChannelModelBindingUpstreamModel({
+          currentModel: current?.upstreamModel,
+          nextModel: model.upstreamModel,
+          currentBinding: currentBinding?.upstreamModel,
+          override: override?.upstreamModel
+        }),
+        enabled: override?.enabled ?? currentBinding?.enabled ?? (model.enabled && protocol.enabled),
+        capabilities: override?.capabilities || currentBinding?.capabilities || { streaming: true, tools: true },
+        updatedAt: new Date()
+      }
+      if (currentBinding) {
+        await db.update(channelModelBindings).set(bindingValues).where(eq(channelModelBindings.id, currentBinding.id))
+      } else {
+        await db.insert(channelModelBindings).values({ channelModelId: persisted.id, protocolBindingId: protocol.id, ...bindingValues })
+      }
+    }
     await db.insert(modelPools).values({ publicModel: model.publicModel }).onConflictDoNothing()
   }
 }
@@ -418,6 +568,16 @@ export async function updateChannelRecord(event: H3Event, id: string, body: Unkn
   const [existing] = await db.select().from(channels).where(eq(channels.id, id)).limit(1)
   if (!existing) throw createError({ statusCode: 404, message: '渠道不存在' })
   const patch: Partial<typeof channels.$inferInsert> = { updatedAt: new Date() }
+  const existingProtocols = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, id))
+  let nextProtocols: ReturnType<typeof parseChannelProtocols> = existingProtocols.map(binding => ({
+    protocol: binding.protocol,
+    enabled: binding.enabled,
+    baseUrlOverride: binding.baseUrlOverride,
+    authScheme: binding.authScheme,
+    apiVersion: binding.apiVersion,
+    probeModel: binding.probeModel,
+    capabilityMode: normalizeCapabilityMode(binding.capabilityMode)
+  }))
   if ('name' in body) patch.name = text(body.name, 120) || existing.name
   if ('baseUrl' in body) {
     const baseUrl = text(body.baseUrl, 1000).replace(/\/+$/, '')
@@ -432,14 +592,23 @@ export async function updateChannelRecord(event: H3Event, id: string, body: Unkn
   if ('timeoutMs' in body) patch.timeoutMs = integer(body.timeoutMs, 1000, 600000, existing.timeoutMs)
   if ('priceMultiplier' in body) patch.priceMultiplier = String(nonnegativeNumber(body.priceMultiplier, Number(existing.priceMultiplier)))
   if ('clientIdentityMode' in body) patch.clientIdentityMode = body.clientIdentityMode === 'passthrough' ? 'passthrough' : 'standard'
-  if ('clientIdentityMode' in body) {
+  let protocolChanged = false
+  if ('protocols' in body) {
+    nextProtocols = parseChannelProtocols(body.protocols, existing.type)
+    protocolChanged = channelProtocolSetChanged(existingProtocols, nextProtocols)
+  }
+  const connectionChanged = ('baseUrl' in body && patch.baseUrl !== existing.baseUrl)
+    || Boolean(text(body.apiKey, 2000))
+    || ('clientIdentityMode' in body && patch.clientIdentityMode !== existing.clientIdentityMode)
+    || protocolChanged
+  if (connectionChanged) {
     patch.healthStatus = 'unknown'
     patch.lastHealthError = null
   }
   const requestedAccessScope = body.accessScope === 'restricted' ? 'restricted' as const : 'all' as const
   await db.update(channels).set(patch).where(eq(channels.id, id))
-  let protocolRows = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, id))
-  if ('protocols' in body) protocolRows = await replaceChannelProtocols(event, id, parseChannelProtocols(body.protocols, existing.type))
+  let protocolRows = existingProtocols
+  if ('protocols' in body) protocolRows = await replaceChannelProtocols(event, id, nextProtocols)
   if ('models' in body) {
     const models = parseChannelModels(body.models)
     if (!models.length) throw createError({ statusCode: 400, message: '请先获取模型或至少手工添加一个模型' })

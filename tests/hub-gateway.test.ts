@@ -1,7 +1,8 @@
 import { EventEmitter } from 'node:events'
+import { Readable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { contentHash, createHubKey, decryptSecret, encryptSecret, hashHubKey } from '../server/utils/hub-crypto'
-import { endpointName, extractUsage, normalizeUpstreamError, readUpstreamChunk, replaceMultipartModel, sanitizeArchiveBody, writeResponseChunk } from '../server/services/hub-gateway'
+import { budgetUpstreamReadableStream, createUpstreamResponseBudget, endpointName, extractUsage, normalizeResponseForArchive, normalizeUpstreamError, readRequestBodyLimited, readUpstreamBodyLimited, readUpstreamChunk, replaceMultipartModel, reserveBodyMemory, sanitizeArchiveBody, UPSTREAM_RESPONSE_LIMITS, writeResponseChunk } from '../server/services/hub-gateway'
 import { resolveAnalyticsRange } from '../server/services/hub-analytics'
 import { startOfZoned, zonedDateKey } from '../server/utils/time-zone'
 import { buildKeyActivityResponse, isKeyActivityRequest, keyActivityRange } from '../server/services/key-activity'
@@ -46,6 +47,149 @@ describe('OpenAI gateway normalization', () => {
     expect(controller.signal.aborted).toBe(true)
   })
 
+  it('rejects declared standard and error responses above their limits without buffering them', async () => {
+    for (const [limit, label] of [
+      [UPSTREAM_RESPONSE_LIMITS.standardBytes, 'Upstream response'],
+      [UPSTREAM_RESPONSE_LIMITS.errorBytes, 'Upstream error response']
+    ] as const) {
+      const controller = new AbortController()
+      const response = new Response('small body', {
+        headers: { 'content-length': String(limit + 1) }
+      })
+
+      await expect(readUpstreamBodyLimited(response, controller, limit, { label })).rejects.toMatchObject({
+        code: 'UPSTREAM_RESPONSE_TOO_LARGE',
+        statusCode: 502
+      })
+      expect(controller.signal.aborted).toBe(true)
+      expect(controller.signal.reason).toMatchObject({ code: 'UPSTREAM_RESPONSE_TOO_LARGE' })
+    }
+  })
+
+  it('aborts a streaming response immediately when its byte budget is exceeded', () => {
+    const controller = new AbortController()
+    const budget = createUpstreamResponseBudget(controller, { maxBytes: 5, label: 'Test stream' })
+    try {
+      expect(() => budget.accountBytes(6)).toThrow('Test stream exceeds 5 bytes')
+      expect(controller.signal.aborted).toBe(true)
+      expect(controller.signal.reason).toMatchObject({ code: 'UPSTREAM_RESPONSE_TOO_LARGE', statusCode: 502 })
+    } finally {
+      budget.finish()
+    }
+  })
+
+  it('tracks passthrough upstream and output bytes as independent lanes', () => {
+    const controller = new AbortController()
+    const budget = createUpstreamResponseBudget(controller, { maxBytes: 3, label: 'Test stream' })
+    try {
+      expect(budget.accountBytes(3, 'upstream')).toBe(3)
+      expect(budget.accountBytes(3, 'output')).toBe(3)
+      expect(budget.totals).toEqual({ upstream: 3, output: 3 })
+      expect(controller.signal.aborted).toBe(false)
+    } finally {
+      budget.finish()
+    }
+  })
+
+  it('aborts work blocked past the streaming response deadline', async () => {
+    const controller = new AbortController()
+    const budget = createUpstreamResponseBudget(controller, { maxBytes: 5, timeoutMs: 10, label: 'Test stream' })
+    try {
+      await expect(budget.guard(new Promise<never>(() => {}))).rejects.toMatchObject({
+        code: 'UPSTREAM_STREAM_TIMEOUT',
+        statusCode: 502
+      })
+      expect(controller.signal.aborted).toBe(true)
+      expect(controller.signal.reason).toMatchObject({ code: 'UPSTREAM_STREAM_TIMEOUT' })
+    } finally {
+      budget.finish()
+    }
+  })
+
+  it('counts every upstream body chunk and aborts when their total exceeds the limit', async () => {
+    const controller = new AbortController()
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(target) {
+        target.enqueue(Uint8Array.from([1, 2, 3]))
+        target.enqueue(Uint8Array.from([4, 5, 6]))
+        target.close()
+      }
+    }))
+
+    await expect(readUpstreamBodyLimited(response, controller, 5)).rejects.toMatchObject({
+      code: 'UPSTREAM_RESPONSE_TOO_LARGE',
+      statusCode: 502
+    })
+    expect(controller.signal.aborted).toBe(true)
+  })
+
+  it('does not wait for a stalled stream cancellation after exceeding the limit', async () => {
+    let finishCancellation: (() => void) | undefined
+    let cancellationStarted = false
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const cancellation = new Promise<void>((resolve) => { finishCancellation = resolve })
+    const controller = new AbortController()
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(target) {
+        target.enqueue(Uint8Array.from([1, 2, 3]))
+        target.enqueue(Uint8Array.from([4, 5, 6]))
+      },
+      cancel() {
+        cancellationStarted = true
+        return cancellation
+      }
+    }))
+    const didNotReturn = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error('response limit waited for stream cancellation')), 100)
+    })
+
+    try {
+      await expect(Promise.race([
+        readUpstreamBodyLimited(response, controller, 5),
+        didNotReturn
+      ])).rejects.toMatchObject({ code: 'UPSTREAM_RESPONSE_TOO_LARGE', statusCode: 502 })
+      expect(cancellationStarted).toBe(true)
+    } finally {
+      if (timeout) clearTimeout(timeout)
+      finishCancellation?.()
+    }
+  })
+
+  it('errors a budgeted conversion stream without waiting for upstream cancellation', async () => {
+    let finishCancellation: (() => void) | undefined
+    let cancellationStarted = false
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const cancellation = new Promise<void>((resolve) => { finishCancellation = resolve })
+    const controller = new AbortController()
+    const budget = createUpstreamResponseBudget(controller, { maxBytes: 5, label: 'Converted stream' })
+    const upstream = new ReadableStream<Uint8Array>({
+      start(target) {
+        target.enqueue(Uint8Array.from([1, 2, 3, 4, 5, 6]))
+      },
+      cancel() {
+        cancellationStarted = true
+        return cancellation
+      }
+    })
+    const reader = budgetUpstreamReadableStream(upstream, budget, 1000).getReader()
+    const didNotReturn = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error('conversion stream waited for upstream cancellation')), 100)
+    })
+
+    try {
+      await expect(Promise.race([reader.read(), didNotReturn])).rejects.toMatchObject({
+        code: 'UPSTREAM_RESPONSE_TOO_LARGE',
+        statusCode: 502
+      })
+      expect(cancellationStarted).toBe(true)
+      expect(controller.signal.aborted).toBe(true)
+    } finally {
+      if (timeout) clearTimeout(timeout)
+      finishCancellation?.()
+      budget.finish()
+    }
+  })
+
   it('stops waiting for response backpressure when the client closes', async () => {
     const response = Object.assign(new EventEmitter(), {
       destroyed: false,
@@ -55,6 +199,94 @@ describe('OpenAI gateway normalization', () => {
     const writing = writeResponseChunk(response, Buffer.from('chunk'))
     queueMicrotask(() => response.emit('close'))
     await expect(writing).resolves.toBe(false)
+  })
+
+  it('releases immediately without consuming capacity when the connection already closed', () => {
+    const request = new Readable({ read() {} })
+    request.destroy()
+    const response = Object.assign(new EventEmitter(), { destroyed: false, writableEnded: false })
+    const event = { node: { req: request, res: response } }
+    const memory = reserveBodyMemory(event as never, 64 * 1024 * 1024, () => { throw new Error('capacity exhausted') })
+
+    expect(memory.reservation).toEqual({ bytes: 0, released: true })
+    expect(() => memory.grow(1)).toThrow('Client connection closed while reading request body')
+
+    const activeRequest = new Readable({ read() {} })
+    const activeResponse = Object.assign(new EventEmitter(), { destroyed: false, writableEnded: false })
+    const activeEvent = { node: { req: activeRequest, res: activeResponse } }
+    const fullCapacity = reserveBodyMemory(activeEvent as never, 256 * 1024 * 1024, () => { throw new Error('capacity exhausted') })
+    try {
+      expect(fullCapacity.reservation.bytes).toBe(256 * 1024 * 1024)
+    } finally {
+      fullCapacity.release()
+      activeRequest.destroy()
+    }
+  })
+
+  it('rejects a request body that remains idle using a real memory reservation', async () => {
+    const request = new Readable({ read() {} })
+    const response = Object.assign(new EventEmitter(), { destroyed: false, writableEnded: false })
+    const event = { node: { req: request, res: response } }
+    const memory = reserveBodyMemory(event as never, 64)
+    const timeoutKinds: string[] = []
+    try {
+      await expect(readRequestBodyLimited(
+        event as never,
+        1024,
+        memory,
+        () => { throw new Error('too large') },
+        {
+          idleTimeoutMs: 10,
+          totalTimeoutMs: 1000,
+          onTimeout: (kind) => {
+            timeoutKinds.push(kind)
+            throw new Error('request body idle timeout')
+          }
+        }
+      )).rejects.toThrow('request body idle timeout')
+      expect(timeoutKinds).toEqual(['idle'])
+      expect(memory.reservation).toEqual({ bytes: 64, released: false })
+      response.emit('finish')
+      expect(memory.reservation.released).toBe(true)
+    } finally {
+      memory.release()
+      request.destroy()
+    }
+  })
+
+  it('enforces the total body deadline even while small chunks keep arriving', async () => {
+    let pump: ReturnType<typeof setInterval> | undefined
+    const request = new Readable({
+      read() {
+        pump ||= setInterval(() => this.push(Buffer.from('x')), 2)
+      }
+    })
+    const response = Object.assign(new EventEmitter(), { destroyed: false, writableEnded: false })
+    const event = { node: { req: request, res: response } }
+    const memory = reserveBodyMemory(event as never, 0)
+    const timeoutKinds: string[] = []
+    try {
+      await expect(readRequestBodyLimited(
+        event as never,
+        1024,
+        memory,
+        () => { throw new Error('too large') },
+        {
+          idleTimeoutMs: 200,
+          totalTimeoutMs: 30,
+          onTimeout: (kind) => {
+            timeoutKinds.push(kind)
+            throw new Error('request body total timeout')
+          }
+        }
+      )).rejects.toThrow('request body total timeout')
+      expect(timeoutKinds).toEqual(['total'])
+      expect(memory.reservation.bytes).toBeGreaterThan(0)
+    } finally {
+      if (pump) clearInterval(pump)
+      memory.release()
+      request.destroy()
+    }
   })
 
   it('discovers and normalizes OpenAI-compatible upstream models', async () => {
@@ -144,11 +376,39 @@ describe('OpenAI gateway normalization', () => {
     expect(extractUsage(Buffer.from('{"output":[{"type":"image_generation_call","result":"base64"}]}'), 'application/json').imageCount).toBe(1)
   })
 
-  it('normalizes non-OpenAI upstream errors and preserves compatible ones', () => {
+  it('normalizes non-OpenAI upstream errors and preserves compatible shapes', () => {
     const normalized = JSON.parse(normalizeUpstreamError(Buffer.from('{"message":"bad input"}'), 400).toString())
     expect(normalized.error).toMatchObject({ message: 'bad input', type: 'invalid_request_error', code: 'upstream_error' })
     const compatible = Buffer.from('{"error":{"message":"already compatible","type":"invalid_request_error"}}')
-    expect(normalizeUpstreamError(compatible, 400)).toBe(compatible)
+    expect(JSON.parse(normalizeUpstreamError(compatible, 400).toString())).toEqual({ error: { message: 'already compatible', type: 'invalid_request_error' } })
+  })
+
+  it('redacts reflected credentials from compatible upstream errors', () => {
+    const normalized = JSON.parse(normalizeUpstreamError(Buffer.from(JSON.stringify({
+      error: { message: 'Authorization: Bearer upstream-secret', setup_token: 'setup-secret' },
+      request: { api_key: 'sk-sensitive-value' }
+    })), 401).toString())
+    expect(JSON.stringify(normalized)).not.toContain('upstream-secret')
+    expect(JSON.stringify(normalized)).not.toContain('setup-secret')
+    expect(JSON.stringify(normalized)).not.toContain('sk-sensitive-value')
+    expect(normalized.error.message).toContain('[REDACTED]')
+  })
+
+  it('normalizes failed upstream responses before they become archivable', () => {
+    const upstream = Buffer.from(JSON.stringify({
+      error: { message: 'Authorization: Bearer platform-upstream-secret' },
+      request: { api_key: 'sk-platform-sensitive-value' }
+    }))
+    const archived = normalizeResponseForArchive(
+      upstream,
+      { ok: false, status: 401, statusText: 'Unauthorized' },
+      'application/problem+json'
+    )
+
+    expect(upstream.toString('utf8')).toContain('platform-upstream-secret')
+    expect(archived.contentType).toBe('application/json; charset=utf-8')
+    expect(archived.body.toString('utf8')).not.toContain('platform-upstream-secret')
+    expect(archived.body.toString('utf8')).not.toContain('sk-platform-sensitive-value')
   })
 
   it('replaces upstream errors with the configured client-facing message', () => {

@@ -1,14 +1,41 @@
 import { describe, expect, it } from 'vitest'
 import { interpretRelayCheckinResponse, newApiBalanceQuotaValues, normalizeUserRelayOrder, preferredModelDiscoveryProtocol, sortRelayAccounts } from '../server/services/user-relays'
-import { parseChannelProtocols } from '../server/services/hub-admin'
+import { parseChannelProtocols, resolveChannelModelBindingUpstreamModel } from '../server/services/hub-admin'
+import { relayPresetCapabilityMode, relayProviderPresets } from '../shared/relay-provider-presets'
 import { mergeUserFailoverSourceIds } from '../server/services/user-route-preferences'
 import { classifyRelayFailure, relayFailureAffectsAccount, relayFailureAllowsFailover } from '../server/services/relay-platform'
 
 describe('private relay protocol settings', () => {
+  it('marks Chat-only official presets as Responses-to-Chat capable', () => {
+    const deepseek = relayProviderPresets.find(preset => preset.id === 'deepseek')!
+    expect(relayPresetCapabilityMode(deepseek, 'openai_chat')).toBe('responses_via_chat')
+    expect(relayPresetCapabilityMode(deepseek, 'anthropic_messages')).toBe('native')
+    const openai = relayProviderPresets.find(preset => preset.id === 'openai')!
+    expect(relayPresetCapabilityMode(openai, 'openai_chat')).toBe('native')
+  })
+
+  it('updates inherited protocol model bindings when the top-level mapping changes', () => {
+    expect(resolveChannelModelBindingUpstreamModel({
+      currentModel: 'glm-5.3', nextModel: 'glm-5.4', currentBinding: 'glm-5.3', override: 'glm-5.3'
+    })).toBe('glm-5.4')
+    expect(resolveChannelModelBindingUpstreamModel({
+      currentModel: 'glm-5.3', nextModel: 'glm-5.4', currentBinding: 'glm-5.3', override: 'glm-5.3-chat'
+    })).toBe('glm-5.3-chat')
+    expect(resolveChannelModelBindingUpstreamModel({
+      currentModel: 'glm-5.3', nextModel: 'glm-5.3', currentBinding: 'glm-5.2', override: 'glm-5.2'
+    })).toBe('glm-5.2')
+  })
+
   it('uses the OpenAI protocol for the shared model catalog before a Messages override', () => {
     const messages = { protocol: 'anthropic_messages' as const, baseUrlOverride: 'https://api.deepseek.com/anthropic' }
     const chat = { protocol: 'openai_chat' as const, baseUrlOverride: null }
     expect(preferredModelDiscoveryProtocol([messages, chat])).toBe(chat)
+  })
+
+  it('does not select a disabled protocol for discovery', () => {
+    const disabledResponses = { protocol: 'openai_responses' as const, enabled: false }
+    const enabledChat = { protocol: 'openai_chat' as const, enabled: true }
+    expect(preferredModelDiscoveryProtocol([disabledResponses, enabledChat])).toBe(enabledChat)
   })
 
   it('preserves the probe model explicitly selected for each protocol', () => {

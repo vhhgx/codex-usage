@@ -73,7 +73,9 @@ async function uploadProbe(path) {
   const { response, headersMs, startedAt } = await fetchTimed('/v1/images/edits', { method: 'POST', body: form })
   await response.arrayBuffer()
   return {
-    ok: response.status !== 413 && response.status < 500,
+    // A 4xx response means the upload contract was rejected just as much as
+    // a 5xx response; only a successful HTTP response is a passing probe.
+    ok: response.ok,
     status: response.status,
     bytes: image.length,
     headersMs,

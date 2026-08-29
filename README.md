@@ -22,7 +22,7 @@ Zephyr Hub 是基于 Nuxt 4/Nitro 的 OpenAI 兼容聚合网关。它使用统�
 
 ## 系统要求
 
-- Node.js 20 或更高版本
+- Node.js 22.12 或更高版本
 - PostgreSQL 16+
 - Redis 7+
 - MinIO 或兼容 S3 的对象存储
@@ -138,7 +138,7 @@ npm run verify
 npm run test:hub-e2e
 npm run build
 npm run db:migrate
-node .output/server/index.mjs
+npm run start:production
 ```
 
 `test:hub-e2e` 使用本地 Compose 的 PostgreSQL、Redis 与 MinIO，在独立的
@@ -146,6 +146,12 @@ node .output/server/index.mjs
 日志归档及凭据加密测试。它还覆盖审计事务回滚、真实首字节、历史日汇总、指标和签名
 Webhook、Key 轮换/吊销、幂等重放/冲突、单请求成本保护、流量排空、审计查询及 CSV/JSON
 导出，结束后自动清理测试数据。
+
+`npm run start:production` 会先执行 `scripts/migrate.mjs`，再启动 Nitro。裸 Node 或
+PM2 部署不要直接运行 `node .output/server/index.mjs`，否则新增迁移不会自动执行；使用
+该启动脚本（并通过 `--env-file` 或进程环境提供生产配置）。仓库内的
+`ecosystem.config.cjs` 已指向同一启动脚本，并优先读取根目录 `.env`，没有时读取
+`deploy/hong-kong/.env`；也可以设置 `HUB_ENV_FILE` 指定绝对路径。
 
 真实 CPA/Sub2API 影子验证会复用后台中已配置的两个渠道，不需要把上游 Key 传给脚本：
 

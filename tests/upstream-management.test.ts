@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { classifyUpstreamFailure, operationFailureDetails, operationFingerprint, sanitizeOperationSummary } from '../server/services/upstream-operations'
 import { MAX_CREDENTIAL_BYTES, parseCredentialJson, safeCredentialPreview, validateSubCredentialAdapter } from '../server/utils/safe-json'
-import { redactSensitiveText } from '../server/utils/upstream'
+import { redactSensitivePayload, redactSensitiveText } from '../server/utils/upstream'
+import { channelProtocolBindingConfigurationChanged, channelProtocolSetChanged, channelUpdateInvalidatesHealth } from '../server/services/hub-admin'
+import { modelDiscoveryCompatibilityFallbackAllowed } from '../server/services/hub-model-discovery'
 import {
   upstreamOperationActionLabel,
   upstreamOperationConnectionLabel,
@@ -10,6 +12,29 @@ import {
 } from '../shared/utils/upstream-operation-view'
 
 describe('upstream credential safety', () => {
+  it('keeps protocol verification when a channel binding is unchanged', () => {
+    const current = { protocol: 'openai_chat' as const, enabled: true, baseUrlOverride: null, authScheme: 'bearer' as const, apiVersion: null, probeModel: 'gpt-5.6', capabilityMode: 'native' }
+    expect(channelProtocolBindingConfigurationChanged(current, { ...current })).toBe(false)
+    expect(channelProtocolSetChanged([current], [{ ...current }])).toBe(false)
+    expect(channelProtocolBindingConfigurationChanged(current, { ...current, probeModel: 'gpt-5.5' })).toBe(true)
+    expect(channelProtocolSetChanged([current], [])).toBe(true)
+  })
+
+  it('does not invent a discovery protocol when configured protocols are disabled', () => {
+    expect(modelDiscoveryCompatibilityFallbackAllowed([])).toBe(true)
+    expect(modelDiscoveryCompatibilityFallbackAllowed([{ enabled: false }])).toBe(false)
+    expect(modelDiscoveryCompatibilityFallbackAllowed([{ enabled: true }])).toBe(false)
+  })
+
+  it('invalidates stale channel health when connection settings are updated', () => {
+    expect(channelUpdateInvalidatesHealth({ name: 'renamed only' })).toBe(false)
+    expect(channelUpdateInvalidatesHealth({ apiKey: '' })).toBe(false)
+    expect(channelUpdateInvalidatesHealth({ baseUrl: 'https://new.example.com' })).toBe(true)
+    expect(channelUpdateInvalidatesHealth({ apiKey: 'new-secret' })).toBe(true)
+    expect(channelUpdateInvalidatesHealth({ protocols: [] })).toBe(true)
+    expect(channelUpdateInvalidatesHealth({ clientIdentityMode: 'passthrough' })).toBe(true)
+  })
+
   it('parses a bounded credential and returns only a hash plus explicit value', () => {
     const raw = Buffer.from(JSON.stringify({ type: 'codex', email: 'admin@example.com', access_token: 'secret' }))
     const parsed = parseCredentialJson(raw)
@@ -34,11 +59,24 @@ describe('upstream credential safety', () => {
   })
 
   it('redacts secrets from upstream error text', () => {
-    const safe = redactSensitiveText('failed: {"access_token":"top-secret","api_key":"sk-value"} Bearer abc.def http://hub:proxy-secret@proxy.test:8080')
+    const safe = redactSensitiveText('failed: {"access_token":"top-secret","api_key":"sk-value","setup_token":"setup-secret","credential":"credential-secret"} Bearer abc.def http://hub:proxy-secret@proxy.test:8080')
     expect(safe).not.toContain('top-secret')
     expect(safe).not.toContain('sk-value')
     expect(safe).not.toContain('proxy-secret')
+    expect(safe).not.toContain('setup-secret')
+    expect(safe).not.toContain('credential-secret')
     expect(safe).toContain('[REDACTED]')
+  })
+
+  it('recursively redacts sensitive fields without discarding error structure', () => {
+    const safe = redactSensitivePayload({
+      error: { type: 'authentication_error', message: 'Bearer raw-token', session_token: 'session-secret' },
+      nested: [{ client_secret: 'client-secret', detail: 'keep this detail', input_tokens: 128 }]
+    })
+    expect(safe).toEqual({
+      error: { type: 'authentication_error', message: 'Bearer [REDACTED]', session_token: '[REDACTED]' },
+      nested: [{ client_secret: '[REDACTED]', detail: 'keep this detail', input_tokens: 128 }]
+    })
   })
 
   it('drops credential-like fields from operation summaries', () => {

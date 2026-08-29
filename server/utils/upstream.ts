@@ -46,13 +46,32 @@ export function upstreamError(error: unknown, fallback: string): never {
   })
 }
 
-export function redactSensitiveText(value: unknown) {
+const SENSITIVE_FIELD = /^(?:authorization|proxy[-_]?authorization|x[-_]?api[-_]?key|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|session(?:[-_]?token)?|setup[-_]?token|token|password|passwd|secret|secret[-_]?key|credential|credentials|cookie|private[-_]?key|client[-_]?secret)$/i
+
+/**
+ * Redact secrets in free-form upstream text before it is persisted or shown
+ * to a client. The optional limit lets callers keep a useful diagnostic
+ * length while retaining the historical 500-character default.
+ */
+export function redactSensitiveText(value: unknown, limit = 500) {
+  const max = Math.max(0, Number.isFinite(limit) ? limit : 500)
   return String(value || '')
-    .slice(0, 2000)
+    .slice(0, Math.max(2000, max))
     .replace(/([a-z][a-z0-9+.-]*:\/\/[^:/\s]+:)[^@/\s]+@/gi, '$1[REDACTED]@')
-    .replace(/("?(?:access[_-]?token|refresh[_-]?token|api[_-]?key|password|secret|cookie|private[_-]?key)"?\s*[:=]\s*)"?[^",\s}]+"?/gi, '$1[REDACTED]')
+    .replace(/\b(authorization|proxy[-_]?authorization)\s*[:=]\s*(?:Bearer\s+)?[A-Za-z0-9._~+\/-]+/gi, '$1: [REDACTED]')
+    .replace(/["']?(?:authorization|proxy[-_]?authorization|x[-_]?api[-_]?key|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|session(?:[-_]?token)?|setup[-_]?token|token|password|passwd|secret|credential|cookie|private[-_]?key|client[-_]?secret)["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,\s}]+)/gi, match => match.replace(/([:=]\s*).+$/s, '$1[REDACTED]'))
     .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
     .replace(/\b(?:sk|zh)-[A-Za-z0-9._~+\/-]{12,}\b/g, '[REDACTED_KEY]')
     .replace(/\beyJ[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]+){1,2}\b/g, '[REDACTED_TOKEN]')
-    .slice(0, 500)
+    .slice(0, max)
+}
+
+/** Recursively redact JSON payloads while preserving their response shape. */
+export function redactSensitivePayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(item => redactSensitivePayload(item))
+  if (!value || typeof value !== 'object') return typeof value === 'string' ? redactSensitiveText(value) : value
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+    key,
+    SENSITIVE_FIELD.test(key) ? '[REDACTED]' : redactSensitivePayload(item)
+  ]))
 }

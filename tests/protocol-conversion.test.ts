@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { anthropicToOpenAiChat, anthropicUsage, openAiChatToAnthropic } from '../server/services/protocols/anthropic-openai'
 import { pipeOpenAiChatAsAnthropic } from '../server/services/protocols/anthropic-stream'
-import { compareRouteCandidates, keyRouteSources, modelMappingAllowsRouting, orderedRouteSourceNodes } from '../server/services/hub-routing'
+import { advanceRouteFailoverState, compareRouteCandidates, keyRouteSources, modelMappingAllowsRouting, orderedRouteSourceNodes, packagePolicyAllowsRouteSource, type RouteFailoverState } from '../server/services/hub-routing'
 import { ChatToResponsesStream, chatToResponsesResponse, responsesToChatRequest } from '../server/services/protocols/responses-chat'
 
 describe('Anthropic and OpenAI protocol conversion', () => {
@@ -86,6 +86,17 @@ describe('Anthropic and OpenAI protocol conversion', () => {
     expect(orderedRouteSourceNodes('private_only', order).map(item => item.id)).toEqual(['relay:first', 'private_pool', 'relay:last'])
   })
 
+  it('keeps user relays in mixed failover when the subscription only supplies platform resources', () => {
+    const policy = {
+      hasActiveSubscription: true,
+      packageSupplyMode: 'platform_only',
+      packageDecisionSource: 'platform' as const
+    }
+    expect(packagePolicyAllowsRouteSource('platform', policy)).toBe(true)
+    expect(packagePolicyAllowsRouteSource('user_relay', policy)).toBe(true)
+    expect(packagePolicyAllowsRouteSource('private_pool', policy)).toBe(false)
+  })
+
   it('uses the dragged relay position before protocol conversion quality', () => {
     const convertedFirst = { channel: { priority: 10, name: 'first' }, conversionMode: 'anthropic_to_openai' as const }
     const directSecond = { channel: { priority: 20, name: 'second' }, conversionMode: 'passthrough' as const }
@@ -98,6 +109,29 @@ describe('Anthropic and OpenAI protocol conversion', () => {
     expect(modelMappingAllowsRouting('substitution', 'platform')).toBe(false)
     expect(modelMappingAllowsRouting('substitution', 'platform', true)).toBe(true)
     expect(modelMappingAllowsRouting('identity', 'platform')).toBe(true)
+  })
+
+  it('counts actual route candidate switches separately from retries', () => {
+    const candidate = (channelId: string, protocolBindingId: string, upstreamModel: string, credentialRef?: string) => ({
+      channel: { id: channelId },
+      protocolBinding: { id: protocolBindingId },
+      upstreamModel,
+      credentialRef
+    })
+    let state: RouteFailoverState = { candidateKey: null, count: 0 }
+    const first = candidate('channel-1', 'protocol-1', 'model-1', 'account-1')
+
+    state = advanceRouteFailoverState(state, first)
+    expect(state.count).toBe(0)
+
+    state = advanceRouteFailoverState(state, first)
+    expect(state.count).toBe(0)
+
+    state = advanceRouteFailoverState(state, candidate('channel-2', 'protocol-2', 'model-1', 'account-2'))
+    expect(state.count).toBe(1)
+
+    state = advanceRouteFailoverState(state, candidate('channel-2', 'protocol-2', 'model-2', 'account-2'))
+    expect(state.count).toBe(2)
   })
 
   it('produces valid Anthropic SSE across arbitrary input chunks', async () => {

@@ -40,6 +40,45 @@ export interface SupplyDecision {
   poolGroupId?: string
 }
 
+export interface RouteFailoverState {
+  candidateKey: string | null
+  count: number
+}
+
+type RouteFailoverCandidate = Pick<RouteCandidate, 'upstreamModel' | 'credentialRef'> & {
+  channel: Pick<RouteCandidate['channel'], 'id'>
+  protocolBinding: Pick<RouteCandidate['protocolBinding'], 'id'>
+}
+
+export function advanceRouteFailoverState(state: RouteFailoverState, candidate: RouteFailoverCandidate): RouteFailoverState {
+  const candidateKey = JSON.stringify([
+    candidate.channel.id,
+    candidate.protocolBinding.id,
+    candidate.upstreamModel,
+    candidate.credentialRef || ''
+  ])
+  if (state.candidateKey === null) return { candidateKey, count: state.count }
+  if (state.candidateKey === candidateKey) return state
+  return { candidateKey, count: state.count + 1 }
+}
+
+export function packagePolicyAllowsRouteSource(
+  source: RouteCandidate['supplySource'],
+  input: {
+    hasActiveSubscription: boolean
+    packageSupplyMode: string
+    packageDecisionSource: SupplyDecision['source'] | null
+  }
+) {
+  // A user's own relay is governed by the Key's failover mode and saved
+  // source order. Plan supplyMode only selects between package capacity and
+  // the plan-backed private pool; it must not remove an independently owned
+  // relay from a mixed failover chain.
+  if (source === 'user_relay') return true
+  if (source === 'platform') return input.packageDecisionSource === 'platform'
+  return !input.hasActiveSubscription || input.packageSupplyMode !== 'platform_only'
+}
+
 export function channelHealthAllowsRouting(channel: Pick<typeof channels.$inferSelect, 'healthStatus'>) {
   return channel.healthStatus === 'healthy'
 }
@@ -48,7 +87,9 @@ function channelCanRoute(channel: typeof channels.$inferSelect) {
   // A user's newly added relay has no health result yet. Let the first real
   // request validate it; failed relays remain blocked by the unhealthy state
   // and circuit breaker.
-  return channel.ownerKind === 'user' && channel.healthStatus === 'unknown' || channelHealthAllowsRouting(channel)
+  return channel.ownerKind === 'user' && channel.healthStatus === 'unknown'
+    || channelHealthAllowsRouting(channel)
+    || channel.ownerKind === 'platform' && channel.healthStatus === 'unknown' && channel.clientIdentityMode === 'passthrough'
 }
 
 type CandidateOrderValue = Pick<RouteCandidate, 'conversionMode'> & { channel: Pick<RouteCandidate['channel'], 'priority' | 'name'> }
@@ -212,7 +253,10 @@ export async function routeCandidates(
           : row.channel.ownerKind === 'platform' && row.channel.type === 'sub2api'
       return channelCanRoute(row.channel)
         && modelMappingAllowsRouting(row.model.mappingKind, supplySource, options.substitution === true)
-        && (supplySource !== 'user_relay' || row.protocolBinding.verificationStatus !== 'failed')
+        // A failed protocol binding is never eligible, regardless of whether
+        // the channel belongs to a user or is a shared platform channel. The
+        // channel health flag is intentionally coarser than protocol health.
+        && row.protocolBinding.verificationStatus !== 'failed'
         && (supplySource !== 'user_relay' || row.accountState?.routingState === undefined || row.accountState.routingState === 'active')
         && (supplySource !== 'user_relay' || row.relayGroup?.enabled !== false)
         && (!options.userId || visibleIds.has(row.channel.id) || supplySource === 'private_pool')

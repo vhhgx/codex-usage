@@ -9,5 +9,10 @@ logs
 .env
 .env.*
 !.env.example
+LOCAL_TEST_CREDENTIALS.md
+backup/
+*.dump
+*.sql.gz
+*.tar.gz
 deploy/edge/tls
 deploy/hong-kong/tls

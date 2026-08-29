@@ -19,6 +19,15 @@ describe('upstream authentication compatibility', () => {
     expect(request.mock.calls.map(call => call[0])).toEqual(['bearer', 'x_api_key'])
   })
 
+  it('continues with the alternate scheme when the first only works with CLI identity', async () => {
+    const request = vi.fn(async (scheme: 'bearer' | 'x_api_key') => scheme === 'bearer'
+      ? { ok: true, status: 200, body: '{}', identityOnly: true }
+      : { ok: true, status: 200, body: '{}' })
+    const result = await probeAuthSchemes('bearer', request)
+    expect(result).toMatchObject({ ok: true, selectedAuthScheme: 'x_api_key', changed: true })
+    expect(request.mock.calls.map(call => call[0])).toEqual(['bearer', 'x_api_key'])
+  })
+
   it('does not overwrite the configured scheme when both attempts fail', async () => {
     const request = vi.fn(async () => ({ ok: false, status: 401, body: 'unauthorized' }))
     const result = await probeAuthSchemes('x_api_key', request)

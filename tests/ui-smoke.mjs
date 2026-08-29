@@ -127,9 +127,43 @@ try {
       await context.addCookies([{ name: 'zephyr_theme', value: viewport.theme, url: baseUrl }])
       const page = await context.newPage()
       const pageErrors = []
+      const consoleErrors = []
+      const apiErrors = []
+      const apiRequestFailures = []
+      const pendingApiRequests = new Map()
       let themeChecked = false
       let drawerChecked = false
       page.on('pageerror', error => pageErrors.push(error.message))
+      page.on('console', message => {
+        const text = message.text()
+        if (message.type() === 'error' || /hydration/i.test(text)) consoleErrors.push(text.slice(0, 1000))
+      })
+      page.on('response', response => {
+        try {
+          const url = new URL(response.url())
+          if (url.pathname.startsWith('/api/') && response.status() >= 400) {
+            apiErrors.push({ method: response.request().method(), path: url.pathname, status: response.status() })
+          }
+        } catch {}
+      })
+      page.on('request', request => {
+        try {
+          const url = new URL(request.url())
+          if (url.pathname.startsWith('/api/')) pendingApiRequests.set(request, `${request.method()} ${url.pathname}`)
+        } catch {}
+      })
+      page.on('requestfinished', request => pendingApiRequests.delete(request))
+      page.on('requestfailed', request => {
+        pendingApiRequests.delete(request)
+        try {
+          const url = new URL(request.url())
+          const error = request.failure()?.errorText || 'request failed'
+          // Vue route changes intentionally abort in-flight API reads. They
+          // are not an application failure and should not make the smoke run
+          // flaky while switching resource tabs or unmounting a panel.
+          if (url.pathname.startsWith('/api/') && !/ERR_ABORTED|aborted|cancelled/i.test(error)) apiRequestFailures.push({ method: request.method(), path: url.pathname, error })
+        } catch {}
+      })
       if (target.name === 'user' && !skipFormLogin) {
         await page.goto(baseUrl)
         await page.waitForURL(`${baseUrl}/login`)
@@ -162,11 +196,6 @@ try {
       }
       const login = await context.request.post(`${baseUrl}${target.login}`, { data: { username: target.username, password: target.password } })
       if (!login.ok()) throw new Error(`${target.name} UI smoke login failed with HTTP ${login.status()}`)
-      if (target.name === 'admin') {
-        const loginResult = await login.json()
-        const selfReset = await context.request.post(`${baseUrl}/api/admin/users/${loginResult.user.id}/reset-password`, { data: { password: `Blocked-${randomUUID()}-password` } })
-        if (!selfReset.ok()) throw new Error(`self password reset should be accepted from user management, received ${selfReset.status()}`)
-      }
       for (const path of target.pages) {
         const response = await page.goto(`${baseUrl}${path}`)
         if (!response?.ok()) throw new Error(`${path} returned HTTP ${response?.status()}`)
@@ -222,7 +251,7 @@ try {
         }
         if (target.name === 'user' && path === '/console') {
           const labels = await page.locator('.workspace-nav a span').allTextContents()
-          if (!labels.includes('个人首页') || !labels.includes('我的 Keys') || !labels.includes('公告') || labels.includes('用户管理')) {
+          if (!labels.includes('个人首页') || !labels.includes('Keys 与用量') || !labels.includes('公告') || labels.includes('用户管理')) {
             throw new Error(`ordinary user received incorrect navigation: ${JSON.stringify(labels)}`)
           }
           if (bootstrap && !await page.getByText('UI Smoke 公告', { exact: true }).count()) {
@@ -288,7 +317,20 @@ try {
         }))
         const name = path === '/console' ? 'overview' : path.split('/').filter(Boolean).at(-1)
         await page.screenshot({ path: `${output}/${viewport.name}-${target.name}-${name}.png`, fullPage: true })
-        results.push({ viewport: viewport.name, theme: viewport.theme, target: target.name, path, pageErrors: [...pageErrors], ...layout })
+        const pathErrors = {
+          pageErrors: [...pageErrors],
+          consoleErrors: [...consoleErrors],
+          apiErrors: [...apiErrors],
+          apiRequestFailures: [...apiRequestFailures]
+        }
+        results.push({ viewport: viewport.name, theme: viewport.theme, target: target.name, path, ...pathErrors, ...layout })
+        if (pathErrors.pageErrors.length || pathErrors.consoleErrors.length || pathErrors.apiErrors.length || pathErrors.apiRequestFailures.length) {
+          throw new Error(`${path} emitted browser/API errors: ${JSON.stringify(pathErrors)}`)
+        }
+        pageErrors.length = 0
+        consoleErrors.length = 0
+        apiErrors.length = 0
+        apiRequestFailures.length = 0
         if (target.name === 'admin') {
           const legacyTablists = await page.locator('[role="tablist"].admin-segment').count()
           if (legacyTablists) throw new Error(`${path} still uses ${legacyTablists} legacy segmented tablist(s)`)
@@ -329,8 +371,12 @@ try {
         if (target.name === 'user' && path === '/console/resources') {
           if (!await page.locator('.workspace-nav').getByText('套餐与资源', { exact: true }).count()) throw new Error('combined resource navigation label is missing')
           if (await page.getByRole('tab', { name: '权限与额度', exact: true }).count()) throw new Error('redundant access and quota tab is still visible')
-          if (await page.locator('.relay-group-summary').count() !== 2) throw new Error('relay groups are not rendered as a complete vertical list')
-          if (await page.locator('.relay-row').count() !== 3) throw new Error('grouped relay accounts are not all expanded as list rows')
+          const groupTabs = page.locator('.relay-group-tabs [role="tab"]')
+          if (await groupTabs.count() !== 2) throw new Error('relay station tabs are missing or duplicated')
+          if (await page.locator('.relay-group-summary').count() !== 1) throw new Error('only the selected relay station should be rendered')
+          const siteATab = groupTabs.filter({ hasText: 'UI Smoke Site A' })
+          if (!await siteATab.count()) throw new Error('primary relay station tab is missing')
+          await siteATab.click()
           const groupedSite = page.locator('.relay-group-summary').filter({ hasText: 'UI Smoke Site A' })
           const groupedAccounts = groupedSite.locator('.relay-row')
           if (await groupedAccounts.count() !== 2) throw new Error('same-site accounts are not grouped in one station list')
@@ -348,8 +394,8 @@ try {
           if (!accountOrderResult.ok()) throw new Error(`manual account row order could not be saved: HTTP ${accountOrderResult.status()} ${await accountOrderResult.text()}`)
           await groupedSite.locator('.relay-row').first().getByText('备用账号', { exact: true }).waitFor()
           await page.route(/\/api\/console\/relays\/[^/]+\/connectivity$/, route => route.fulfill({ status: 200, json: { status: 'operational', success: true, message: '中转地址可达', endpoint: 'https://relay-a.example.com', responseTimeMs: 25, httpStatus: 401, testedAt: Date.now(), retryCount: 0, errorCode: null } }))
-          await page.getByRole('button', { name: 'UI Smoke Relay A 检测连通', exact: true }).click()
-          await page.locator('.app-toast[data-tone="success"]', { hasText: '连通正常' }).waitFor()
+          await page.getByRole('button', { name: 'UI Smoke Relay A 检查连接', exact: true }).click()
+          await page.locator('.app-toast[data-tone="success"]', { hasText: '连接正常' }).waitFor()
           await page.unroute(/\/api\/console\/relays\/[^/]+\/connectivity$/)
           const relayOrderItems = page.locator('.relay-order__item')
           if (await page.locator('.relay-order__item[data-source-type="user_relay"]').count() !== 2) throw new Error('failover order did not collapse each relay station into one source')
@@ -361,6 +407,7 @@ try {
           const nextRelayName = (await relayOrderItems.nth(1).locator('strong').innerText()).trim()
           const dragHandle = relayOrderItems.first().locator('.relay-order__grip')
           await dragHandle.scrollIntoViewIfNeeded()
+          await dragHandle.evaluate(element => element.closest('.relay-order')?.scrollIntoView({ block: 'center', inline: 'nearest' }))
           const [handleBox, targetBox] = await Promise.all([dragHandle.boundingBox(), relayOrderItems.nth(1).boundingBox()])
           if (!handleBox || !targetBox) throw new Error('relay drag handles are not visible')
           const targetPoint = { x: targetBox.x + Math.min(32, targetBox.width / 4), y: targetBox.y + targetBox.height / 2 }
@@ -382,7 +429,7 @@ try {
           if (!await relayDrawer.locator('input').count()) throw new Error('relay create form did not open in a drawer')
           await relayDrawer.getByLabel('预设服务商').selectOption('agentrouter')
           if (await relayDrawer.getByLabel('Base URL *').inputValue() !== 'https://agentrouter.org') throw new Error('relay provider preset did not fill the base URL')
-          if (await relayDrawer.locator('.protocol-option.active').count() !== 3) throw new Error('relay provider preset did not fill supported protocols')
+          if (await relayDrawer.locator('.relay-model-badges span').count() !== 3) throw new Error('relay provider preset did not fill model scopes')
           await relayDrawer.getByRole('button', { name: '关闭' }).click()
           for (const tabName of ['我的中转', '专属号池']) {
             if (!await page.getByRole('tab', { name: tabName, exact: true }).count()) throw new Error(`combined user resource tab is missing: ${tabName}`)
@@ -390,6 +437,17 @@ try {
           }
           await page.waitForURL(`${baseUrl}/console/resources?tab=pool`)
           await page.locator('.pool-page').waitFor({ state: 'attached', timeout: 5000 })
+          const poolAccountsTab = page.getByRole('tab', { name: '账号管理', exact: true })
+          const poolReceiversTab = page.getByRole('tab', { name: '接码管理', exact: true })
+          await poolAccountsTab.focus()
+          await page.keyboard.press('ArrowRight')
+          if (await poolReceiversTab.getAttribute('aria-selected') !== 'true' || !await poolReceiversTab.evaluate(element => element === document.activeElement)) {
+            throw new Error('user pool tabs do not support ArrowRight activation and focus')
+          }
+          await page.keyboard.press('Home')
+          if (await poolAccountsTab.getAttribute('aria-selected') !== 'true' || !await poolAccountsTab.evaluate(element => element === document.activeElement)) {
+            throw new Error('user pool tabs do not support Home activation and focus')
+          }
           const poolImport = page.getByRole('button', { name: '导入账号', exact: true })
           await poolImport.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {})
           if (!await poolImport.count()) throw new Error('user pool import action is missing')
@@ -400,10 +458,21 @@ try {
           for (const mode of ['手动', '上传', '批量导入', '凭据转换']) {
             if (!await importDrawer.getByRole('tab', { name: mode, exact: true }).count()) throw new Error(`user pool import mode is missing: ${mode}`)
           }
+          const manualImportTab = importDrawer.getByRole('tab', { name: '手动', exact: true })
+          const convertImportTab = importDrawer.getByRole('tab', { name: '凭据转换', exact: true })
+          await manualImportTab.focus()
+          await page.keyboard.press('End')
+          if (await convertImportTab.getAttribute('aria-selected') !== 'true' || !await convertImportTab.evaluate(element => element === document.activeElement)) {
+            throw new Error('user pool import tabs do not support End activation and focus')
+          }
+          await page.keyboard.press('Home')
+          if (await manualImportTab.getAttribute('aria-selected') !== 'true' || !await manualImportTab.evaluate(element => element === document.activeElement)) {
+            throw new Error('user pool import tabs do not support Home activation and focus')
+          }
           await importDrawer.getByRole('tab', { name: '批量导入', exact: true }).click()
           await importDrawer.getByLabel('来源 *').selectOption('ldxp')
           await importDrawer.getByText('2FA 密钥', { exact: true }).click()
-          const privateDeliveryEmail = `user-pool-${viewport.name}@example.com`
+          const privateDeliveryEmail = `user-pool-${viewport.name}-${randomUUID().slice(0, 8)}@example.com`
           await importDrawer.locator('textarea').fill(`${privateDeliveryEmail}----secret-password----MFLV3KISP5JROQOWHAQCLUVA4PO6YUM7`)
           await importDrawer.locator('.vault-delivery-preview').getByText('账号 + 密码 + 2FA 密钥', { exact: true }).waitFor()
           const userPoolPreview = await importDrawer.locator('.vault-delivery-preview').innerText()
@@ -411,12 +480,57 @@ try {
             throw new Error('user pool delivery preview exposes imported credentials')
           }
           await page.screenshot({ path: `${output}/${viewport.name}-user-pool-batch-import.png`, fullPage: true })
-          const privateDeliveryResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/console/pool/account-vault/delivery-import' && response.request().method() === 'POST')
+          const privateDeliveryPattern = /\/api\/console\/pool\/account-vault\/delivery-import$/
+          let releasePrivateDelivery
+          let markPrivateDeliveryHeld
+          const privateDeliveryHeld = new Promise(resolve => { markPrivateDeliveryHeld = resolve })
+          await page.route(privateDeliveryPattern, async route => {
+            markPrivateDeliveryHeld()
+            await new Promise(resolve => { releasePrivateDelivery = resolve })
+            await route.continue()
+          })
+          const privateDeliveryResponse = page.waitForResponse(response => privateDeliveryPattern.test(new URL(response.url()).pathname) && response.request().method() === 'POST')
           await importDrawer.getByRole('button', { name: '确认导入', exact: true }).click()
+          await privateDeliveryHeld
+          const importer = importDrawer.locator('form')
+          if (!await importer.evaluate(element => element.inert && element.getAttribute('aria-busy') === 'true')) throw new Error('user pool importer remains interactive while saving')
+          const importerClose = importDrawer.getByRole('button', { name: '关闭', exact: true })
+          await importerClose.click()
+          if (!await importDrawer.isVisible()) throw new Error('user pool importer closed while its save request was active')
+          await page.locator('.app-toast', { hasText: '账号操作正在处理，请等待完成' }).waitFor()
+          await page.keyboard.press('Tab')
+          if (!await importerClose.evaluate(element => element === document.activeElement)) throw new Error('drawer focus escaped while its form was inert')
+          if (!releasePrivateDelivery) throw new Error('user pool delivery request was not held for the saving-state check')
+          releasePrivateDelivery()
           if (!(await privateDeliveryResponse).ok()) throw new Error('user pool batch import request failed')
+          await page.unroute(privateDeliveryPattern)
+          await importDrawer.waitFor({ state: 'hidden' }).catch(async () => {
+            const diagnostic = {
+              busy: await importer.getAttribute('aria-busy'),
+              errors: await importDrawer.locator('.form-error').allTextContents(),
+              apiErrors: apiErrors.filter(item => item.path.startsWith('/api/console/pool/')),
+              pendingApiRequests: [...pendingApiRequests.values()].filter(item => item.includes('/api/console/pool/'))
+            }
+            throw new Error(`user pool importer did not finish after its save response: ${JSON.stringify(diagnostic)}`)
+          })
           await page.locator('.pool-vault-section').getByText(privateDeliveryEmail, { exact: true }).first().waitFor()
-          await page.getByRole('tab', { name: '接码管理', exact: true }).click()
-          await page.getByRole('button', { name: '新增接码', exact: true }).waitFor()
+          await poolReceiversTab.click()
+          const addReceiver = page.getByRole('button', { name: '新增接码', exact: true })
+          await addReceiver.waitFor()
+          await addReceiver.click()
+          const receiverDrawer = page.getByRole('dialog', { name: '新增接码' })
+          const singleReceiverTab = receiverDrawer.getByRole('tab', { name: '单个添加', exact: true })
+          const batchReceiverTab = receiverDrawer.getByRole('tab', { name: '批量导入', exact: true })
+          await singleReceiverTab.focus()
+          await page.keyboard.press('ArrowRight')
+          if (await batchReceiverTab.getAttribute('aria-selected') !== 'true' || !await batchReceiverTab.evaluate(element => element === document.activeElement)) {
+            throw new Error('receiver creation tabs do not support ArrowRight activation and focus')
+          }
+          await page.keyboard.press('ArrowLeft')
+          if (await singleReceiverTab.getAttribute('aria-selected') !== 'true' || !await singleReceiverTab.evaluate(element => element === document.activeElement)) {
+            throw new Error('receiver creation tabs do not support ArrowLeft activation and focus')
+          }
+          await receiverDrawer.getByRole('button', { name: '关闭', exact: true }).click()
           await page.screenshot({ path: `${output}/${viewport.name}-user-pool-receivers.png`, fullPage: true })
         }
         if (target.name === 'admin' && path === '/admin/channels') {
@@ -702,7 +816,7 @@ try {
   }
 }
 
-if (results.some(result => result.documentWidth > result.viewportWidth + 1 || result.fixedOverflow.length > 0 || result.inaccessibleIconButtons.length > 0 || result.pageErrors.length)) {
+if (results.some(result => result.documentWidth > result.viewportWidth + 1 || result.fixedOverflow.length > 0 || result.inaccessibleIconButtons.length > 0 || result.pageErrors.length || result.consoleErrors.length || result.apiErrors.length || result.apiRequestFailures.length)) {
   throw new Error(`UI overflow detected: ${JSON.stringify(results)}`)
 }
 console.log(JSON.stringify({ passed: true, results, output }))

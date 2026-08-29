@@ -13,6 +13,9 @@ const CONCURRENCY_LEASE_RENEW_MS = 60 * 1000
 
 export interface HubConcurrencyLease {
   id: string
+  /** Unique operation namespace; base and subscription admissions have
+   * different leases even when they belong to one request. */
+  settlementKey: string
   keyId: string
   groupId: string | null
   scopePrefixes: string[]
@@ -117,9 +120,13 @@ async function periodUsage(event: H3Event | undefined, scope: AdmissionScope, pe
     : scope.kind === 'group'
       ? eq(usageRollups.groupId, scope.id)
       : eq(usageRollups.userId, scope.usageOwnerId!)
+  // Subscription limits only count traffic paid for by the platform. Requests
+  // served by a user's own relay or private pool must not consume package
+  // quota, even though their rollups belong to the same user.
+  const supplyCondition = scope.kind === 'subscription' ? eq(usageRollups.supplySource, 'platform') : undefined
   const condition = start
-    ? and(dimension, eq(usageRollups.granularity, 'day'), gte(usageRollups.bucketStart, start))
-    : and(dimension, eq(usageRollups.granularity, 'day'))
+    ? and(dimension, eq(usageRollups.granularity, 'day'), gte(usageRollups.bucketStart, start), supplyCondition)
+    : and(dimension, eq(usageRollups.granularity, 'day'), supplyCondition)
   const [usage] = await useDatabase(event).select({
     requests: sql<number>`coalesce(sum(${usageRollups.admittedRequests}), 0)`,
     tokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}), 0)`,
@@ -267,6 +274,66 @@ end
 return 'ok'
 `
 
+// Settlement/cancellation are retried from several error paths. Keep the
+// counter adjustment and its once-only marker in the same Redis script so a
+// repeated catch cannot double-charge a request.
+const SETTLE_SCRIPT = `
+local settledKey = KEYS[1]
+local cancelledKey = KEYS[2]
+if redis.call('EXISTS', settledKey) == 1 or redis.call('EXISTS', cancelledKey) == 1 then return 0 end
+local prefixCount = tonumber(ARGV[1])
+local counterCount = tonumber(ARGV[2])
+local totalTokens = tonumber(ARGV[3])
+local reservedTokens = tonumber(ARGV[4])
+local cost = tonumber(ARGV[5])
+local reservedCost = tonumber(ARGV[6])
+local leaseId = ARGV[7]
+local markerTtl = tonumber(ARGV[8])
+local keyIndex = 3
+for index = 1, prefixCount do
+  redis.call('ZREM', KEYS[keyIndex], leaseId)
+  keyIndex = keyIndex + 1
+end
+for index = 1, counterCount do
+  local usageKey = KEYS[keyIndex]
+  redis.call('HINCRBY', usageKey, 'tokens', math.floor(totalTokens + 0.5) - math.floor(reservedTokens + 0.5))
+  redis.call('HINCRBYFLOAT', usageKey, 'cost', cost - reservedCost)
+  local ttl = tonumber(ARGV[8 + index])
+  if ttl and ttl > 0 then redis.call('EXPIRE', usageKey, ttl) end
+  keyIndex = keyIndex + 1
+end
+redis.call('SET', settledKey, '1', 'PX', markerTtl)
+return 1
+`
+
+const CANCEL_SCRIPT = `
+local settledKey = KEYS[1]
+local cancelledKey = KEYS[2]
+if redis.call('EXISTS', settledKey) == 1 or redis.call('EXISTS', cancelledKey) == 1 then return 0 end
+local prefixCount = tonumber(ARGV[1])
+local counterCount = tonumber(ARGV[2])
+local reservedTokens = tonumber(ARGV[3])
+local reservedCost = tonumber(ARGV[4])
+local leaseId = ARGV[5]
+local markerTtl = tonumber(ARGV[6])
+local keyIndex = 3
+for index = 1, prefixCount do
+  redis.call('ZREM', KEYS[keyIndex], leaseId)
+  keyIndex = keyIndex + 1
+end
+for index = 1, counterCount do
+  local usageKey = KEYS[keyIndex]
+  redis.call('HINCRBY', usageKey, 'requests', -1)
+  redis.call('HINCRBY', usageKey, 'tokens', -math.floor(reservedTokens + 0.5))
+  redis.call('HINCRBYFLOAT', usageKey, 'cost', -reservedCost)
+  local ttl = tonumber(ARGV[6 + index])
+  if ttl and ttl > 0 then redis.call('EXPIRE', usageKey, ttl) end
+  keyIndex = keyIndex + 1
+end
+redis.call('SET', cancelledKey, '1', 'PX', markerTtl)
+return 1
+`
+
 export async function admitHubRequest(event: H3Event, key: HubKey, group: Group | null, reservedTokens: number, reservedCost: number, options: { skipSubscriptionQuota?: boolean; scopeMode?: 'all' | 'base_only' | 'subscription_only' } = {}) {
   const settings = await getHubSettings(event)
   const scopeMode = options.scopeMode || 'all'
@@ -301,6 +368,7 @@ export async function admitHubRequest(event: H3Event, key: HubKey, group: Group 
   if (result === 'ok') {
     return {
       id: leaseId,
+      settlementKey: crypto.randomUUID(),
       keyId: key.id,
       groupId: group?.id || null,
       scopePrefixes: scopes.map(scopePrefix),
@@ -354,28 +422,40 @@ export async function settleHubRequest(
   lease: HubConcurrencyLease
 ) {
   const redis = useRedis(event)
-  const transaction = redis.multi()
-  for (const prefix of lease.scopePrefixes) {
-    transaction.zrem(`${prefix}:concurrency:leases`, lease.id)
-  }
-  for (const counter of lease.usageCounters) {
-    transaction.hincrby(counter.key, 'tokens', Math.round(totalTokens) - Math.round(reservedTokens))
-    transaction.hincrbyfloat(counter.key, 'cost', cost - reservedCost)
-    if (counter.ttl) transaction.expire(counter.key, counter.ttl)
-  }
-  await transaction.exec()
+  const markerTtl = 24 * 60 * 60 * 1000
+  const settledKey = `hub:admission:${lease.settlementKey}:settled`
+  const cancelledKey = `hub:admission:${lease.settlementKey}:cancelled`
+  const keys = [settledKey, cancelledKey, ...lease.scopePrefixes.map(prefix => `${prefix}:concurrency:leases`), ...lease.usageCounters.map(counter => counter.key)]
+  const args: Array<string | number> = [
+    lease.scopePrefixes.length,
+    lease.usageCounters.length,
+    Math.round(totalTokens),
+    Math.round(reservedTokens),
+    cost,
+    reservedCost,
+    lease.id,
+    markerTtl,
+    ...lease.usageCounters.map(counter => counter.ttl)
+  ]
+  await redis.eval(SETTLE_SCRIPT, keys.length, ...keys, ...args)
 }
 
 export async function cancelHubAdmission(event: H3Event, lease: HubConcurrencyLease, reservedTokens: number, reservedCost: number) {
-  const transaction = useRedis(event).multi()
-  for (const prefix of lease.scopePrefixes) transaction.zrem(`${prefix}:concurrency:leases`, lease.id)
-  for (const counter of lease.usageCounters) {
-    transaction.hincrby(counter.key, 'requests', -1)
-    transaction.hincrby(counter.key, 'tokens', -Math.round(reservedTokens))
-    transaction.hincrbyfloat(counter.key, 'cost', -reservedCost)
-    if (counter.ttl) transaction.expire(counter.key, counter.ttl)
-  }
-  await transaction.exec()
+  const redis = useRedis(event)
+  const markerTtl = 24 * 60 * 60 * 1000
+  const settledKey = `hub:admission:${lease.settlementKey}:settled`
+  const cancelledKey = `hub:admission:${lease.settlementKey}:cancelled`
+  const keys = [settledKey, cancelledKey, ...lease.scopePrefixes.map(prefix => `${prefix}:concurrency:leases`), ...lease.usageCounters.map(counter => counter.key)]
+  const args: Array<string | number> = [
+    lease.scopePrefixes.length,
+    lease.usageCounters.length,
+    Math.round(reservedTokens),
+    reservedCost,
+    lease.id,
+    markerTtl,
+    ...lease.usageCounters.map(counter => counter.ttl)
+  ]
+  await redis.eval(CANCEL_SCRIPT, keys.length, ...keys, ...args)
 }
 
 export async function renewHubConcurrency(event: H3Event, lease: HubConcurrencyLease) {

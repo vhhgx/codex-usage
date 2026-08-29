@@ -1,9 +1,12 @@
 [Unit]
 Description=Create a verified Zephyr Hub backup
-After=docker.service
+After=network-online.target docker.service
+Wants=network-online.target
 Requires=docker.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=/opt/zephyr-hub/deploy/hong-kong
-ExecStart=/usr/bin/docker compose --profile backup run --rm backup
+WorkingDirectory=/root/apps/zephry-hub/deploy/hong-kong
+Environment=HUB_ENV_FILE=/root/apps/zephry-hub/deploy/hong-kong/.env
+ExecStart=/usr/bin/docker compose --env-file /root/apps/zephry-hub/deploy/hong-kong/.env -f /root/apps/zephry-hub/deploy/hong-kong/docker-compose-hongkong.yml --profile backup run --rm backup
+TimeoutStartSec=infinity

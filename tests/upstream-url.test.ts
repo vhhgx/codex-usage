@@ -63,6 +63,16 @@ describe('upstream endpoint joining', () => {
     expect(upstreamTarget('https://open.bigmodel.cn/api/paas/v4', '/v1/models')).toBe('https://open.bigmodel.cn/api/paas/v4/models')
   })
 
+  it('keeps a namespaced v1 base such as Zhipu API v1 intact', () => {
+    expect(upstreamTarget('https://open.bigmodel.cn/api/v1', '/v1/responses')).toBe('https://open.bigmodel.cn/api/v1/responses')
+    expect(upstreamTarget('https://open.bigmodel.cn/api/v1', '/v1/models')).toBe('https://open.bigmodel.cn/api/v1/models')
+  })
+
+  it('keeps a namespaced v1 base path such as Zhipu Responses', () => {
+    expect(upstreamTarget('https://open.bigmodel.cn/api/v1', '/v1/responses')).toBe('https://open.bigmodel.cn/api/v1/responses')
+    expect(upstreamTarget('https://open.bigmodel.cn/api/v1', '/v1/models')).toBe('https://open.bigmodel.cn/api/v1/models')
+  })
+
   it('preserves v1 below a non-versioned API namespace', () => {
     expect(upstreamTarget('https://open.bigmodel.cn/api/anthropic', '/v1/messages')).toBe('https://open.bigmodel.cn/api/anthropic/v1/messages')
   })

@@ -13,6 +13,7 @@
     "typecheck": "nuxt typecheck",
     "verify": "npm run test && npm run typecheck && npm run build",
     "preview": "nuxt preview",
+    "start:production": "node scripts/start-production.mjs",
     "postinstall": "nuxt prepare",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",

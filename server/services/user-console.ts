@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, gte, inArray, lte, sql } from 'drizzle-orm'
+import { and, asc, count, desc, eq, gte, inArray, lte, or, sql } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { useDatabase } from '../db'
 import { channelModels, channels, groupChannelRules, groupMemberships, groupModelRules, groups, hubKeys, modelPrices, requestLogs, usageRollups, userPoolAccounts, userPoolGroups, userRelayGroups } from '../db/schema'
@@ -26,7 +26,7 @@ export async function createUserKey(event: H3Event, userId: string, body: Record
   await ensureDefaultSubscription(event, userId)
   const channelIds = Array.isArray(body.channelIds) ? [...new Set(body.channelIds.filter((id): id is string => typeof id === 'string'))] : []
   await assertUserChannelAccess(event, userId, channelIds)
-  const routeMode: KeyRouteMode = body.routeMode === 'private_only' || body.routeMode === 'platform_only' || body.routeMode === 'private_then_platform'
+  const routeMode: KeyRouteMode = body.routeMode === 'private_only' || body.routeMode === 'platform_only' || body.routeMode === 'platform_then_private' || body.routeMode === 'private_then_platform'
     ? body.routeMode
     : 'platform_then_private'
   return createHubKeyRecord(event, { name: body.name, note: body.note, key: body.key, routeMode, channelIds, ownerUserId: userId, groupId: DEFAULT_GROUP_ID }, userId)
@@ -184,8 +184,12 @@ export async function getUserModels(event: H3Event, userId: string) {
       channelName: channels.name,
       channelType: channels.type,
       ownerKind: channels.ownerKind,
-      ownerUserId: channels.ownerUserId
-    }).from(channelModels).innerJoin(channels, eq(channelModels.channelId, channels.id)).where(and(eq(channelModels.enabled, true), eq(channels.enabled, true), eq(channels.healthStatus, 'healthy'))),
+      ownerUserId: channels.ownerUserId,
+      relayGroupEnabled: userRelayGroups.enabled
+    }).from(channelModels)
+      .innerJoin(channels, eq(channelModels.channelId, channels.id))
+      .leftJoin(userRelayGroups, eq(channels.userRelayGroupId, userRelayGroups.id))
+      .where(and(eq(channelModels.enabled, true), eq(channels.enabled, true), eq(channels.healthStatus, 'healthy'), or(eq(channels.ownerKind, 'platform'), eq(userRelayGroups.enabled, true)))),
     db.select().from(modelPrices).where(lte(modelPrices.effectiveAt, new Date())).orderBy(desc(modelPrices.effectiveAt)),
     db.select({ poolId: userPoolGroups.id, poolName: userPoolGroups.displayName })
       .from(userPoolGroups)
@@ -211,6 +215,7 @@ export async function getUserModels(event: H3Event, userId: string) {
       if (allowedModels.size && !allowedModels.has(row.publicModel)) continue
       if (groupChannels.length && !allowedChannels.has(row.channelId)) continue
       const channelVisible = visibleSet.has(row.channelId)
+      if (row.ownerKind === 'user' && row.relayGroupEnabled === false) continue
       const poolEligible = Boolean(pool && row.ownerKind === 'platform' && row.channelType === 'sub2api')
       if (!channelVisible && !poolEligible) continue
       if (!result.has(row.publicModel)) result.set(row.publicModel, new Set())

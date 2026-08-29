@@ -12,9 +12,9 @@ import { contentHash, decryptChannelSecret, hashCacheAffinity, hashClientIp } fr
 import { pinnedUpstreamFetch, upstreamTarget } from '../utils/upstream-url'
 import { trustedClientIp } from '../utils/client-ip'
 import { copyUpstreamClientIdentity } from '../utils/upstream-client-identity'
-import { acquireChannel, admitHubRequest, releaseChannel, settleHubRequest, type ChannelConcurrencyLease } from './hub-limits'
-import { authenticateHubRequest, calculateCost, enforceRequestProtection, estimateReservation, listAccessibleModels, readUpstreamChunk, sanitizeArchiveBody, storeBodySafe, storeFileSafe, touchKeyCredential, writeResponseChunk } from './hub-gateway'
-import { orderedRouteSourceNodes, recordChannelFailure, recordChannelSuccess, rememberAffinitySelection, routeCandidates, selectSupplySource, userRelayAccountAllowsRouting, type SupplyDecision } from './hub-routing'
+import { acquireChannel, admitHubRequest, cancelHubAdmission, releaseChannel, settleHubRequest, type ChannelConcurrencyLease, type HubConcurrencyLease } from './hub-limits'
+import { assertUpstreamResponseSize, authenticateHubRequest, budgetUpstreamReadableStream, calculateCost, createUpstreamResponseBudget, enforceRequestProtection, estimateReservation, listAccessibleModels, readRequestBodyLimited, readUpstreamBodyLimited, reserveBodyMemory, sanitizeArchiveBody, storeBodySafe, storeFileSafe, touchKeyCredential, UPSTREAM_RESPONSE_LIMITS, writeResponseChunk } from './hub-gateway'
+import { advanceRouteFailoverState, orderedRouteSourceNodes, packagePolicyAllowsRouteSource, recordChannelFailure, recordChannelSuccess, rememberAffinitySelection, routeCandidates, selectSupplySource, userRelayAccountAllowsRouting, type RouteFailoverState, type SupplyDecision } from './hub-routing'
 import { recordUsageRollups } from './hub-rollups'
 import { effectivePriceMultiplier, policyAllows } from './group-policy'
 import { getHubSettings } from './hub-settings'
@@ -28,9 +28,18 @@ import { getUserFailoverSourceIds } from './user-route-preferences'
 import { classifyRelayFailure, relayFailureAffectsAccount, relayFailureAllowsFailover } from './relay-platform'
 import { MAX_UPSTREAM_RETRIES, shouldRetryUpstream, shouldRetryUpstreamError, upstreamRetryDelay, waitForUpstreamRetry } from './upstream-retry'
 import { markUserRelayFailure } from './user-relays'
+import { redactSensitiveText } from '../utils/upstream'
 
 const MAX_BODY_BYTES = 50 * 1024 * 1024
 const USAGE_TAIL_BYTES = 4 * 1024 * 1024
+async function bestEffort(task: Promise<unknown>) {
+  try {
+    await task
+    return true
+  } catch {
+    return false
+  }
+}
 function anthropicError(status: number, message: string, type = 'api_error'): never {
   throw createError({ statusCode: status, data: { type: 'error', error: { type, message } } })
 }
@@ -49,6 +58,7 @@ function parseBody(raw: Buffer): Record<string, unknown> & { model: string } {
 
 function upstreamHeaders(event: H3Event, apiKey: string, authScheme: 'bearer' | 'x_api_key', apiVersion: string | null, directAnthropic: boolean, clientIdentityMode: string) {
   const headers = new Headers({ 'content-type': 'application/json', accept: getHeader(event, 'accept') || 'application/json' })
+  headers.set('accept-encoding', 'identity')
   if (authScheme === 'x_api_key') {
     headers.set('x-api-key', apiKey)
     headers.set('anthropic-version', apiVersion || '2023-06-01')
@@ -108,9 +118,9 @@ function upstreamError(buffer: Buffer, status: number) {
     const payload = JSON.parse(buffer.toString('utf8')) as Record<string, unknown>
     const error = payload.error && typeof payload.error === 'object' ? payload.error as Record<string, unknown> : null
     const message = typeof error?.message === 'string' ? error.message : typeof payload.message === 'string' ? payload.message : `Upstream returned HTTP ${status}`
-    return Buffer.from(JSON.stringify({ type: 'error', error: { type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error', message: message.slice(0, 2000) } }))
+    return Buffer.from(JSON.stringify({ type: 'error', error: { type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error', message: redactSensitiveText(message, 2000) } }))
   } catch {
-    return Buffer.from(JSON.stringify({ type: 'error', error: { type: status >= 500 ? 'api_error' : 'invalid_request_error', message: buffer.toString('utf8').slice(0, 2000) || `Upstream returned HTTP ${status}` } }))
+    return Buffer.from(JSON.stringify({ type: 'error', error: { type: status >= 500 ? 'api_error' : 'invalid_request_error', message: redactSensitiveText(buffer.toString('utf8'), 2000) || `Upstream returned HTTP ${status}` } }))
   }
 }
 
@@ -122,12 +132,12 @@ export async function handleAnthropicModels(event: H3Event) {
   if (!policyAllows(key.allowedEndpoints, '/v1/models') || !policyAllows(group.allowedEndpoints, '/v1/models')) anthropicError(403, 'This Hub Key cannot list models', 'permission_error')
   const lease = await admitHubRequest(event, key, group, 0, 0, { scopeMode: 'base_only' })
   try {
-    const result = await listAccessibleModels(event, key, group, userId, ['anthropic_messages', 'openai_chat'])
-    await touchKeyCredential(event, key.id)
+  const result = await listAccessibleModels(event, key, group, userId, ['anthropic_messages', 'openai_chat'])
+    await bestEffort(touchKeyCredential(event, key.id))
     const data = result.data.map(model => ({ type: 'model', id: model.id, display_name: model.id, created_at: '1970-01-01T00:00:00Z' }))
     return { data, has_more: false, first_id: data[0]?.id || null, last_id: data.at(-1)?.id || null }
   } finally {
-    await settleHubRequest(event, key, group, 0, 0, 0, 0, lease)
+    await settleHubRequest(event, key, group, 0, 0, 0, 0, lease).catch(() => {})
   }
 }
 
@@ -138,9 +148,18 @@ export async function handleAnthropicMessages(event: H3Event) {
   const access = await authenticateHubRequest(event)
   const { key, group, userId } = access
   await assertTrafficAccepting(event)
-  const rawText = await readRawBody(event, false)
-  const raw = Buffer.isBuffer(rawText) ? rawText : Buffer.from(rawText || '')
-  if (raw.length > MAX_BODY_BYTES) anthropicError(413, 'Request body is too large', 'invalid_request_error')
+  const memory = reserveBodyMemory(
+    event,
+    Number.isFinite(declared) && declared > 0 ? declared : 64 * 1024,
+    () => anthropicError(503, 'Gateway request body capacity is temporarily exhausted', 'api_error')
+  )
+  const raw = await readRequestBodyLimited(
+    event,
+    MAX_BODY_BYTES,
+    memory,
+    () => anthropicError(413, 'Request body is too large', 'invalid_request_error'),
+    { onTimeout: () => anthropicError(408, 'Request body timed out', 'invalid_request_error') }
+  )
   const body = parseBody(raw)
   const endpoint = '/v1/messages'
   if (!policyAllows(key.allowedEndpoints, endpoint) || !policyAllows(group.allowedEndpoints, endpoint)) anthropicError(403, 'This Hub Key cannot use the Messages endpoint', 'permission_error')
@@ -172,6 +191,7 @@ export async function handleAnthropicMessages(event: H3Event) {
   const requestId = typeof event.context.hubRequestId === 'string' ? event.context.hubRequestId : `req_${crypto.randomUUID().replace(/-/g, '')}`
   let packageDecision: SupplyDecision | null = null
   let billingMode = 'unlimited'
+  let packageSupplyMode = 'platform_only'
   const hasPackageNode = candidateBatches.some(batch => batch.node.source === 'platform')
   const activeSubscription = hasPackageNode ? await getActiveSubscription(event, userId) : null
   if (hasPackageNode && activeSubscription) {
@@ -181,9 +201,15 @@ export async function handleAnthropicMessages(event: H3Event) {
     const snapshot = activeSubscription.subscription.entitlementSnapshot || {}
     billingMode = String(version?.billingMode || snapshot.billingMode || (activeSubscription.plan.mode === 'token' ? 'token_package' : activeSubscription.plan.mode === 'cost' ? 'token_metered' : 'unlimited'))
     const supplyMode = String(version?.supplyMode || snapshot.supplyMode || 'platform_only')
+    packageSupplyMode = supplyMode
     const tokenLimit = Number(version?.tokenLimit ?? snapshot.tokenLimit ?? activeSubscription.plan.tokenLimit ?? 0)
     const usedRow = tokenLimit > 0
-      ? (await useDatabase(event).select({ tokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}), 0)` }).from(usageRollups).where(and(eq(usageRollups.userId, userId), eq(usageRollups.granularity, 'day'), gte(usageRollups.bucketStart, activeSubscription.subscription.startsAt))))[0]
+      ? (await useDatabase(event).select({ tokens: sql<number>`coalesce(sum(${usageRollups.totalTokens}), 0)` }).from(usageRollups).where(and(
+          eq(usageRollups.userId, userId),
+          eq(usageRollups.granularity, 'day'),
+          gte(usageRollups.bucketStart, activeSubscription.subscription.startsAt),
+          eq(usageRollups.supplySource, 'platform')
+        )))[0]
       : null
     try {
       packageDecision = selectSupplySource({
@@ -202,11 +228,15 @@ export async function handleAnthropicMessages(event: H3Event) {
   }
   const candidates: Awaited<ReturnType<typeof routeCandidates>> = []
   for (const batch of candidateBatches) {
-    if (batch.node.source === 'user_relay' || batch.node.source === 'private_pool') candidates.push(...batch.candidates)
-    else if (packageDecision?.source === 'platform') candidates.push(...batch.candidates)
+    if (!packagePolicyAllowsRouteSource(batch.node.source, {
+      hasActiveSubscription: Boolean(activeSubscription),
+      packageSupplyMode,
+      packageDecisionSource: packageDecision?.source || null
+    })) continue
+    candidates.push(...batch.candidates)
   }
   if (!candidates.length) anthropicError(503, '没有可用来源支持当前模型', 'api_error')
-  const supplyDecision: SupplyDecision = candidates[0]!.supplySource === 'user_relay'
+  let supplyDecision: SupplyDecision = candidates[0]!.supplySource === 'user_relay'
     ? { source: 'user_relay', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
     : candidates[0]!.supplySource === 'private_pool'
       ? { source: 'private_pool', subscriptionId: null, planVersionId: null, reservedTokens: 0, poolGroupId: privatePool?.id }
@@ -216,34 +246,52 @@ export async function handleAnthropicMessages(event: H3Event) {
   event.context.hubPoolGroupId = supplyDecision.poolGroupId
   event.context.hubSubscriptionId = supplyDecision.subscriptionId
   event.context.hubPlanVersionId = supplyDecision.planVersionId
-  enforceRequestProtection(key, reservation)
-  let walletHoldKey: string | null = null
-  let walletHeld = false
-  let concurrencyLease: Awaited<ReturnType<typeof admitHubRequest>>
-  try {
-    if (billingMode === 'token_metered' && supplyDecision.source !== 'user_relay' && reservation.cost > 0) {
-      walletHoldKey = `request:${requestId}:hold`
-      await holdUserWallet(event, userId, reservation.cost, walletHoldKey, requestId)
-      walletHeld = true
-    }
-    concurrencyLease = await admitHubRequest(event, key, group, reservation.tokens, supplyDecision.source === 'user_relay' ? 0 : reservation.cost, { skipSubscriptionQuota: supplyDecision.source === 'user_relay' || supplyDecision.source === 'private_pool' })
-  } catch (error) {
-    if (walletHeld && walletHoldKey) await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {})
-    throw error
-  }
   const settings = await getHubSettings(event)
   const relayGroupIds = [...new Set(candidates.map(candidate => candidate.relayGroupId).filter((value): value is string => Boolean(value)))]
   const relayGroupRows = relayGroupIds.length ? await useDatabase(event).select({ id: userRelayGroups.id, name: userRelayGroups.name }).from(userRelayGroups).where(inArray(userRelayGroups.id, relayGroupIds)) : []
   const relayGroupNames = new Map(relayGroupRows.map(row => [row.id, row.name]))
-  const [packagePlan] = supplyDecision.subscriptionId
-    ? await useDatabase(event).select({ name: servicePlans.name }).from(userSubscriptions).innerJoin(servicePlans, eq(userSubscriptions.planId, servicePlans.id)).where(eq(userSubscriptions.id, supplyDecision.subscriptionId)).limit(1)
+  const packageSubscriptionId = packageDecision?.source === 'platform' ? packageDecision.subscriptionId : null
+  const [packagePlan] = packageSubscriptionId
+    ? await useDatabase(event).select({ name: servicePlans.name }).from(userSubscriptions).innerJoin(servicePlans, eq(userSubscriptions.planId, servicePlans.id)).where(eq(userSubscriptions.id, packageSubscriptionId)).limit(1)
     : []
   const resourceFields = (candidate: typeof candidates[number]) => {
     const resourceType = candidate.supplySource === 'user_relay' ? 'user_relay' as const : candidate.supplySource === 'private_pool' ? 'private_pool' as const : 'subscription' as const
-    const resourceId = candidate.supplySource === 'user_relay' ? candidate.relayGroupId || candidate.channel.id : candidate.supplySource === 'private_pool' ? privatePool?.id || null : supplyDecision.subscriptionId
+    const candidateDecision = candidate.supplySource === 'user_relay'
+      ? { source: 'user_relay' as const, subscriptionId: null, planVersionId: null, reservedTokens: 0 }
+      : candidate.supplySource === 'private_pool'
+        ? { source: 'private_pool' as const, subscriptionId: null, planVersionId: null, reservedTokens: 0, poolGroupId: privatePool?.id }
+        : packageDecision?.source === 'platform'
+          ? packageDecision
+          : { source: 'platform' as const, subscriptionId: null, planVersionId: null, reservedTokens: 0 }
+    const resourceId = candidate.supplySource === 'user_relay' ? candidate.relayGroupId || candidate.channel.id : candidate.supplySource === 'private_pool' ? candidateDecision.poolGroupId || null : candidateDecision.subscriptionId
     const resourceName = candidate.supplySource === 'user_relay' ? relayGroupNames.get(candidate.relayGroupId || '') || candidate.channel.name : candidate.supplySource === 'private_pool' ? privatePool?.displayName || '我的专属号池' : packagePlan?.name || '当前套餐'
     return { resourceType, resourceId, resourceNameSnapshot: resourceName, executionNameSnapshot: candidate.channel.accountLabel || candidate.channel.name, userRelayGroupId: candidate.relayGroupId || null }
   }
+  enforceRequestProtection(key, reservation)
+  let walletHoldKey: string | null = null
+  let walletHeld = false
+  let packageAdmissionLease: HubConcurrencyLease | null = null
+  let packageAdmissionError: unknown = null
+  let concurrencyLease: Awaited<ReturnType<typeof admitHubRequest>>
+  try {
+    // Admit key/group limits first. Package quota and wallet holds are tied to
+    // the candidate actually selected and are activated below.
+    concurrencyLease = await admitHubRequest(event, key, group, reservation.tokens, 0, { scopeMode: 'base_only' })
+  } catch (error) {
+    if (walletHeld && walletHoldKey) await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {})
+    throw error
+  }
+  // Keep the base admission state available for every setup and request
+  // failure path.  A lease is only considered settled after Redis confirms
+  // the transaction; failed cleanup must remain retryable.
+  let baseAdmissionSettled = false
+  const settleBaseAdmission = async (totalTokens = 0, cost = 0) => {
+    if (baseAdmissionSettled) return true
+    const settled = await bestEffort(settleHubRequest(event, key, group, totalTokens, cost, reservation.tokens, 0, concurrencyLease))
+    if (settled) baseAdmissionSettled = true
+    return settled
+  }
+  const startedAt = Date.now()
   let log: typeof requestLogs.$inferSelect | undefined
   try {
     [log] = await useDatabase(event).insert(requestLogs).values({
@@ -253,30 +301,137 @@ export async function handleAnthropicMessages(event: H3Event) {
       clientIpHash: hashClientIp(trustedClientIp(event), event), requestBodyHash: contentHash(raw), bodyExpiresAt: new Date(Date.now() + settings.bodyRetentionDays * 86400_000)
     }).returning()
   } catch (error) {
-    await settleHubRequest(event, key, group, 0, 0, reservation.tokens, supplyDecision.source === 'user_relay' ? 0 : reservation.cost, concurrencyLease).catch(() => {})
+    await settleBaseAdmission()
     if (walletHeld && walletHoldKey) await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {})
     throw error
   }
   if (!log) {
-    await settleHubRequest(event, key, group, 0, 0, reservation.tokens, supplyDecision.source === 'user_relay' ? 0 : reservation.cost, concurrencyLease).catch(() => {})
+    await settleBaseAdmission()
     if (walletHeld && walletHoldKey) await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {})
     anthropicError(500, 'Unable to initialize request log')
   }
-  const requestObject = await storeBodySafe(event, requestId, 'request', sanitizeArchiveBody(raw, 'application/json'), 'application/json')
-  if (requestObject) await useDatabase(event).update(requestLogs).set({ requestBodyObject: requestObject }).where(eq(requestLogs.id, log.id))
+  try {
+    const requestObject = await storeBodySafe(event, requestId, 'request', sanitizeArchiveBody(raw, 'application/json'), 'application/json')
+    if (requestObject) await bestEffort(useDatabase(event).update(requestLogs).set({ requestBodyObject: requestObject }).where(eq(requestLogs.id, log.id)))
+  } catch (error) {
+    await settleBaseAdmission()
+    throw error
+  }
 
-  let admitted: ChannelConcurrencyLease | null = null
+  let admittedChannel: ChannelConcurrencyLease | null = null
   let settled = false
   let attempts = 0
+  let routeFailoverState: RouteFailoverState = { candidateKey: null, count: 0 }
   let lastCandidate: typeof candidates[number] | null = null
   let responseStarted = false
+  // A wallet settlement has a distinct idempotency key from a release. Keep
+  // the intended amount until settlement is confirmed so cleanup never
+  // converts a timed-out settlement into a conflicting release.
+  let walletSettlementCost: number | null = null
+  const releaseTrackedChannel = async (lease: ChannelConcurrencyLease) => {
+    const released = await bestEffort(releaseChannel(event, lease))
+    if (released && admittedChannel === lease) admittedChannel = null
+    return released
+  }
+  const releasePackageReservation = async () => {
+    let released = true
+    if (packageAdmissionLease) {
+      const lease = packageAdmissionLease
+      if (await bestEffort(cancelHubAdmission(event, lease, reservation.tokens, reservation.cost))) packageAdmissionLease = null
+      else released = false
+    }
+    if (walletHeld && walletHoldKey && walletSettlementCost === null) {
+      if (await bestEffort(releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId))) walletHeld = false
+      else released = false
+    }
+    return released
+  }
+  const settleWalletReservation = async (cost: number) => {
+    if (!walletHeld || !walletHoldKey) return true
+    walletSettlementCost = cost
+    const settled = await bestEffort(settleUserWallet(event, userId, walletHoldKey, cost, `request:${requestId}:settle`, requestId))
+    if (settled) {
+      walletHeld = false
+      walletSettlementCost = null
+    }
+    return settled
+  }
+  const activateCandidateSupply = async (candidate: typeof candidates[number]) => {
+    const nextDecision: SupplyDecision = candidate.supplySource === 'user_relay'
+      ? { source: 'user_relay', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
+      : candidate.supplySource === 'private_pool'
+        ? { source: 'private_pool', subscriptionId: null, planVersionId: null, reservedTokens: 0, poolGroupId: privatePool?.id }
+        : packageDecision?.source === 'platform'
+          ? packageDecision
+          : { source: 'platform', subscriptionId: null, planVersionId: null, reservedTokens: 0 }
+    if (nextDecision.source === 'user_relay' || nextDecision.source === 'private_pool') {
+      if (!await releasePackageReservation()) throw new Error('无法释放套餐预留')
+    } else if (packageAdmissionError) {
+      return false
+    } else {
+      try {
+        if (!packageAdmissionLease && nextDecision.subscriptionId) {
+          packageAdmissionLease = await admitHubRequest(event, key, group, reservation.tokens, reservation.cost, { scopeMode: 'subscription_only' })
+        }
+        if (billingMode === 'token_metered' && reservation.cost > 0 && !walletHeld) {
+          walletHoldKey ||= `request:${requestId}:hold`
+          await holdUserWallet(event, userId, reservation.cost, walletHoldKey, requestId)
+          walletHeld = true
+        }
+      } catch (error) {
+        packageAdmissionError = error
+        if (!await releasePackageReservation()) throw new Error('无法释放套餐预留')
+        return false
+      }
+    }
+    supplyDecision = nextDecision
+    event.context.hubSupplySource = supplyDecision.source
+    event.context.hubPoolGroupId = supplyDecision.poolGroupId
+    event.context.hubSubscriptionId = supplyDecision.subscriptionId
+    event.context.hubPlanVersionId = supplyDecision.planVersionId
+    await useDatabase(event).update(requestLogs).set({
+      supplySource: supplyDecision.source,
+      poolGroupId: supplyDecision.poolGroupId || null,
+      subscriptionId: supplyDecision.subscriptionId,
+      planVersionId: supplyDecision.planVersionId,
+      billedAmount: String(supplyDecision.source === 'user_relay' ? 0 : reservation.cost),
+      ...resourceFields(candidate)
+    }).where(eq(requestLogs.id, log!.id))
+    return true
+  }
+  const settleAdmissions = async (totalTokens: number, cost: number) => {
+    if (!baseAdmissionSettled) {
+      await settleHubRequest(event, key, group, totalTokens, cost, reservation.tokens, 0, concurrencyLease)
+      baseAdmissionSettled = true
+    }
+    if (packageAdmissionLease) {
+      if (supplyDecision.source !== 'platform') throw new Error('私有来源仍存在套餐预留')
+      const lease = packageAdmissionLease
+      await settleHubRequest(event, key, group, totalTokens, cost, reservation.tokens, reservation.cost, lease)
+      packageAdmissionLease = null
+    }
+  }
   try {
     for (let index = 0; index < candidates.length; index++) {
       const candidate = candidates[index]!
       if (candidate.channel.ownerKind === 'user' && !await userRelayAccountAllowsRouting(event, candidate.channel.id)) continue
       const lease = await acquireChannel(event, candidate.channel.id, candidate.channel.maxConcurrency, candidate.relayGroupId ? { id: candidate.relayGroupId, max: candidate.relayGroupMaxConcurrency || null } : undefined)
       if (!lease) continue
-      admitted = lease
+      // Track the channel slot before supply activation. If activation or its
+      // cleanup fails, the outer handler can retry releasing this exact lease.
+      admittedChannel = lease
+      let activated = false
+      try {
+        activated = await activateCandidateSupply(candidate)
+      } catch (error) {
+        if (!await releaseTrackedChannel(lease)) throw new Error('无法释放渠道并发租约')
+        throw error
+      }
+      if (!activated) {
+        if (!await releaseTrackedChannel(lease)) throw new Error('无法释放渠道并发租约')
+        continue
+      }
+      routeFailoverState = advanceRouteFailoverState(routeFailoverState, candidate)
       lastCandidate = candidate
       const started = Date.now()
       let attemptStarted = started
@@ -320,7 +475,7 @@ export async function handleAnthropicMessages(event: H3Event) {
               : await fetch(upstreamTarget(base, path), { method: 'POST', headers, body: JSON.stringify(outgoing), redirect: 'manual', signal: requestController.signal })
           } catch (error) {
             if (retryIndex >= MAX_UPSTREAM_RETRIES || requestController.signal.aborted || !shouldRetryUpstreamError(error)) throw error
-            await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'retrying', durationMs: Date.now() - attemptStarted, errorMessage: error instanceof Error ? error.message.slice(0, 2000) : 'Temporary upstream network error', failureClass: 'upstream_unavailable', ...resourceFields(candidate) })
+            await bestEffort(useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'retrying', durationMs: Date.now() - attemptStarted, errorMessage: redactSensitiveText(error instanceof Error ? error.message : 'Temporary upstream network error', 2000), failureClass: 'upstream_unavailable', ...resourceFields(candidate) }))
             await closeConnection()
             closePinned = null
             event.node.res.once('close', abortUpstream)
@@ -330,12 +485,15 @@ export async function handleAnthropicMessages(event: H3Event) {
           prefetchedResponseBuffer = null
           responseFailureClass = null
           if (!response.ok) {
-            prefetchedResponseBuffer = Buffer.from(await response.arrayBuffer())
+            prefetchedResponseBuffer = await readUpstreamBodyLimited(response, requestController, UPSTREAM_RESPONSE_LIMITS.errorBytes, {
+              idleTimeoutMs: candidate.channel.timeoutMs,
+              label: 'Upstream error response'
+            })
             responseFailureClass = classifyRelayFailure(response.status, prefetchedResponseBuffer.toString('utf8'))
           }
           const failureText = prefetchedResponseBuffer?.toString('utf8') || ''
           if (!shouldRetryUpstream(response.status, failureText) || retryIndex >= MAX_UPSTREAM_RETRIES) break
-          await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'retrying', httpStatus: response.status, durationMs: Date.now() - attemptStarted, errorMessage: failureText.slice(0, 2000), failureClass: responseFailureClass || 'upstream_unavailable', ...resourceFields(candidate) })
+          await bestEffort(useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'retrying', httpStatus: response.status, durationMs: Date.now() - attemptStarted, errorMessage: redactSensitiveText(failureText, 2000), failureClass: responseFailureClass || 'upstream_unavailable', ...resourceFields(candidate) }))
           await closeConnection()
           closePinned = null
           event.node.res.once('close', abortUpstream)
@@ -346,15 +504,23 @@ export async function handleAnthropicMessages(event: H3Event) {
         if (responseFailureClass && relayFailureAllowsFailover(response.status, responseFailureClass, candidate.channel.ownerKind === 'user') && index < candidates.length - 1) {
           const errorBody = prefetchedResponseBuffer!
           await closeConnection()
-          const errorText = errorBody.toString('utf8').slice(0, 1000)
-          await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'failed', httpStatus: response.status, durationMs: Date.now() - started, errorMessage: errorText, failureClass: responseFailureClass, ...resourceFields(candidate) })
-          if (candidate.channel.ownerKind === 'user') await markUserRelayFailure(event, candidate.channel.id, responseFailureClass, errorText)
-          if (relayFailureAffectsAccount(responseFailureClass)) await recordChannelFailure(event, candidate.channel.id, `HTTP ${response.status}`)
-          await releaseChannel(event, lease)
-          admitted = null
+          const errorText = redactSensitiveText(errorBody.toString('utf8'), 1000)
+          await bestEffort(useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'failed', httpStatus: response.status, durationMs: Date.now() - started, errorMessage: errorText, failureClass: responseFailureClass, ...resourceFields(candidate) }))
+          if (candidate.channel.ownerKind === 'user') await bestEffort(markUserRelayFailure(event, candidate.channel.id, responseFailureClass, errorText))
+          if (relayFailureAffectsAccount(responseFailureClass)) await bestEffort(recordChannelFailure(event, candidate.channel.id, `HTTP ${response.status}`))
+          if (!await releaseTrackedChannel(lease)) throw new Error('无法释放渠道并发租约')
           continue
         }
         if (body.stream === true && response.ok && response.body) {
+          const declaredStreamBytes = Number(response.headers.get('content-length'))
+          if (Number.isFinite(declaredStreamBytes) && declaredStreamBytes > 0) {
+            assertUpstreamResponseSize(
+              declaredStreamBytes,
+              UPSTREAM_RESPONSE_LIMITS.streamBytes,
+              requestController,
+              'Upstream streaming response'
+            )
+          }
           responseStarted = true
           setResponseStatus(event, response.status)
           setResponseHeader(event, 'content-type', 'text/event-stream; charset=utf-8')
@@ -365,89 +531,115 @@ export async function handleAnthropicMessages(event: H3Event) {
           const pathName = join(directory, 'body')
           const archive = createWriteStream(pathName, { flags: 'wx' })
           streamArchive = archive
+          const streamBudget = createUpstreamResponseBudget(requestController, {
+            maxBytes: UPSTREAM_RESPONSE_LIMITS.streamBytes,
+            timeoutMs: UPSTREAM_RESPONSE_LIMITS.streamTimeoutMs,
+            label: 'Upstream streaming response'
+          })
           const hash = createHash('sha256')
           let tail: Buffer<ArrayBufferLike> = Buffer.alloc(0)
           let firstByteMs: number | null = null
           const write = async (value: Uint8Array) => {
             const chunk = Buffer.from(value)
+            streamBudget.account(chunk, 'output')
             firstByteMs ??= Date.now() - started
             hash.update(chunk)
             tail = appendTail(tail, chunk)
-            if (!archive.write(chunk)) await once(archive, 'drain')
-            await writeResponseChunk(event.node.res, chunk)
+            if (!archive.write(chunk)) await streamBudget.guard(once(archive, 'drain'))
+            await streamBudget.guard(writeResponseChunk(event.node.res, chunk))
           }
           let usage: CanonicalUsage
-          if (direct) {
-            const reader = response.body.getReader()
-            while (true) {
-              const { done, value } = await readUpstreamChunk(reader, candidate.channel.timeoutMs, requestController)
-              if (done) break
-              await write(value)
+          try {
+            if (direct) {
+              const reader = response.body.getReader()
+              while (true) {
+                const { done, value } = await streamBudget.read(reader, candidate.channel.timeoutMs)
+                if (done) break
+                await write(value)
+              }
+              usage = anthropicStreamUsage(tail)
+            } else {
+              const budgetedBody = budgetUpstreamReadableStream(response.body, streamBudget, candidate.channel.timeoutMs)
+              usage = await pipeOpenAiChatAsAnthropic(budgetedBody, requestedModel, write)
             }
-            usage = anthropicStreamUsage(tail)
-          } else usage = await pipeOpenAiChatAsAnthropic(response.body, requestedModel, write)
-          archive.end()
-          await once(archive, 'finish')
+            const archiveFinished = once(archive, 'finish')
+            archive.end()
+            await streamBudget.guard(archiveFinished)
+          } finally {
+            streamBudget.finish()
+          }
           if (!event.node.res.writableEnded) event.node.res.end()
           await closeConnection()
           const responseObject = await storeFileSafe(event, requestId, 'response', pathName, 'text/event-stream')
-          await rm(directory, { recursive: true, force: true })
-          streamDirectory = null
-          streamArchive = null
           const cost = supplyDecision.source === 'user_relay' ? 0 : await calculateCost(event, requestedModel, usageForBilling(usage), body, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Number(candidate.channel.priceMultiplier)))
-          await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'success', httpStatus: response.status, durationMs: Date.now() - started, ...resourceFields(candidate) })
-          await useDatabase(event).update(requestLogs).set({
+          await bestEffort(useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'success', httpStatus: response.status, durationMs: Date.now() - started, ...resourceFields(candidate) }))
+          await bestEffort(useDatabase(event).update(requestLogs).set({
             channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, outboundProtocol: candidate.protocolBinding.protocol, conversionMode: candidate.conversionMode,
             sourceOwnerKind: candidate.channel.ownerKind, sourceOwnerUserId: candidate.channel.ownerUserId, cacheAffinityReused: affinityWasReused,
             ...resourceFields(candidate),
             upstreamModel: candidate.upstreamModel, status: 'success', httpStatus: response.status, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
             cachedTokens: usage.cachedTokens, cacheCreationTokens: usage.cacheCreationTokens, reasoningTokens: usage.reasoningTokens, totalTokens: usage.totalTokens,
             cost: String(cost), billableTokens: usage.totalTokens, billedAmount: String(cost), firstByteMs: firstByteMs ?? Date.now() - started, durationMs: Date.now() - started,
-            failoverCount: Math.max(0, attempts - 1), responseBodyObject: responseObject, responseBodyHash: hash.digest('hex'), completedAt: new Date()
-          }).where(eq(requestLogs.id, log.id))
-          await recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, protocol: candidate.protocolBinding.protocol, model: requestedModel, endpoint, status: 'success', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, cacheCreationTokens: usage.cacheCreationTokens, affinityReused: affinityWasReused, affinityEligible: true, totalTokens: usage.totalTokens, cost, durationMs: Date.now() - started, failovers: Math.max(0, attempts - 1) })
-          await settleHubRequest(event, key, group, usage.totalTokens, cost, reservation.tokens, supplyDecision.source === 'user_relay' ? 0 : reservation.cost, concurrencyLease)
-          if (walletHeld && walletHoldKey) { await settleUserWallet(event, userId, walletHoldKey, cost, `request:${requestId}:settle`, requestId); walletHeld = false }
+            failoverCount: routeFailoverState.count, responseBodyObject: responseObject, responseBodyHash: hash.digest('hex'), completedAt: new Date()
+          }).where(eq(requestLogs.id, log.id)))
+          await bestEffort(recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, protocol: candidate.protocolBinding.protocol, model: requestedModel, endpoint, status: 'success', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, cacheCreationTokens: usage.cacheCreationTokens, affinityReused: affinityWasReused, affinityEligible: true, totalTokens: usage.totalTokens, cost, durationMs: Date.now() - started, failovers: routeFailoverState.count }))
+          await settleAdmissions(usage.totalTokens, cost)
+          // Redis admissions must be finalized before wallet/telemetry work.
+          // Otherwise a downstream failure would enter the outer catch and
+          // settle the same reservation a second time.
+          if (!await settleWalletReservation(cost)) throw new Error('钱包结算失败')
           settled = true
-          await releaseChannel(event, lease)
-          admitted = null
-          await touchKeyCredential(event, key.id)
-          await recordChannelSuccess(event, candidate.channel.id, candidate.channel.ownerKind === 'user' ? candidate.protocolBinding.id : undefined)
-          await rememberAffinitySelection(event, affinityKey, candidate)
+          if (!await releaseTrackedChannel(lease)) throw new Error('无法释放渠道并发租约')
+          await bestEffort(touchKeyCredential(event, key.id))
+          await bestEffort(recordChannelSuccess(event, candidate.channel.id, candidate.channel.ownerKind === 'user' ? candidate.protocolBinding.id : undefined))
+          await bestEffort(rememberAffinitySelection(event, affinityKey, candidate))
           return
         }
-        const upstreamBuffer = prefetchedResponseBuffer || Buffer.from(await response.arrayBuffer())
+        const upstreamBuffer = prefetchedResponseBuffer || await readUpstreamBodyLimited(
+          response,
+          requestController,
+          response.ok ? UPSTREAM_RESPONSE_LIMITS.standardBytes : UPSTREAM_RESPONSE_LIMITS.errorBytes,
+          {
+            idleTimeoutMs: candidate.channel.timeoutMs,
+            label: response.ok ? 'Upstream response' : 'Upstream error response'
+          }
+        )
         await closeConnection()
         const usage = direct ? anthropicUsage(JSON.parse(upstreamBuffer.toString('utf8') || '{}')) : openAiUsage((JSON.parse(upstreamBuffer.toString('utf8') || '{}') as Record<string, unknown>).usage)
         const output = response.ok && !direct ? Buffer.from(JSON.stringify(openAiChatToAnthropic(JSON.parse(upstreamBuffer.toString('utf8')), requestedModel))) : response.ok ? upstreamBuffer : upstreamError(upstreamBuffer, response.status)
+        assertUpstreamResponseSize(
+          output.length,
+          response.ok ? UPSTREAM_RESPONSE_LIMITS.standardBytes : UPSTREAM_RESPONSE_LIMITS.errorBytes,
+          requestController,
+          response.ok ? 'Upstream response' : 'Upstream error response'
+        )
         const cost = supplyDecision.source === 'user_relay' ? 0 : await calculateCost(event, requestedModel, usageForBilling(usage), body, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Number(candidate.channel.priceMultiplier)))
         const responseObject = await storeBodySafe(event, requestId, 'response', output, 'application/json')
-        await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: response.ok ? 'success' : 'failed', httpStatus: response.status, durationMs: Date.now() - started, failureClass: response.ok ? null : classifyRelayFailure(response.status, output.toString('utf8')), ...resourceFields(candidate) })
-        await useDatabase(event).update(requestLogs).set({
+        await bestEffort(useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: response.ok ? 'success' : 'failed', httpStatus: response.status, durationMs: Date.now() - started, failureClass: response.ok ? null : classifyRelayFailure(response.status, output.toString('utf8')), ...resourceFields(candidate) }))
+        await bestEffort(useDatabase(event).update(requestLogs).set({
           channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, outboundProtocol: candidate.protocolBinding.protocol, conversionMode: candidate.conversionMode,
           sourceOwnerKind: candidate.channel.ownerKind, sourceOwnerUserId: candidate.channel.ownerUserId, cacheAffinityReused: affinityWasReused,
           ...resourceFields(candidate),
           upstreamModel: candidate.upstreamModel, status: response.ok ? 'success' : 'error', httpStatus: response.status, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
           cachedTokens: usage.cachedTokens, cacheCreationTokens: usage.cacheCreationTokens, reasoningTokens: usage.reasoningTokens, totalTokens: usage.totalTokens,
           cost: String(cost), billableTokens: usage.totalTokens, billedAmount: String(cost), firstByteMs: Date.now() - started, durationMs: Date.now() - started,
-          failoverCount: Math.max(0, attempts - 1), responseBodyObject: responseObject, responseBodyHash: contentHash(output), errorMessage: response.ok ? null : output.toString('utf8').slice(0, 2000), completedAt: new Date()
-        }).where(eq(requestLogs.id, log.id))
-        await recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, protocol: candidate.protocolBinding.protocol, model: requestedModel, endpoint, status: response.ok ? 'success' : 'error', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, cacheCreationTokens: usage.cacheCreationTokens, affinityReused: affinityWasReused, affinityEligible: true, totalTokens: usage.totalTokens, cost, durationMs: Date.now() - started, failovers: Math.max(0, attempts - 1) })
-        await settleHubRequest(event, key, group, usage.totalTokens, cost, reservation.tokens, supplyDecision.source === 'user_relay' ? 0 : reservation.cost, concurrencyLease)
-        if (walletHeld && walletHoldKey) { await settleUserWallet(event, userId, walletHoldKey, cost, `request:${requestId}:settle`, requestId); walletHeld = false }
+          failoverCount: routeFailoverState.count, responseBodyObject: responseObject, responseBodyHash: contentHash(output), errorMessage: response.ok ? null : redactSensitiveText(output.toString('utf8'), 2000), completedAt: new Date()
+        }).where(eq(requestLogs.id, log.id)))
+        await bestEffort(recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, protocol: candidate.protocolBinding.protocol, model: requestedModel, endpoint, status: response.ok ? 'success' : 'error', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, cacheCreationTokens: usage.cacheCreationTokens, affinityReused: affinityWasReused, affinityEligible: true, totalTokens: usage.totalTokens, cost, durationMs: Date.now() - started, failovers: routeFailoverState.count }))
+        await settleAdmissions(usage.totalTokens, cost)
+        if (!await settleWalletReservation(cost)) throw new Error('钱包结算失败')
         settled = true
-        await releaseChannel(event, lease)
-        admitted = null
-        await touchKeyCredential(event, key.id)
+        if (!await releaseTrackedChannel(lease)) throw new Error('无法释放渠道并发租约')
+        await bestEffort(touchKeyCredential(event, key.id))
         if (response.ok) {
-          await recordChannelSuccess(event, candidate.channel.id, candidate.channel.ownerKind === 'user' ? candidate.protocolBinding.id : undefined)
-          await rememberAffinitySelection(event, affinityKey, candidate)
+          await bestEffort(recordChannelSuccess(event, candidate.channel.id, candidate.channel.ownerKind === 'user' ? candidate.protocolBinding.id : undefined))
+          await bestEffort(rememberAffinitySelection(event, affinityKey, candidate))
         }
         else {
           const failureText = output.toString('utf8').slice(0, 2000)
           const failureClass = classifyRelayFailure(response.status, failureText)
-          if (candidate.channel.ownerKind === 'user') await markUserRelayFailure(event, candidate.channel.id, failureClass, failureText)
-          if (relayFailureAffectsAccount(failureClass)) await recordChannelFailure(event, candidate.channel.id, `HTTP ${response.status}`)
+          if (candidate.channel.ownerKind === 'user') await bestEffort(markUserRelayFailure(event, candidate.channel.id, failureClass, failureText))
+          if (relayFailureAffectsAccount(failureClass)) await bestEffort(recordChannelFailure(event, candidate.channel.id, `HTTP ${response.status}`))
         }
         setResponseStatus(event, response.status)
         setResponseHeader(event, 'content-type', 'application/json; charset=utf-8')
@@ -455,20 +647,19 @@ export async function handleAnthropicMessages(event: H3Event) {
         return output
       } catch (error) {
         if (upstreamTimer) clearTimeout(upstreamTimer)
-        if (streamArchive && !streamArchive.destroyed) streamArchive.destroy()
-        if (streamDirectory) await rm(streamDirectory, { recursive: true, force: true }).catch(() => {})
         await closeConnection()
-        await releaseChannel(event, lease)
-        admitted = null
-        await recordChannelFailure(event, candidate.channel.id, error instanceof Error ? error.message : 'upstream error')
-        await useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'failed', durationMs: Date.now() - started, errorMessage: error instanceof Error ? error.message.slice(0, 2000) : 'Unknown upstream error', failureClass: 'upstream_unavailable', ...resourceFields(candidate) })
+        if (!await releaseTrackedChannel(lease)) throw new Error('无法释放渠道并发租约')
+        const localStatus = Number((error as { statusCode?: number }).statusCode || 0)
+        if (attempts === 0 && localStatus >= 400 && localStatus < 500) throw error
+        await bestEffort(recordChannelFailure(event, candidate.channel.id, error instanceof Error ? error.message : 'upstream error'))
+        await bestEffort(useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: 'failed', durationMs: Date.now() - started, errorMessage: redactSensitiveText(error instanceof Error ? error.message : 'Unknown upstream error', 2000), failureClass: 'upstream_unavailable', ...resourceFields(candidate) }))
         if (responseStarted) {
-          const message = error instanceof Error ? error.message.slice(0, 500) : 'Upstream stream failed'
+          const message = redactSensitiveText(error instanceof Error ? error.message : 'Upstream stream failed', 500)
           if (!event.node.res.destroyed && !event.node.res.writableEnded) {
             await writeResponseChunk(event.node.res, Buffer.from(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message } })}\n\n`)).catch(() => false)
             if (!event.node.res.writableEnded) event.node.res.end()
           }
-          await useDatabase(event).update(requestLogs).set({
+          await bestEffort(useDatabase(event).update(requestLogs).set({
             channelId: candidate.channel.id,
             protocolBindingId: candidate.protocolBinding.id,
             outboundProtocol: candidate.protocolBinding.protocol,
@@ -481,29 +672,70 @@ export async function handleAnthropicMessages(event: H3Event) {
             httpStatus: 502,
             errorMessage: message,
             durationMs: Date.now() - started,
-            failoverCount: Math.max(0, attempts - 1),
+            failoverCount: routeFailoverState.count,
             completedAt: new Date()
-          }).where(eq(requestLogs.id, log.id))
-          await settleHubRequest(event, key, group, 0, 0, reservation.tokens, supplyDecision.source === 'user_relay' ? 0 : reservation.cost, concurrencyLease).catch(() => {})
-          if (walletHeld && walletHoldKey) { await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {}); walletHeld = false }
+          }).where(eq(requestLogs.id, log.id)))
+          try {
+            await settleAdmissions(0, 0)
+          } catch (settlementError) {
+            // Do not claim the admission was settled when Redis failed. Let
+            // the outer cleanup retry through the idempotent Redis script.
+            throw settlementError
+          }
+          if (walletHeld && walletHoldKey) {
+            if (walletSettlementCost !== null) {
+              if (!await settleWalletReservation(walletSettlementCost)) throw new Error('钱包结算失败')
+            } else {
+              if (!await bestEffort(releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId))) throw new Error('无法释放钱包冻结')
+              walletHeld = false
+            }
+          }
           settled = true
           return
         }
         if (index === candidates.length - 1) throw error
+      } finally {
+        if (streamArchive && !streamArchive.destroyed) streamArchive.destroy()
+        if (streamDirectory) await rm(streamDirectory, { recursive: true, force: true }).catch(() => {})
       }
     }
     anthropicError(503, 'All matching channels are at their concurrency limit', 'overloaded_error')
   } catch (error) {
-    if (admitted) await releaseChannel(event, admitted).catch(() => {})
-    if (!settled) await settleHubRequest(event, key, group, 0, 0, reservation.tokens, supplyDecision.source === 'user_relay' ? 0 : reservation.cost, concurrencyLease).catch(() => {})
-    if (walletHeld && walletHoldKey) { await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {}); walletHeld = false }
-    const message = error instanceof Error ? error.message : 'All upstream channels failed'
-    await useDatabase(event).update(requestLogs).set({
+    if (admittedChannel) await releaseTrackedChannel(admittedChannel)
+    if (!settled) {
+      if (!baseAdmissionSettled) await settleBaseAdmission()
+      await releasePackageReservation()
+    }
+    if (walletHeld && walletHoldKey) {
+      if (walletSettlementCost !== null) await settleWalletReservation(walletSettlementCost)
+      else await releasePackageReservation()
+    }
+    const message = redactSensitiveText(error instanceof Error ? error.message : 'All upstream channels failed', 2000)
+    const failureStatus = Number((error as { statusCode?: number }).statusCode || 0)
+    const httpStatus = failureStatus >= 400 && failureStatus < 600 ? failureStatus : 502
+    await bestEffort(useDatabase(event).update(requestLogs).set({
       channelId: lastCandidate?.channel.id || null,
       protocolBindingId: lastCandidate?.protocolBinding.id || null,
       ...(lastCandidate ? resourceFields(lastCandidate) : {}),
-      status: 'error', httpStatus: 502, errorMessage: message.slice(0, 2000), durationMs: 0, failoverCount: Math.max(0, attempts - 1), completedAt: new Date()
-    }).where(eq(requestLogs.id, log.id))
+      status: 'error', httpStatus, errorMessage: message, durationMs: Date.now() - startedAt, failoverCount: routeFailoverState.count, completedAt: new Date()
+    }).where(eq(requestLogs.id, log.id)))
+    await bestEffort(recordUsageRollups(event, {
+      keyId: key.id,
+      userId,
+      groupId: group.id,
+      channelId: lastCandidate?.channel.id || null,
+      protocolBindingId: lastCandidate?.protocolBinding.id || null,
+      protocol: lastCandidate?.protocolBinding.protocol || null,
+      model: requestedModel,
+      endpoint,
+      status: 'error',
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      cost: 0,
+      durationMs: Date.now() - startedAt,
+      failovers: routeFailoverState.count
+    }))
     throw error
   }
 }

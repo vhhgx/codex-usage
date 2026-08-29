@@ -37,7 +37,7 @@ export function normalizeUserUpstreamUrl(raw: string) {
   return url.toString().replace(/\/$/, '')
 }
 
-export async function resolvePublicUpstream(raw: string) {
+export async function resolvePublicUpstream(raw: string, options: { allowPrivateNetwork?: boolean } = {}) {
   const normalized = normalizeUserUpstreamUrl(raw)
   const url = new URL(normalized)
   let addresses: Array<{ address: string; family: 4 | 6 }>
@@ -49,7 +49,11 @@ export async function resolvePublicUpstream(raw: string) {
     throw createError({ statusCode: 400, message: `无法解析中转地址：${message}` })
   }
   const allowTunFakeIp = allowTunFakeIpForHostname(url.hostname)
-  if (!addresses.length || addresses.some(item => !isPublicUpstreamAddress(item.address) && !(allowTunFakeIp && isTunFakeIpAddress(item.address)))) {
+  const privateAllowed = options.allowPrivateNetwork === true
+  const isAllowed = (address: string) => isPublicUpstreamAddress(address)
+    || privateAllowed && ipaddr.isValid(address) && ['private', 'uniqueLocal', 'carrierGradeNat'].includes(ipaddr.parse(address).range())
+    || allowTunFakeIp && isTunFakeIpAddress(address)
+  if (!addresses.length || addresses.some(item => !isAllowed(item.address))) {
     throw createError({ statusCode: 400, message: '中转地址解析到了不允许访问的网络' })
   }
   return { normalized, url, addresses: addresses.slice(0, 8) }
@@ -82,6 +86,9 @@ export function upstreamTarget(raw: string, path: string) {
   const normalized = normalizeUserUpstreamUrl(raw)
   const endpoint = path.startsWith('/') ? path : `/${path}`
   const versionedBase = /\/v\d+(?:\.\d+)?$/i.test(new URL(normalized).pathname)
+  // The request's `/v1` segment is the operation namespace, while the base
+  // URL retains the provider's versioned prefix (including namespaced paths
+  // such as `/api/v1`).
   const suffix = versionedBase ? endpoint.replace(/^\/v1(?=\/|$)/i, '') : endpoint
   return `${normalized}${suffix}`
 }
@@ -127,12 +134,12 @@ async function pinnedResolvedFetch(
   throw failure
 }
 
-export async function pinnedUpstreamFetch(raw: string, path: string, init: Parameters<typeof undiciFetch>[1] = {}) {
-  const resolved = await resolvePublicUpstream(raw)
+export async function pinnedUpstreamFetch(raw: string, path: string, init: Parameters<typeof undiciFetch>[1] = {}, options: { allowPrivateNetwork?: boolean } = {}) {
+  const resolved = await resolvePublicUpstream(raw, options)
   return pinnedResolvedFetch(resolved, upstreamTarget(resolved.normalized, path), init)
 }
 
-export async function pinnedUpstreamBaseFetch(raw: string, init: Parameters<typeof undiciFetch>[1] = {}) {
-  const resolved = await resolvePublicUpstream(raw)
+export async function pinnedUpstreamBaseFetch(raw: string, init: Parameters<typeof undiciFetch>[1] = {}, options: { allowPrivateNetwork?: boolean } = {}) {
+  const resolved = await resolvePublicUpstream(raw, options)
   return pinnedResolvedFetch(resolved, resolved.normalized, init)
 }

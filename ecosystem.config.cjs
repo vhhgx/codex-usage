@@ -1,15 +1,20 @@
+const fs = require('node:fs')
 const path = require('node:path')
 
 const rootDir = __dirname
+const defaultEnvFile = fs.existsSync(path.join(rootDir, '.env'))
+  ? path.join(rootDir, '.env')
+  : path.join(rootDir, 'deploy/hong-kong/.env')
+const envFile = path.resolve(rootDir, process.env.HUB_ENV_FILE || defaultEnvFile)
 
 module.exports = {
   apps: [
     {
       name: 'zephyr-console',
       cwd: rootDir,
-      script: path.join(rootDir, '.output/server/index.mjs'),
+      script: path.join(rootDir, 'scripts/start-production.mjs'),
       interpreter: 'node',
-      node_args: `--env-file=${path.join(rootDir, '.env')}`,
+      node_args: `--env-file=${envFile}`,
       instances: 1,
       exec_mode: 'fork',
       autorestart: true,

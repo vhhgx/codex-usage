@@ -3,7 +3,7 @@ import { and, asc, eq, inArray, max, sql } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { createError } from 'h3'
 import type { ChannelAuthScheme, ChannelModelView, ChannelProtocol, ChannelType, RelayAccountOrderMode, RelayModelScope, RelayPlatformType, UserRelayAccountView, UserRelayGroupView } from '#shared/types/hub'
-import { relayProviderPresets } from '#shared/relay-provider-presets'
+import { relayPresetCapabilityMode, relayProviderPresets } from '#shared/relay-provider-presets'
 import { latestModelsByFamily, modelScope } from '#shared/utils/model-routing'
 import { useDatabase } from '../db'
 import { channelModels, channelProtocolBindings, channels, userModelSourcePreferences, userPoolAccounts, userPoolGroups, userRelayAccountStates, userRelayGroups, userRoutePreferences } from '../db/schema'
@@ -11,8 +11,8 @@ import { decryptChannelSecret, decryptContextSecret, encryptChannelSecret, encry
 import { normalizeUserUpstreamUrl, pinnedUpstreamFetch, resolvePublicUpstream, upstreamNetworkError, userUpstreamTarget } from '../utils/upstream-url'
 import { redactSensitiveText } from '../utils/upstream'
 import { isClientIdentityRejection, probeAuthSchemes, upstreamAuthHeaders } from '../utils/upstream-auth'
-import { upstreamProbeClientIdentity } from '../utils/upstream-client-identity'
-import { listChannels, parseChannelModels, parseChannelProtocols, replaceChannelModels, replaceChannelProtocols } from './hub-admin'
+import { requestUpstreamClientIdentity, upstreamProbeClientIdentity } from '../utils/upstream-client-identity'
+import { channelProtocolSetChanged, listChannels, parseChannelModels, parseChannelProtocols, replaceChannelModels, replaceChannelProtocols } from './hub-admin'
 import { discoverUpstreamModelIds, modelIdsFromPayload, persistDiscoveredModels, syncChannelModelsFromUpstream } from './hub-model-discovery'
 import { invalidateChannelAccess } from './channel-access'
 import { channelCircuitState } from './hub-routing'
@@ -330,9 +330,12 @@ export async function getUserRelay(event: H3Event, ownerUserId: string, id: stri
 }
 
 export function preferredModelDiscoveryProtocol<T extends { protocol: ChannelProtocol }>(protocols: T[]) {
-  return protocols.find(binding => binding.protocol === 'openai_responses')
-    || protocols.find(binding => binding.protocol === 'openai_chat')
-    || protocols[0]
+  const enabled = protocols.filter(binding => (binding as T & { enabled?: boolean }).enabled !== false)
+  const candidates = enabled.filter(binding => (binding as T & { verificationStatus?: string }).verificationStatus !== 'failed')
+  const pool = candidates.length ? candidates : enabled
+  return pool.find(binding => binding.protocol === 'openai_responses')
+    || pool.find(binding => binding.protocol === 'openai_chat')
+    || pool[0]
 }
 
 async function discoverPrivateModels(baseUrl: string, apiKey: string, timeoutMs: number, protocols: ReturnType<typeof parseChannelProtocols>) {
@@ -341,7 +344,8 @@ async function discoverPrivateModels(baseUrl: string, apiKey: string, timeoutMs:
   const ids = await discoverUpstreamModelIds(baseUrl, apiKey, timeoutMs, {
     authScheme: preferred.authScheme,
     apiVersion: preferred.apiVersion,
-    privateUrl: true
+    privateUrl: true,
+    protocol: preferred.protocol
   })
   return ids.slice(0, MAX_USER_RELAY_MODELS).map(upstreamModel => ({
     publicModel: upstreamModel,
@@ -362,21 +366,49 @@ export async function discoverUserRelayModels(event: H3Event, ownerUserId: strin
   const configured = relayId
     ? await useDatabase(event).select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, relayId))
     : []
-  const preferred = preferredModelDiscoveryProtocol(configured)
-  const attempts = configured.length
-    ? [preferred!, ...configured.filter(protocol => protocol !== preferred)]
+  const preset = relayPreset(body.providerPresetId)
+  const requestedProtocols = !configured.length && Array.isArray(body.protocols)
+    ? parseChannelProtocols(body.protocols, 'openai_compatible')
+    : []
+  const presetProtocols = !configured.length && !requestedProtocols.length && preset?.protocols.length
+    ? preset.protocols.map(item => ({ protocol: item.protocol, authScheme: item.authScheme, apiVersion: item.protocol === 'anthropic_messages' ? '2023-06-01' : null, baseUrlOverride: item.baseUrlOverride || null, enabled: true, verificationStatus: 'unknown' as const }))
+    : []
+  type DiscoveryProtocol = {
+    protocol: ChannelProtocol
+    authScheme: ChannelAuthScheme
+    apiVersion: string | null
+    baseUrlOverride: string | null
+    enabled: boolean
+    verificationStatus: 'unknown' | 'verified' | 'pending_real_client' | 'failed'
+  }
+  const sourceProtocols: DiscoveryProtocol[] = configured.length
+    ? configured.map(protocol => ({ protocol: protocol.protocol, authScheme: protocol.authScheme, apiVersion: protocol.apiVersion, baseUrlOverride: protocol.baseUrlOverride, enabled: protocol.enabled, verificationStatus: protocol.verificationStatus }))
+    : requestedProtocols.length
+      ? requestedProtocols.map(protocol => ({ protocol: protocol.protocol, authScheme: protocol.authScheme, apiVersion: protocol.apiVersion, baseUrlOverride: protocol.baseUrlOverride, enabled: protocol.enabled, verificationStatus: 'unknown' as const }))
+      : presetProtocols
+  const enabledSourceProtocols = sourceProtocols.filter(protocol => protocol.enabled !== false)
+  const preferred = preferredModelDiscoveryProtocol(enabledSourceProtocols)
+  const attempts = enabledSourceProtocols.length
+    ? [preferred!, ...enabledSourceProtocols.filter(protocol => protocol !== preferred)]
     : [
-        { protocol: 'openai_responses' as const, authScheme: 'bearer' as const, apiVersion: null, baseUrlOverride: null },
-        { protocol: 'anthropic_messages' as const, authScheme: 'x_api_key' as const, apiVersion: '2023-06-01', baseUrlOverride: null }
+        ...(sourceProtocols.length
+          ? []
+          : [
+              { protocol: 'openai_responses' as const, authScheme: 'bearer' as const, apiVersion: null, baseUrlOverride: null, enabled: true, verificationStatus: 'unknown' as const },
+              { protocol: 'anthropic_messages' as const, authScheme: 'x_api_key' as const, apiVersion: '2023-06-01', baseUrlOverride: null, enabled: true, verificationStatus: 'unknown' as const }
+            ])
       ]
+  if (!attempts.length) throw createError({ statusCode: 409, message: '请先启用至少一种上游协议后再获取模型' })
   let lastError: unknown
   for (const protocol of attempts) {
     try {
-      const ids = await discoverUpstreamModelIds(baseUrl, apiKey, integer(body.timeoutMs, 1000, 600000, relay?.timeoutMs || 120000), {
+      const ids = await discoverUpstreamModelIds(protocol.baseUrlOverride || baseUrl, apiKey, integer(body.timeoutMs, 1000, 600000, relay?.timeoutMs || 120000), {
         authScheme: protocol.authScheme,
         apiVersion: protocol.apiVersion,
         privateUrl: true,
-        protocol: protocol.protocol
+        protocol: protocol.protocol,
+        requestEvent: event,
+        clientIdentityMode: relay?.clientIdentityMode === 'passthrough' || body.clientIdentityMode === 'passthrough' ? 'passthrough' : 'standard'
       })
       return { models: ids.slice(0, MAX_USER_RELAY_MODELS) }
     } catch (error) { lastError = error }
@@ -412,9 +444,24 @@ export async function createUserRelay(event: H3Event, ownerUserId: string, body:
   if (insecureHttp && body.insecureHttpAcknowledged !== true) throw createError({ statusCode: 400, message: '使用 HTTP 中转前必须确认 API Key 和请求内容将以明文传输' })
   validateModelCount(body.models)
   const preset = relayPreset(body.providerPresetId)
-  const presetProtocols = preset?.protocols.map(item => ({ ...item, enabled: true, baseUrlOverride: item.baseUrlOverride || null, apiVersion: item.protocol === 'anthropic_messages' ? '2023-06-01' : null, probeModel: preset.defaultModels?.[0] || null, capabilityMode: 'native' as const })) || []
-  const provisionalType: ChannelType = presetProtocols.some(item => item.protocol === 'anthropic_messages') && !presetProtocols.some(item => item.protocol !== 'anthropic_messages') ? 'anthropic_compatible' : 'openai_compatible'
-  const protocols = presetProtocols.length ? await validateUserProtocols(presetProtocols) : []
+  const presetProtocols = preset?.protocols.map(item => ({ ...item, enabled: true, baseUrlOverride: item.baseUrlOverride || null, apiVersion: item.protocol === 'anthropic_messages' ? '2023-06-01' : null, probeModel: preset.defaultModels?.[0] || null, capabilityMode: relayPresetCapabilityMode(preset, item.protocol) })) || []
+  const scopes = preset?.modelScopes?.length ? preset.modelScopes : relayModelScopes(body.modelScopes)
+  const provisionalType: ChannelType = presetProtocols.some(item => item.protocol === 'anthropic_messages') && !presetProtocols.some(item => item.protocol !== 'anthropic_messages')
+    ? 'anthropic_compatible'
+    : 'openai_compatible'
+  const explicitProtocols = Array.isArray(body.protocols) && body.protocols.length
+    ? parseChannelProtocols(body.protocols, provisionalType)
+    : []
+  const defaultProtocols = [
+    ...(scopes.includes('gpt') || scopes.includes('other') ? [
+      { protocol: 'openai_responses' as const },
+      { protocol: 'openai_chat' as const }
+    ] : []),
+    ...(scopes.includes('claude') ? [{ protocol: 'anthropic_messages' as const }] : [])
+  ]
+  const protocols = await validateUserProtocols(
+    presetProtocols.length ? presetProtocols : explicitProtocols.length ? explicitProtocols : parseChannelProtocols(defaultProtocols, provisionalType)
+  )
   if (!group) {
     const [createdGroup] = await db.insert(userRelayGroups).values({
       ownerUserId,
@@ -432,7 +479,6 @@ export async function createUserRelay(event: H3Event, ownerUserId: string, body:
   const id = randomUUID()
   const timeoutMs = integer(body.timeoutMs, 1000, 600000, 120000)
   const models = parseChannelModels(body.models)
-  const scopes = preset?.modelScopes?.length ? preset.modelScopes : relayModelScopes(body.modelScopes)
   if (!preset && !scopes.length) throw createError({ statusCode: 400, message: '请至少选择一个模型品类' })
   const [created] = await db.insert(channels).values({
     id,
@@ -496,25 +542,36 @@ export async function updateUserRelay(event: H3Event, ownerUserId: string, id: s
     if (!relay.providerPresetId && !scopes.length) throw createError({ statusCode: 400, message: '请至少选择一个模型品类' })
     patch.modelScopes = scopes
   }
-  if ('clientIdentityMode' in body || 'protocols' in body || 'baseUrl' in body || text(body.apiKey, 2000)) {
-    patch.healthStatus = 'unknown'
-    patch.lastHealthError = null
-  }
   const checkinToken = text(body.checkinToken, 4096)
   if (checkinToken) patch.encryptedCheckinToken = encryptContextSecret(checkinToken, `user-relay-checkin:${id}`, event)
   if ('checkinEnabled' in body) {
+    const relayGroup = relay.userRelayGroupId ? await ownedRelayGroup(event, ownerUserId, relay.userRelayGroupId) : null
+    const platform = relayPlatformDefinition(relayGroup?.platformType || 'generic')
+    if (body.checkinEnabled === true && !platform.supportsCheckin) throw createError({ statusCode: 400, message: `${platform.label} 不支持 Hub 签到` })
     if (body.checkinEnabled === true && !checkinToken && !relay.encryptedCheckinToken) throw createError({ statusCode: 400, message: '启用签到时必须填写 NewAPI 控制台访问令牌' })
     patch.checkinEnabled = body.checkinEnabled === true
   }
   if ('checkinUserId' in body) patch.checkinUserId = text(body.checkinUserId, 120) || null
   validateModelCount(body.models)
-  let protocols = await useDatabase(event).select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, id))
+  const existingProtocols = await useDatabase(event).select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, id))
+  let protocols = existingProtocols
+  let protocolChanged = false
   if ('protocols' in body) {
     const parsed = await validateUserProtocols(parseChannelProtocols(body.protocols, relay.type))
-    protocols = await replaceChannelProtocols(event, id, parsed)
+    protocolChanged = channelProtocolSetChanged(existingProtocols, parsed)
+    protocols = parsed as typeof existingProtocols
     if (parsed.length) patch.type = relayType(parsed)
   }
+  const connectionChanged = ('baseUrl' in body && patch.baseUrl !== relay.baseUrl)
+    || Boolean(text(body.apiKey, 2000))
+    || ('clientIdentityMode' in body && patch.clientIdentityMode !== relay.clientIdentityMode)
+    || protocolChanged
+  if (connectionChanged) {
+    patch.healthStatus = 'unknown'
+    patch.lastHealthError = null
+  }
   await useDatabase(event).update(channels).set(patch).where(and(eq(channels.id, id), eq(channels.ownerUserId, ownerUserId)))
+  if ('protocols' in body) protocols = await replaceChannelProtocols(event, id, protocols as ReturnType<typeof parseChannelProtocols>)
   if ('models' in body) {
     const models = parseChannelModels(body.models)
     await replaceChannelModels(event, id, models, protocols)
@@ -532,14 +589,94 @@ function testPayload(protocol: ChannelProtocol, model: string) {
   return { path: '/v1/chat/completions', body: { model, max_tokens: 1, messages: [{ role: 'user', content: 'Reply OK' }] } }
 }
 
+type ProtocolProbeResult = {
+  protocol: ChannelProtocol
+  ok: boolean
+  clientIdentityRejected: boolean
+  clientIdentityProbed?: boolean
+  authScheme?: ChannelAuthScheme
+  apiVersion?: string | null
+  baseUrlOverride?: string | null
+  probeModel?: string | null
+  model?: string | null
+  capabilityMode?: 'native' | 'responses_via_chat' | 'unsupported'
+  message?: string | null
+}
+
+/**
+ * A protocol test is observational. It must update capability/health metadata
+ * without deleting hand-configured protocols or touching the model directory.
+ * New protocols are only created when a relay had no binding for that protocol.
+ */
+async function persistProtocolProbeResults(
+  db: ReturnType<typeof useDatabase>,
+  channelId: string,
+  results: ProtocolProbeResult[]
+) {
+  if (!results.length) return []
+  const existing = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, channelId))
+  const rows: Array<typeof channelProtocolBindings.$inferSelect> = []
+  for (const result of results) {
+    const current = existing.find(item => item.protocol === result.protocol)
+    const now = new Date()
+    const verified = result.ok && !result.clientIdentityRejected
+    const status = verified ? 'verified' as const : result.clientIdentityRejected ? 'pending_real_client' as const : 'failed' as const
+    const values = {
+      // Do not change enabled here: a health check cannot override a user's
+      // explicit enable/disable choice.
+      authScheme: result.authScheme
+        ? (result.authScheme === 'x_api_key' ? 'x_api_key' as const : 'bearer' as const)
+        : current?.authScheme || 'bearer' as const,
+      apiVersion: result.apiVersion === undefined ? current?.apiVersion || null : result.apiVersion,
+      // A hand-picked probe model is part of the user's configuration. Only
+      // fill it for a new/empty binding; a later health check must not replace
+      // it with whichever model happened to be selected automatically.
+      probeModel: current?.probeModel || (result.model === undefined ? null : result.model),
+      baseUrlOverride: result.baseUrlOverride === undefined ? current?.baseUrlOverride || null : result.baseUrlOverride,
+      capabilityMode: result.capabilityMode || current?.capabilityMode || 'native',
+      verificationStatus: status,
+      detectedAt: now,
+      verifiedAt: verified ? now : null,
+      lastError: verified ? null : result.message || (result.clientIdentityRejected ? '上游要求兼容客户端身份' : '协议检测失败'),
+      updatedAt: now
+    }
+    if (current) {
+      await db.update(channelProtocolBindings).set(values).where(eq(channelProtocolBindings.id, current.id))
+      rows.push({ ...current, ...values })
+    } else {
+      const [created] = await db.insert(channelProtocolBindings).values({
+        channelId,
+        protocol: result.protocol,
+        enabled: verified,
+        authScheme: values.authScheme,
+        apiVersion: values.apiVersion,
+        probeModel: values.probeModel,
+        baseUrlOverride: values.baseUrlOverride,
+        capabilityMode: values.capabilityMode,
+        verificationStatus: values.verificationStatus,
+        detectedAt: values.detectedAt,
+        verifiedAt: values.verifiedAt,
+        lastError: values.lastError,
+        updatedAt: values.updatedAt
+      }).returning()
+      if (created) rows.push(created)
+    }
+  }
+  return rows
+}
+
 export async function testUserRelay(event: H3Event, ownerUserId: string, id: string, requestedModel = '') {
   const relay = await ownedRelay(event, ownerUserId, id)
   const db = useDatabase(event)
   const configuredProtocols = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, id))
+  // A disabled binding is an explicit opt-out. It must not be selected for
+  // model discovery or protocol verification, otherwise a stale/unsupported
+  // protocol can make the relay look unhealthy and overwrite its settings.
+  const enabledProtocols = configuredProtocols.filter(protocol => protocol.enabled)
   const apiKey = decryptChannelSecret(relay.encryptedApiKey, relay.id, 'user', event)
-  const modelProtocol = preferredModelDiscoveryProtocol(configuredProtocols)
+  const modelProtocol = preferredModelDiscoveryProtocol(enabledProtocols)
   const connectivity = {
-    endpoint: userUpstreamTarget(relay.baseUrl, '/v1/models'),
+    endpoint: userUpstreamTarget(modelProtocol?.baseUrlOverride || relay.baseUrl, '/v1/models'),
     ok: false,
     reachable: false,
     status: null as number | null,
@@ -553,13 +690,16 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
   }
   const connectivityStarted = Date.now()
   let discoveredModels: string[] = []
+  let connectivitySelectedAuthScheme: ChannelAuthScheme | null = null
   try {
     const identityProtocol: ChannelProtocol = modelProtocol?.protocol || (relay.modelScopes.length === 1 && relay.modelScopes[0] === 'claude' ? 'anthropic_messages' : 'openai_responses')
     const probe = await probeAuthSchemes(connectivity.authScheme, async (authScheme) => {
+      let identityRetried = false
+      const forwardedIdentity = relay.clientIdentityMode === 'passthrough' ? requestUpstreamClientIdentity(event, identityProtocol) : {}
       const request = async (withIdentity: boolean) => {
-        const result = await pinnedUpstreamFetch(relay.baseUrl, '/v1/models', {
+        const result = await pinnedUpstreamFetch(modelProtocol?.baseUrlOverride || relay.baseUrl, '/v1/models', {
           method: 'GET',
-          headers: { ...upstreamAuthHeaders(authScheme, apiKey, modelProtocol?.apiVersion), ...(withIdentity ? upstreamProbeClientIdentity(identityProtocol) : {}) },
+          headers: { ...upstreamAuthHeaders(authScheme, apiKey, modelProtocol?.apiVersion), ...(withIdentity ? (Object.keys(forwardedIdentity).length ? forwardedIdentity : upstreamProbeClientIdentity(identityProtocol)) : forwardedIdentity) },
           signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 15000))
         })
         connectivity.endpoint = result.target
@@ -570,23 +710,36 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
       }
       let response = await request(false)
       if (!response.ok && isClientIdentityRejection(response.body)) {
+        identityRetried = true
         connectivity.clientIdentityProbed = true
         response = await request(true)
       }
-      return response
+      // Synthetic probe identity proves only that the upstream accepts the
+      // protocol; it is not evidence that a real client request will pass.
+      const identityOnly = identityRetried && response.ok && !Object.keys(forwardedIdentity).length
+      return { ...response, identityOnly }
     })
     const final = probe.attempts.at(-1)!
     connectivity.reachable = true
-    connectivity.ok = probe.ok
+    connectivitySelectedAuthScheme = probe.selectedAuthScheme
+    const selectedAttempt = probe.selectedAuthScheme
+      ? probe.attempts.find(attempt => attempt.authScheme === probe.selectedAuthScheme) || final
+      : final
+    const identityOnly = probe.selectedAuthScheme
+      ? selectedAttempt?.identityOnly === true
+      : probe.attempts.some(attempt => attempt.identityOnly === true)
+    connectivity.ok = probe.ok && !identityOnly
     connectivity.status = final.status
     connectivity.authScheme = probe.selectedAuthScheme || final.authScheme
     connectivity.attemptedAuthSchemes = probe.attempts.map(attempt => attempt.authScheme)
-    if (probe.ok) {
+    if (connectivity.ok) {
       try { discoveredModels = modelIdsFromPayload(JSON.parse(final.body)); connectivity.modelCount = discoveredModels.length } catch {}
       if (!connectivity.modelCount) connectivity.message = '模型接口可访问，但没有识别到模型；检测不会自动修改模型目录'
     } else {
       connectivity.errorCode = final.status ? `HTTP_${final.status}` : 'UPSTREAM_ERROR'
-      connectivity.message = `${final.status ? `HTTP ${final.status}: ` : ''}${redactSensitiveText(final.body)}`.slice(0, 500)
+      connectivity.message = identityOnly
+        ? '上游要求兼容客户端身份，需使用真实 Claude Code / Codex 请求验证'
+        : `${final.status ? `HTTP ${final.status}: ` : ''}${redactSensitiveText(final.body)}`.slice(0, 500)
     }
   } catch (error) {
     const detail = upstreamNetworkError(error)
@@ -594,24 +747,50 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
     connectivity.message = detail.message
   }
   connectivity.latencyMs = Date.now() - connectivityStarted
+  if (configuredProtocols.length && modelProtocol && connectivity.attemptedAuthSchemes.length) {
+    // Persist a working fallback auth scheme, but leave protocol verification
+    // untouched because this endpoint only proves /v1/models connectivity.
+    const selected = connectivitySelectedAuthScheme
+    const binding = configuredProtocols.find(item => item.protocol === modelProtocol.protocol)
+    if (binding && selected && selected !== binding.authScheme) {
+      await db.update(channelProtocolBindings).set({ authScheme: selected, updatedAt: new Date() }).where(eq(channelProtocolBindings.id, binding.id))
+    }
+  }
   const latest = latestModelsByFamily(discoveredModels)
   const latestByScope = (scope: RelayModelScope) => latest.find(item => modelScope(item.model) === scope)?.model
   const fallbackModel = latest[0]?.model || null
   const preset = relayPreset(relay.providerPresetId)
-  const candidateProtocols: Array<{ protocol: ChannelProtocol; authScheme: ChannelAuthScheme; apiVersion: string | null; baseUrlOverride: string | null; probeModel: string | null }> = configuredProtocols.length
-    ? configuredProtocols.map(item => ({ protocol: item.protocol, authScheme: item.authScheme, apiVersion: item.apiVersion, baseUrlOverride: item.baseUrlOverride, probeModel: item.probeModel }))
-    : (preset?.protocols.length
-        ? preset.protocols.map(item => ({ protocol: item.protocol, authScheme: item.authScheme, apiVersion: item.protocol === 'anthropic_messages' ? '2023-06-01' : null, baseUrlOverride: item.baseUrlOverride || null, probeModel: null }))
+  const candidateProtocols: Array<{ protocol: ChannelProtocol; authScheme: ChannelAuthScheme; apiVersion: string | null; baseUrlOverride: string | null; probeModel: string | null }> = enabledProtocols.length
+    ? enabledProtocols.map(item => ({ protocol: item.protocol, authScheme: item.authScheme, apiVersion: item.apiVersion, baseUrlOverride: item.baseUrlOverride, probeModel: item.probeModel }))
+    : configuredProtocols.length
+      ? []
+      : (preset?.protocols.length
+        ? preset.protocols.map(item => ({ protocol: item.protocol, authScheme: item.authScheme, apiVersion: item.protocol === 'anthropic_messages' ? '2023-06-01' : null, baseUrlOverride: item.baseUrlOverride || null, probeModel: preset.defaultModels?.[0] || null }))
         : [
             ...(relay.modelScopes.includes('gpt') ? [{ protocol: 'openai_responses' as const, authScheme: 'bearer' as const, apiVersion: null, baseUrlOverride: null, probeModel: null }, { protocol: 'openai_chat' as const, authScheme: 'bearer' as const, apiVersion: null, baseUrlOverride: null, probeModel: null }] : []),
             ...(relay.modelScopes.includes('claude') ? [{ protocol: 'anthropic_messages' as const, authScheme: 'x_api_key' as const, apiVersion: '2023-06-01', baseUrlOverride: null, probeModel: null }] : []),
             ...(relay.modelScopes.length === 1 && relay.modelScopes[0] === 'other' ? [{ protocol: 'openai_responses' as const, authScheme: 'bearer' as const, apiVersion: null, baseUrlOverride: null, probeModel: null }, { protocol: 'openai_chat' as const, authScheme: 'bearer' as const, apiVersion: null, baseUrlOverride: null, probeModel: null }] : [])
           ])
   const results: Array<Record<string, unknown> & { protocol: ChannelProtocol; ok: boolean; clientIdentityRejected: boolean }> = []
-  for (const protocol of connectivity.reachable && discoveredModels.length ? candidateProtocols : []) {
+  // A provider may intentionally reject /v1/models (AgentRouter is one
+  // example) while accepting the actual protocol endpoint. HTTP reachability
+  // is enough to continue, using an explicitly configured or preset model.
+  // Only a DNS/TCP/TLS failure prevents protocol probes.
+  for (const protocol of connectivity.reachable ? candidateProtocols : []) {
     const expectedScope: RelayModelScope = protocol.protocol === 'anthropic_messages' ? 'claude' : relay.modelScopes.includes('gpt') ? 'gpt' : 'other'
-    const model = requestedModel && discoveredModels.includes(requestedModel) ? requestedModel : protocol.probeModel && discoveredModels.includes(protocol.probeModel) ? protocol.probeModel : latestByScope(expectedScope) || fallbackModel
-    if (!model) continue
+    const catalogModel = requestedModel && discoveredModels.includes(requestedModel)
+      ? requestedModel
+      : protocol.probeModel && discoveredModels.includes(protocol.probeModel)
+        ? protocol.probeModel
+        : latestByScope(expectedScope) || fallbackModel
+    // When the catalog is unavailable, an explicit/provisioned model is still
+    // a valid probe target. The upstream response, rather than /models, is the
+    // source of truth for this check.
+    const model = catalogModel || (requestedModel || protocol.probeModel || preset?.defaultModels?.[0] || null)
+    if (!model) {
+      results.push({ protocol: protocol.protocol, endpoint: userUpstreamTarget(protocol.baseUrlOverride || relay.baseUrl, testPayload(protocol.protocol, 'probe').path), ok: false, status: null, latencyMs: 0, errorCode: 'NO_PROBE_MODEL', message: '没有可用于协议检测的模型；请先获取模型或填写协议探测模型', authScheme: protocol.authScheme, attemptedAuthSchemes: [], clientIdentityRejected: false, clientIdentityProbed: false, model: null, verificationStatus: 'failed', baseUrlOverride: protocol.baseUrlOverride, apiVersion: protocol.apiVersion })
+      continue
+    }
     const payload = testPayload(protocol.protocol, model)
     let ok = false
     let message: string | null = null
@@ -620,12 +799,15 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
     let endpoint = userUpstreamTarget(protocol.baseUrlOverride || relay.baseUrl, payload.path)
     const started = Date.now()
     let selectedAuthScheme: ChannelAuthScheme | null = null
-    let attempts: Array<{ authScheme: ChannelAuthScheme; ok: boolean; status: number | null; body: string }> = []
+    let attempts: Array<{ authScheme: ChannelAuthScheme; ok: boolean; status: number | null; body: string; identityOnly?: boolean }> = []
     let clientIdentityUsed = false
+    let clientIdentityRejected = false
     try {
       const probe = await probeAuthSchemes(protocol.authScheme, async (authScheme) => {
+        let identityRetried = false
+        const forwardedIdentity = relay.clientIdentityMode === 'passthrough' ? requestUpstreamClientIdentity(event, protocol.protocol) : {}
         const request = async (withIdentity: boolean) => {
-          const clientIdentity = withIdentity || relay.clientIdentityMode === 'passthrough' ? upstreamProbeClientIdentity(protocol.protocol) : {}
+          const clientIdentity = withIdentity ? (Object.keys(forwardedIdentity).length ? forwardedIdentity : upstreamProbeClientIdentity(protocol.protocol)) : forwardedIdentity
           const headers = { 'content-type': 'application/json', ...clientIdentity, ...upstreamAuthHeaders(authScheme, apiKey, protocol.apiVersion) }
           const result = await pinnedUpstreamFetch(protocol.baseUrlOverride || relay.baseUrl, payload.path, {
             method: 'POST', headers, body: JSON.stringify(payload.body), signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 30000))
@@ -638,27 +820,33 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
         }
         let response = await request(false)
         if (!response.ok && isClientIdentityRejection(response.body)) {
+          clientIdentityRejected = true
+          identityRetried = true
           clientIdentityUsed = true
           response = await request(true)
         }
-        return response
+        const identityOnly = identityRetried && response.ok && !Object.keys(forwardedIdentity).length
+        return { ...response, identityOnly }
       })
-      ok = probe.ok
       selectedAuthScheme = probe.selectedAuthScheme
       attempts = probe.attempts
       const final = attempts.at(-1)!
+      const selectedAttempt = probe.selectedAuthScheme
+        ? attempts.find(attempt => attempt.authScheme === probe.selectedAuthScheme) || final
+        : final
       status = final.status
+      const selectedIdentityOnly = selectedAttempt.identityOnly === true
+      clientIdentityRejected = selectedIdentityOnly || (!probe.ok && attempts.some(attempt => attempt.identityOnly === true || isClientIdentityRejection(attempt.body)))
+      ok = probe.ok && !selectedIdentityOnly
       errorCode = ok ? null : status ? `HTTP_${status}` : 'UPSTREAM_ERROR'
-      message = ok ? null : `${status ? `HTTP ${status}: ` : ''}${redactSensitiveText(final.body)}`.slice(0, 500)
-      if (probe.changed && selectedAuthScheme) {
-        // The selected scheme is persisted with the detected capability below.
-      }
+      message = ok ? null : clientIdentityRejected || selectedIdentityOnly
+        ? '上游要求兼容客户端身份，需使用真实 Claude Code / Codex 请求验证'
+        : `${status ? `HTTP ${status}: ` : ''}${redactSensitiveText(final.body)}`.slice(0, 500)
     } catch (error) {
       const detail = upstreamNetworkError(error)
       errorCode = detail.code
       message = detail.message
     }
-    const clientIdentityRejected = attempts.some(attempt => isClientIdentityRejection(attempt.body))
     const verificationStatus = ok ? 'verified' : clientIdentityRejected ? 'pending_real_client' : 'failed'
     results.push({ protocol: protocol.protocol, endpoint, ok, status, latencyMs: Date.now() - started, errorCode, message, authScheme: selectedAuthScheme || protocol.authScheme, attemptedAuthSchemes: attempts.map(attempt => attempt.authScheme), clientIdentityRejected, clientIdentityProbed: clientIdentityUsed || relay.clientIdentityMode === 'passthrough', model, verificationStatus, baseUrlOverride: protocol.baseUrlOverride, apiVersion: protocol.apiVersion })
     if (protocol.protocol === 'openai_responses' && ok && !configuredProtocols.length) {
@@ -667,29 +855,19 @@ export async function testUserRelay(event: H3Event, ownerUserId: string, id: str
       if (chatIndex >= 0) candidateProtocols.splice(chatIndex, 1)
     }
   }
-  if (connectivity.reachable && discoveredModels.length) {
-    const protocolRows = await replaceChannelProtocols(event, id, results.map((result) => ({
+  if (connectivity.reachable && enabledProtocols.length && results.length) {
+    const hasNativeResponses = results.some(item => item.protocol === 'openai_responses' && item.ok)
+    await persistProtocolProbeResults(db, id, results.map(result => ({
       protocol: result.protocol,
-      enabled: result.ok || result.clientIdentityRejected,
-      baseUrlOverride: typeof result.baseUrlOverride === 'string' ? result.baseUrlOverride : null,
+      ok: result.ok,
+      clientIdentityRejected: result.clientIdentityRejected,
       authScheme: result.authScheme === 'x_api_key' ? 'x_api_key' : 'bearer',
       apiVersion: typeof result.apiVersion === 'string' ? result.apiVersion : null,
       probeModel: typeof result.model === 'string' ? result.model : null,
-      capabilityMode: result.protocol === 'openai_chat' && !results.some(item => item.protocol === 'openai_responses' && item.ok) ? 'responses_via_chat' : 'native'
+      baseUrlOverride: typeof result.baseUrlOverride === 'string' ? result.baseUrlOverride : null,
+      capabilityMode: result.protocol === 'openai_chat' && !hasNativeResponses ? 'responses_via_chat' : 'native',
+      message: typeof result.message === 'string' ? result.message : null
     })))
-    for (const row of protocolRows) {
-      const result = results.find(item => item.protocol === row.protocol)
-      if (!result) continue
-      await db.update(channelProtocolBindings).set({
-        verificationStatus: result.verificationStatus === 'verified' || result.verificationStatus === 'pending_real_client' ? result.verificationStatus : 'failed',
-        capabilityMode: row.protocol === 'openai_chat' && !results.some(item => item.protocol === 'openai_responses' && item.ok) ? 'responses_via_chat' : 'native',
-        detectedAt: new Date(),
-        verifiedAt: new Date(),
-        lastError: typeof result.message === 'string' ? result.message : null,
-        updatedAt: new Date()
-      }).where(eq(channelProtocolBindings.id, row.id))
-    }
-    await persistDiscoveredModels(event, id, discoveredModels)
   }
   const passed = results.filter(result => result.ok).length
   const pendingClientVerification = results.some(result => result.clientIdentityRejected)
@@ -714,13 +892,13 @@ export async function testUserRelayConnectivity(event: H3Event, ownerUserId: str
   const apiVersion = preferred?.apiVersion || null
   const identityProtocol = preferred?.protocol || 'openai_responses'
   const started = Date.now()
-  let endpoint = relay.baseUrl
+  let endpoint = userUpstreamTarget(preferred?.baseUrlOverride || relay.baseUrl, '/v1/models')
   let clientIdentityProbed = false
   let lastStatus: number | null = null
   let lastBody = ''
-  async function saveConnectivityHealth(success: boolean, message: string) {
+  async function saveConnectivityHealth(success: boolean, message: string, pending = false) {
     await db.update(channels).set({
-      healthStatus: success ? 'healthy' : 'unhealthy',
+      healthStatus: success ? 'healthy' : pending ? 'unknown' : 'unhealthy',
       lastHealthCheckAt: new Date(),
       lastHealthError: success ? null : message.slice(0, 2000),
       updatedAt: new Date()
@@ -728,10 +906,12 @@ export async function testUserRelayConnectivity(event: H3Event, ownerUserId: str
   }
   try {
     const probe = await probeAuthSchemes(authScheme, async (scheme) => {
+      let identityRetried = false
+      const forwardedIdentity = relay.clientIdentityMode === 'passthrough' ? requestUpstreamClientIdentity(event, identityProtocol) : {}
       const request = async (withIdentity: boolean) => {
-        const result = await pinnedUpstreamFetch(relay.baseUrl, '/v1/models', {
+        const result = await pinnedUpstreamFetch(preferred?.baseUrlOverride || relay.baseUrl, '/v1/models', {
           method: 'GET',
-          headers: { accept: 'application/json', ...upstreamAuthHeaders(scheme, apiKey, apiVersion), ...(withIdentity ? upstreamProbeClientIdentity(identityProtocol) : {}) },
+          headers: { accept: 'application/json', ...upstreamAuthHeaders(scheme, apiKey, apiVersion), ...(withIdentity ? (Object.keys(forwardedIdentity).length ? forwardedIdentity : upstreamProbeClientIdentity(identityProtocol)) : forwardedIdentity) },
           signal: AbortSignal.timeout(Math.min(relay.timeoutMs, 15000))
         })
         endpoint = result.target
@@ -742,20 +922,31 @@ export async function testUserRelayConnectivity(event: H3Event, ownerUserId: str
       }
       let response = await request(false)
       if (!response.ok && isClientIdentityRejection(response.body)) {
+        identityRetried = true
         clientIdentityProbed = true
         response = await request(true)
       }
       lastStatus = response.status
       lastBody = response.body
-      return response
+      const identityOnly = identityRetried && response.ok && !Object.keys(forwardedIdentity).length
+      return { ...response, identityOnly }
     })
     const final = probe.attempts.at(-1)
     const latencyMs = Date.now() - started
-    if (probe.ok && final) {
+    if (probe.selectedAuthScheme && preferred && probe.selectedAuthScheme !== preferred.authScheme) {
+      await db.update(channelProtocolBindings).set({ authScheme: probe.selectedAuthScheme, updatedAt: new Date() }).where(eq(channelProtocolBindings.id, preferred.id))
+    }
+    const selectedAttempt = probe.selectedAuthScheme
+      ? probe.attempts.find(attempt => attempt.authScheme === probe.selectedAuthScheme) || final
+      : final
+    const finalIdentityOnly = probe.selectedAuthScheme
+      ? selectedAttempt?.identityOnly === true
+      : probe.attempts.some(attempt => attempt.identityOnly === true)
+    const effectiveOk = probe.ok && !finalIdentityOnly
+    if (effectiveOk && final) {
       let ids: string[] = []
       try { ids = modelIdsFromPayload(JSON.parse(final.body)) } catch {}
       if (ids.length) {
-        await persistDiscoveredModels(event, id, ids)
         await invalidateChannelAccess(event, [id])
         await saveConnectivityHealth(true, '')
         return {
@@ -776,11 +967,11 @@ export async function testUserRelayConnectivity(event: H3Event, ownerUserId: str
       lastBody = '/v1/models 未返回可识别模型'
     }
     const detail = lastBody ? redactSensitiveText(lastBody).slice(0, 500) : '上游未返回响应'
-    await saveConnectivityHealth(false, detail)
+    await saveConnectivityHealth(false, finalIdentityOnly ? '上游要求兼容客户端身份，需使用真实 Claude Code / Codex 请求验证' : detail, finalIdentityOnly)
     return {
       status: 'failed',
       success: false,
-      message: `${lastStatus ? `HTTP ${lastStatus}: ` : ''}${detail}`,
+      message: finalIdentityOnly ? '上游要求兼容客户端身份，需使用真实 Claude Code / Codex 请求验证' : `${lastStatus ? `HTTP ${lastStatus}: ` : ''}${detail}`,
       endpoint,
       responseTimeMs: latencyMs,
       httpStatus: lastStatus,

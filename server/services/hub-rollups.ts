@@ -41,9 +41,11 @@ export async function recordUsageRollups(event: H3Event | undefined, value: {
   const poolGroupId = value.poolGroupId || (typeof context?.hubPoolGroupId === 'string' ? context.hubPoolGroupId : null)
   const subscriptionId = value.subscriptionId || (typeof context?.hubSubscriptionId === 'string' ? context.hubSubscriptionId : null)
   const planVersionId = value.planVersionId || (typeof context?.hubPlanVersionId === 'string' ? context.hubPlanVersionId : null)
-  for (const granularity of ['hour', 'day'] as const) {
-    await db.insert(usageRollups).values({
-      bucketStart: startOfZoned(new Date(), granularity, timezone),
+  const observedAt = new Date()
+  await db.transaction(async (tx) => {
+    for (const granularity of ['hour', 'day'] as const) {
+      await tx.insert(usageRollups).values({
+      bucketStart: startOfZoned(observedAt, granularity, timezone),
       granularity,
       keyId: value.keyId,
       userId: value.userId,
@@ -84,7 +86,7 @@ export async function recordUsageRollups(event: H3Event | undefined, value: {
       latencyLe5000: value.durationMs <= 5000 ? 1 : 0,
       latencyLe10000: value.durationMs <= 10000 ? 1 : 0,
       failovers: value.failovers
-    }).onConflictDoUpdate({
+      }).onConflictDoUpdate({
       target: [usageRollups.bucketStart, usageRollups.granularity, usageRollups.keyId, usageRollups.userId, usageRollups.groupId, usageRollups.model, usageRollups.endpoint, usageRollups.status, usageRollups.channelId, usageRollups.protocolBindingId, usageRollups.protocol, usageRollups.supplySource, usageRollups.poolGroupId, usageRollups.subscriptionId, usageRollups.planVersionId],
       set: {
         requests: sql`${usageRollups.requests} + 1`,
@@ -115,6 +117,7 @@ export async function recordUsageRollups(event: H3Event | undefined, value: {
         failovers: sql`${usageRollups.failovers} + ${value.failovers}`,
         updatedAt: new Date()
       }
-    })
-  }
+      })
+    }
+  })
 }

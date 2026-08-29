@@ -2,7 +2,7 @@
 import { IconActivityHeartbeat, IconChartBar, IconCheck, IconChevronDown, IconCloudDownload, IconPlugConnected, IconPlus, IconRefresh, IconRoute, IconSearch, IconTrash, IconX } from '@tabler/icons-vue'
 import type { HubGroupView, HubUserView } from '#shared/types/access-control'
 import type { ChannelAccessScope, ChannelModelView, ChannelProtocol, ChannelProtocolBindingView, ChannelType, ChannelView, ProbeModelCatalogView } from '#shared/types/hub'
-import { relayProviderPresets } from '#shared/relay-provider-presets'
+import { relayPresetCapabilityMode, relayProviderPresets } from '#shared/relay-provider-presets'
 
 definePageMeta({ layout: 'admin', middleware: 'admin' })
 useSeoMeta({ title: '资源管理 | Zephyr Hub' })
@@ -85,7 +85,7 @@ function probeModelsFor(protocol: ChannelProtocol) { return probeModelData.value
 function applyPreset() {
   const preset = relayProviderPresets.find(item => item.id === selectedPresetId.value)
   if (!preset) return
-  const protocols = preset.protocols.map(item => ({ ...protocolBinding(item.protocol), authScheme: item.authScheme, baseUrlOverride: item.baseUrlOverride || null, probeModel: probeModelsFor(item.protocol)[0]?.model || null }))
+  const protocols = preset.protocols.map(item => ({ ...protocolBinding(item.protocol), authScheme: item.authScheme, baseUrlOverride: item.baseUrlOverride || null, probeModel: probeModelsFor(item.protocol)[0]?.model || null, capabilityMode: relayPresetCapabilityMode(preset, item.protocol) }))
   Object.assign(form, { name: preset.name, baseUrl: preset.baseUrl, type: protocols.length === 1 && protocols[0]?.protocol === 'anthropic_messages' ? 'anthropic_compatible' : 'openai_compatible', protocols })
 }
 function payload() {

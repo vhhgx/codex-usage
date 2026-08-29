@@ -28,7 +28,7 @@ export function connectivityFailureAllowsRetry(code: string, message: string) {
 
 export async function probeUpstreamConnectivity(
   baseUrl: string,
-  options: { timeoutMs?: number; maxRetries?: number; degradedThresholdMs?: number } = {}
+  options: { timeoutMs?: number; maxRetries?: number; degradedThresholdMs?: number; allowPrivateNetwork?: boolean } = {}
 ): Promise<UpstreamConnectivityResult> {
   const timeoutMs = Math.min(30_000, Math.max(1_000, options.timeoutMs ?? DEFAULT_TIMEOUT_MS))
   const maxRetries = Math.min(3, Math.max(0, options.maxRetries ?? DEFAULT_MAX_RETRIES))
@@ -37,11 +37,14 @@ export async function probeUpstreamConnectivity(
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const started = Date.now()
     try {
-      const result = await pinnedUpstreamBaseFetch(baseUrl, {
+      const requestInit = {
         method: 'GET',
         headers: { accept: '*/*', 'accept-encoding': 'identity' },
         signal: AbortSignal.timeout(timeoutMs)
-      })
+      } as const
+      const result = options.allowPrivateNetwork === true
+        ? await pinnedUpstreamBaseFetch(baseUrl, requestInit, { allowPrivateNetwork: true })
+        : await pinnedUpstreamBaseFetch(baseUrl, requestInit)
       const latencyMs = Date.now() - started
       const httpStatus = result.response.status
       await Promise.resolve(result.close()).catch(() => {})

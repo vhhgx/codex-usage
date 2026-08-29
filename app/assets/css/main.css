@@ -1213,6 +1213,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .confirm-dialog::backdrop { background: var(--hub-overlay-scrim); }
 .confirm-dialog form { padding: 24px; display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 16px; }
 .confirm-dialog__icon { width: 42px; height: 42px; border-radius: 7px; display: grid; place-items: center; color: var(--hub-danger); background: var(--hub-danger-soft); }
+.confirm-dialog__icon--primary { color: var(--hub-accent-text); background: var(--hub-accent-soft); }
 .confirm-dialog h2 { margin: 1px 0 0; font-size: 18px; }
 .confirm-dialog p { margin-top: 8px; color: var(--hub-text-muted); font-size: 13px; line-height: 1.6; }
 .confirm-dialog footer { grid-column: 1 / -1; padding-top: 8px; display: flex; justify-content: flex-end; gap: 9px; }

@@ -51,7 +51,8 @@ body::before {
   background: var(--hub-ambient-light);
 }
 
-body.workspace-drawer-open { overflow: hidden; }
+body.workspace-drawer-open,
+body.app-drawer-open { overflow: hidden; }
 ::selection { background: var(--hub-selection); }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -751,6 +752,7 @@ body.workspace-drawer-open { overflow: hidden; }
 .confirm-dialog::backdrop,
 .announcement-dialog::backdrop { background: var(--hub-overlay-scrim); }
 .confirm-dialog__icon { color: var(--hub-danger); background: var(--hub-danger-soft); }
+.confirm-dialog__icon--primary { color: var(--hub-accent-text); background: var(--hub-accent-soft); }
 .announcement-dialog__icon { color: var(--hub-accent-text); background: var(--hub-accent-soft); }
 .announcement-dialog__panel[data-tone='warning'] .announcement-dialog__icon { color: var(--hub-warning); background: var(--hub-warning-soft); }
 .announcement-dialog__panel[data-tone='success'] .announcement-dialog__icon { color: var(--hub-success); background: var(--hub-success-soft); }

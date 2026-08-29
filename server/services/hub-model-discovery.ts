@@ -7,9 +7,27 @@ import { pinnedUpstreamFetch, upstreamTarget } from '../utils/upstream-url'
 import type { ChannelModelView } from '#shared/types/hub'
 import { canonicalModelId, modelRevision, modelVendorFamily } from '#shared/utils/model-routing'
 import { alternateAuthScheme, isClientIdentityRejection, upstreamAuthHeaders } from '../utils/upstream-auth'
-import { upstreamProbeClientIdentity } from '../utils/upstream-client-identity'
+import { requestUpstreamClientIdentity, upstreamProbeClientIdentity } from '../utils/upstream-client-identity'
+import { redactSensitiveText } from '../utils/upstream'
 
 const MAX_DISCOVERED_MODELS = 2000
+
+interface UpstreamDiscoveryOptions {
+  authScheme?: 'bearer' | 'x_api_key'
+  apiVersion?: string | null
+  privateUrl?: boolean
+  protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat'
+  requestEvent?: H3Event
+  clientIdentityMode?: 'standard' | 'passthrough'
+  onAuthSelected?: (authScheme: 'bearer' | 'x_api_key') => void
+}
+
+export function modelDiscoveryCompatibilityFallbackAllowed(protocols: Array<{ enabled: boolean }>) {
+  // Only legacy channels with no protocol rows may use the implicit Chat
+  // binding. If rows exist but are disabled, the operator explicitly opted
+  // out and model synchronization must not bypass that choice.
+  return protocols.length === 0
+}
 
 export function modelIdsFromPayload(payload: unknown) {
   if (!payload || typeof payload !== 'object' || !Array.isArray((payload as { data?: unknown }).data)) return []
@@ -67,16 +85,19 @@ export function mergeDiscoveredModelMappings(ids: string[], manual: ChannelModel
   return [...new Map([...automatic, ...manual].map(model => [model.publicModel, model])).values()]
 }
 
-export async function discoverUpstreamModelIds(baseUrl: string, apiKey: string, timeoutMs = 15000, options: { authScheme?: 'bearer' | 'x_api_key'; apiVersion?: string | null; privateUrl?: boolean; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat' } = {}) {
+export async function discoverUpstreamModelIds(baseUrl: string, apiKey: string, timeoutMs = 15000, options: UpstreamDiscoveryOptions = {}) {
   return (await discoverUpstreamModels(baseUrl, apiKey, timeoutMs, options)).map(item => item.id)
 }
 
-export async function discoverUpstreamModels(baseUrl: string, apiKey: string, timeoutMs = 15000, options: { authScheme?: 'bearer' | 'x_api_key'; apiVersion?: string | null; privateUrl?: boolean; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat' } = {}) {
+export async function discoverUpstreamModels(baseUrl: string, apiKey: string, timeoutMs = 15000, options: UpstreamDiscoveryOptions = {}) {
   const initialAuth = options.authScheme || (options.protocol === 'anthropic_messages' ? 'x_api_key' : 'bearer')
   const protocol = options.protocol || (initialAuth === 'x_api_key' ? 'anthropic_messages' : 'openai_responses')
   const attempts = [initialAuth, alternateAuthScheme(initialAuth)]
   let lastFailure: { status: number; body: string } | null = null
   for (const authScheme of attempts) {
+    const forwardedIdentity = options.clientIdentityMode === 'passthrough' && options.requestEvent
+      ? requestUpstreamClientIdentity(options.requestEvent, protocol)
+      : {}
     for (const withIdentity of [false, true]) {
       if (withIdentity && (!lastFailure || !isClientIdentityRejection(lastFailure.body))) continue
       let response: Response
@@ -84,7 +105,9 @@ export async function discoverUpstreamModels(baseUrl: string, apiKey: string, ti
       try {
         const headers: Record<string, string> = {
           ...(authScheme === 'bearer' ? { Authorization: `Bearer ${apiKey}` } : upstreamAuthHeaders(authScheme, apiKey, options.apiVersion)),
-          ...(withIdentity ? upstreamProbeClientIdentity(protocol) : {})
+          ...(withIdentity
+            ? (Object.keys(forwardedIdentity).length ? forwardedIdentity : upstreamProbeClientIdentity(protocol))
+            : forwardedIdentity)
         }
         if (options.privateUrl) {
           const result = await pinnedUpstreamFetch(baseUrl, '/v1/models', { headers, signal: AbortSignal.timeout(Math.min(Math.max(timeoutMs, 1000), 15000)) })
@@ -104,13 +127,14 @@ export async function discoverUpstreamModels(baseUrl: string, apiKey: string, ti
         try { payload = JSON.parse(body) } catch { throw createError({ statusCode: 502, message: '读取上游模型失败：/v1/models 未返回有效 JSON' }) }
         const models = modelsFromPayload(payload)
         if (!models.length) throw createError({ statusCode: 502, message: '上游 /v1/models 没有返回任何可用模型' })
+        options.onAuthSelected?.(authScheme)
         return models
       }
       lastFailure = { status: response.status, body }
       if (!isClientIdentityRejection(body) && response.status !== 401 && response.status !== 403) break
     }
   }
-  if (lastFailure) throw createError({ statusCode: 502, message: `读取上游模型失败：HTTP ${lastFailure.status} ${lastFailure.body.slice(0, 300)}`.trim() })
+  if (lastFailure) throw createError({ statusCode: 502, message: `读取上游模型失败：HTTP ${lastFailure.status} ${redactSensitiveText(lastFailure.body).slice(0, 300)}`.trim() })
   throw createError({ statusCode: 502, message: '读取上游模型失败：上游未返回响应' })
 }
 
@@ -148,11 +172,18 @@ export async function persistDiscoveredModels(event: H3Event | undefined, channe
 export function userDiscoveredModelPlan(
   channelId: string,
   ids: string[],
-  existing: Array<{ id: string; publicModel: string; upstreamModel: string; enabled: boolean }>
+  existing: Array<{ id: string; publicModel: string; upstreamModel: string; enabled: boolean; mappingKind?: string | null }>
 ) {
   const available = new Set(ids)
   const legacyPrefix = `relay/${channelId.slice(0, 8)}/`
-  const stale = existing.filter(model => !available.has(model.upstreamModel) || model.publicModel.startsWith(legacyPrefix))
+  // Manual aliases/substitutions are user configuration, not discovered
+  // identities. Never remove them merely because their target is absent from
+  // the upstream /models response.
+  const stale = existing.filter(model => model.publicModel.startsWith(legacyPrefix) || (
+    (model.mappingKind || 'identity') === 'identity'
+      && !available.has(model.upstreamModel)
+      && !available.has(model.publicModel)
+  ))
   const direct = existing.filter(model => available.has(model.publicModel) && model.publicModel === model.upstreamModel && !stale.includes(model))
   return {
     staleIds: stale.map(model => model.id),
@@ -195,22 +226,57 @@ export async function syncChannelModelsFromUpstream(event: H3Event, channelId: s
   const [channel] = await db.select().from(channels).where(eq(channels.id, channelId)).limit(1)
   if (!channel) throw createError({ statusCode: 404, message: '渠道不存在' })
   const protocols = await db.select().from(channelProtocolBindings).where(eq(channelProtocolBindings.channelId, channelId))
-  const protocol = protocols.find(binding => binding.protocol === 'openai_responses')
-    || protocols.find(binding => binding.protocol === 'openai_chat')
-    || protocols[0]
-  const discoveredModels = await discoverUpstreamModels(
-    protocol?.baseUrlOverride || channel.baseUrl,
-    decryptChannelSecret(channel.encryptedApiKey, channel.id, channel.ownerKind, event),
-    channel.timeoutMs,
-    { authScheme: protocol?.authScheme, apiVersion: protocol?.apiVersion, privateUrl: channel.ownerKind === 'user', protocol: protocol?.protocol }
-  )
+  const protocolOrder = [...protocols]
+    .filter(binding => binding.enabled)
+    .sort((left, right) => {
+      const rank = (binding: typeof left) => (binding.verificationStatus === 'failed' ? 2 : binding.verificationStatus === 'verified' ? 0 : 1)
+      const protocolRank = (binding: typeof left) => binding.protocol === 'openai_responses' ? 0 : binding.protocol === 'openai_chat' ? 1 : 2
+      return rank(left) - rank(right) || protocolRank(left) - protocolRank(right)
+    })
+  const candidates = protocolOrder.length
+    ? protocolOrder
+    : modelDiscoveryCompatibilityFallbackAllowed(protocols)
+      ? [{ protocol: 'openai_chat' as const, authScheme: 'bearer' as const, apiVersion: null, baseUrlOverride: null, enabled: true, verificationStatus: 'unknown' as const }]
+      : []
+  if (!candidates.length) throw createError({ statusCode: 409, message: '没有启用的上游协议，无法同步模型' })
+  const apiKey = decryptChannelSecret(channel.encryptedApiKey, channel.id, channel.ownerKind, event)
+  let discoveredModels: DiscoveredUpstreamModel[] = []
+  let lastError: unknown
+  let successfulProtocol: typeof candidates[number] | null = null
+  let selectedAuthScheme: 'bearer' | 'x_api_key' | null = null
+  for (const protocol of candidates) {
+    try {
+      discoveredModels = await discoverUpstreamModels(
+        protocol.baseUrlOverride || channel.baseUrl,
+        apiKey,
+        channel.timeoutMs,
+        {
+          authScheme: protocol.authScheme,
+          apiVersion: protocol.apiVersion,
+          privateUrl: channel.ownerKind === 'user',
+          protocol: protocol.protocol,
+          requestEvent: event,
+          clientIdentityMode: channel.clientIdentityMode === 'passthrough' ? 'passthrough' : 'standard',
+          onAuthSelected: authScheme => { selectedAuthScheme = authScheme }
+        }
+      )
+      successfulProtocol = protocol
+      break
+    } catch (error) {
+      lastError = error
+    }
+  }
+  if (!discoveredModels.length && lastError) throw lastError
+  if (successfulProtocol && selectedAuthScheme && 'id' in successfulProtocol && successfulProtocol.id && successfulProtocol.authScheme !== selectedAuthScheme) {
+    await db.update(channelProtocolBindings).set({ authScheme: selectedAuthScheme, updatedAt: new Date() }).where(eq(channelProtocolBindings.id, successfulProtocol.id))
+  }
   const ids = discoveredModels.map(item => item.id)
   const persisted = channel.ownerKind === 'user'
     ? await reconcileUserDiscoveredModels(event, channel.id, ids)
     : { ...(await persistDiscoveredModels(event, channel.id, ids)), removed: 0, reactivated: 0 }
-  if (channel.ownerKind === 'user') {
-    await db.update(channelProtocolBindings).set({ verificationStatus: 'unknown', verifiedAt: null, lastError: null, updatedAt: new Date() }).where(eq(channelProtocolBindings.channelId, channel.id))
-  }
+  // Model synchronization only refreshes the catalog. Protocol verification
+  // is an independent, explicit action and must not be cleared here; doing so
+  // would make a known-failed binding routable again after every model sync.
   const persistedModels = await db.select().from(channelModels).where(eq(channelModels.channelId, channel.id))
   for (const discovered of discoveredModels) {
     const model = persistedModels.find(item => item.upstreamModel === discovered.id && item.publicModel === discovered.id)

@@ -34,7 +34,22 @@ const remainingTokens = computed(() => tokenLimit.value === null ? null : Math.m
 const packageType = computed(() => plan.value?.plan.mode === 'unlimited' ? '全包套餐' : plan.value?.plan.mode === 'token' ? '半包套餐' : '按量套餐')
 const compact = (value: number) => new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 2 }).format(value || 0)
 const date = (value: number | null | undefined) => value ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium' }).format(value) : '长期有效'
-function selectTab(tab: ResourceTab) { void router.replace({ query: { ...route.query, tab } }) }
+function selectTab(tab: ResourceTab) {
+  if (activeTab.value === tab) return
+  void router.replace({ query: { ...route.query, tab } }).catch(() => {})
+}
+function onResourceTabKeydown(event: KeyboardEvent, current: ResourceTab) {
+  const order: ResourceTab[] = ['relays', 'pool']
+  const direction = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0
+  if (!direction && event.key !== 'Home' && event.key !== 'End') return
+  event.preventDefault()
+  const index = order.indexOf(current)
+  const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? order.length - 1 : (index + direction + order.length) % order.length
+  const next = order[nextIndex]
+  if (!next) return
+  selectTab(next)
+  nextTick(() => document.getElementById(`resource-tab-${next}`)?.focus())
+}
 </script>
 
 <template>
@@ -47,12 +62,12 @@ function selectTab(tab: ResourceTab) { void router.replace({ query: { ...route.q
       <article><span>{{ remainingTokens === null ? '套餐额度' : '剩余 Token' }}</span><strong class="tabular-nums">{{ planStatus === 'pending' && !planData ? '—' : remainingTokens === null ? '不限量' : compact(remainingTokens) }}</strong><small>{{ planStatus === 'pending' && !planData ? '正在加载' : tokenLimit === null ? '仅统计套餐供给' : `总额度 ${compact(tokenLimit)}` }}</small></article>
       <footer>套餐用量仅统计平台供给；个人中转和专属号池的消耗不计入。</footer>
     </section>
-    <ConsoleUserRelayOrder />
-    <nav class="admin-page-tabs resource-tabs" role="tablist" aria-label="套餐与资源">
-      <button role="tab" :aria-selected="activeTab === 'relays'" :class="{ active: activeTab === 'relays' }" @click="selectTab('relays')"><IconServerBolt :size="17" />我的中转</button>
-      <button role="tab" :aria-selected="activeTab === 'pool'" :class="{ active: activeTab === 'pool' }" @click="selectTab('pool')"><IconUserShield :size="17" />专属号池</button>
+    <ConsoleUserRelayOrder :polling-enabled="activeTab === 'relays'" />
+    <nav class="admin-page-tabs resource-tabs" role="tablist" aria-label="套餐与资源" aria-orientation="horizontal">
+      <button id="resource-tab-relays" type="button" role="tab" aria-controls="resource-tab-panel" :aria-selected="activeTab === 'relays'" :tabindex="activeTab === 'relays' ? 0 : -1" :class="{ active: activeTab === 'relays' }" @keydown="onResourceTabKeydown($event, 'relays')" @click="selectTab('relays')"><IconServerBolt :size="17" />我的中转</button>
+      <button id="resource-tab-pool" type="button" role="tab" aria-controls="resource-tab-panel" :aria-selected="activeTab === 'pool'" :tabindex="activeTab === 'pool' ? 0 : -1" :class="{ active: activeTab === 'pool' }" @keydown="onResourceTabKeydown($event, 'pool')" @click="selectTab('pool')"><IconUserShield :size="17" />专属号池</button>
     </nav>
-    <section class="resource-tab-panel" role="tabpanel">
+    <section id="resource-tab-panel" class="resource-tab-panel" role="tabpanel" :aria-labelledby="`resource-tab-${activeTab}`" tabindex="0">
       <ConsoleUserRelaysPanel v-if="activeTab === 'relays'" />
       <ConsoleUserPoolPanel v-else />
     </section>
