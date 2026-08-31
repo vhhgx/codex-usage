@@ -1,5 +1,5 @@
 import { and, asc, count, desc, eq, gt, gte, isNull, lte, or, sql } from 'drizzle-orm'
-import type { H3Event } from 'h3'
+import { createError, type H3Event } from 'h3'
 import { announcements, groupMemberships, groups, servicePlanVersions, servicePlans, usageRollups, userPoolGroups, userSubscriptions, users } from '../db/schema'
 import { useDatabase } from '../db'
 import { getHubSettings } from './hub-settings'
@@ -121,16 +121,16 @@ export async function ensureDefaultSubscription(event: H3Event, userId: string, 
   }).onConflictDoNothing()
 }
 
-function planValues(body: UnknownRecord, current?: typeof servicePlans.$inferSelect) {
+export function planValues(body: UnknownRecord, current?: typeof servicePlans.$inferSelect) {
   const requestedMode = String(body.mode || '')
   const billingMode = String(body.billingMode || '')
-  const mode = ['unlimited', 'token', 'cost'].includes(requestedMode)
-    ? requestedMode
-    : billingMode === 'token_package' ? 'token' : billingMode === 'token_metered' ? 'cost' : current?.mode || 'unlimited'
+  const mode = ['unlimited', 'token_package', 'token_metered'].includes(billingMode)
+    ? billingMode === 'token_package' ? 'token' : billingMode === 'token_metered' ? 'cost' : 'unlimited'
+    : ['unlimited', 'token', 'cost'].includes(requestedMode) ? requestedMode : current?.mode || 'unlimited'
   const cycle = ['none', 'week', 'month'].includes(String(body.cycle)) ? String(body.cycle) : current?.cycle || 'none'
   const tokenLimit = mode === 'token' ? nullableNumber(body.tokenLimit ?? current?.tokenLimit) : null
   const costLimit = mode === 'cost' ? nullableNumber(body.costLimit ?? current?.costLimit) : null
-  if (mode === 'token' && (!tokenLimit || !Number.isInteger(tokenLimit))) throw createError({ statusCode: 400, message: 'Token 套餐必须填写正整数额度' })
+  if (mode === 'token' && (!tokenLimit || !Number.isSafeInteger(tokenLimit))) throw createError({ statusCode: 400, message: 'Token 套餐必须填写有效的正整数额度' })
   if (mode === 'cost' && !costLimit) throw createError({ statusCode: 400, message: '金额套餐必须填写大于 0 的额度' })
   return {
     name: body.name === undefined ? current?.name || '' : text(body.name, 120),
@@ -153,6 +153,7 @@ function versionValues(body: UnknownRecord, plan: typeof servicePlans.$inferSele
   if (!validCombination) throw createError({ statusCode: 400, message: '计费方式与资源供给方式组合不受支持' })
   const quotaUnit = body.quotaUnit === 'weighted_token' ? 'weighted_token' : 'raw_token'
   const tokenLimit = body.tokenLimit === null || body.tokenLimit === undefined ? plan.tokenLimit : nullableNumber(body.tokenLimit)
+  if (billingMode === 'token_package' && (!tokenLimit || !Number.isSafeInteger(tokenLimit))) throw createError({ statusCode: 400, message: 'Token 套餐必须填写有效的正整数额度' })
   return {
     planId: plan.id,
     version: versionNumber,
@@ -181,22 +182,27 @@ export async function listPlans(event: H3Event) {
   const countByPlan = new Map(counts.map(item => [item.planId, Number(item.value)]))
   const versionsByPlan = new Map<string, typeof versions>()
   for (const version of versions) versionsByPlan.set(version.planId, [...(versionsByPlan.get(version.planId) || []), version])
-  return plans.map(plan => ({
-    ...plan,
-    tokenLimit: plan.tokenLimit,
-    costLimit: plan.costLimit === null ? null : Number(plan.costLimit),
-    price: Number(plan.price),
-    subscriberCount: countByPlan.get(plan.id) || 0,
-    currentVersion: versionsByPlan.get(plan.id)?.find(version => version.id === plan.currentVersionId) || versionsByPlan.get(plan.id)?.[0] || null,
-    versions: (versionsByPlan.get(plan.id) || []).map(version => ({
-      ...version,
-      price: Number(version.price),
-      privateUsageRateMultiplier: Number(version.privateUsageRateMultiplier),
-      createdAt: version.createdAt.getTime()
-    })),
-    createdAt: plan.createdAt.getTime(),
-    updatedAt: plan.updatedAt.getTime()
-  }))
+  return plans.map(plan => {
+    const currentVersion = versionsByPlan.get(plan.id)?.find(version => version.id === plan.currentVersionId) || versionsByPlan.get(plan.id)?.[0] || null
+    const effectiveMode = currentVersion?.billingMode === 'token_package' ? 'token' : currentVersion?.billingMode === 'token_metered' ? 'cost' : currentVersion?.billingMode === 'unlimited' ? 'unlimited' : plan.mode
+    return {
+      ...plan,
+      mode: effectiveMode,
+      tokenLimit: effectiveMode === 'token' ? currentVersion?.tokenLimit ?? plan.tokenLimit : null,
+      costLimit: plan.costLimit === null ? null : Number(plan.costLimit),
+      price: Number(plan.price),
+      subscriberCount: countByPlan.get(plan.id) || 0,
+      currentVersion,
+      versions: (versionsByPlan.get(plan.id) || []).map(version => ({
+        ...version,
+        price: Number(version.price),
+        privateUsageRateMultiplier: Number(version.privateUsageRateMultiplier),
+        createdAt: version.createdAt.getTime()
+      })),
+      createdAt: plan.createdAt.getTime(),
+      updatedAt: plan.updatedAt.getTime()
+    }
+  })
 }
 
 export async function createPlan(event: H3Event, body: UnknownRecord, actorId: string) {
@@ -290,6 +296,8 @@ export async function getUserPlan(event: H3Event, userId: string) {
   ))
   const effectiveExpiresAt = effectivePlatformExpiry(row.subscription.expiresAt, row.platformAccessExpiresAt)
   const expired = isPlatformAccessExpired(row.subscription.expiresAt, row.platformAccessExpiresAt)
+  const effectiveBillingMode = String(snapshot.billingMode || (row.plan.mode === 'token' ? 'token_package' : row.plan.mode === 'cost' ? 'token_metered' : 'unlimited'))
+  const effectiveMode = effectiveBillingMode === 'token_package' ? 'token' : effectiveBillingMode === 'token_metered' ? 'cost' : 'unlimited'
   return {
     id: row.subscription.id,
     status: expired ? 'expired' : row.subscription.status,
@@ -299,9 +307,9 @@ export async function getUserPlan(event: H3Event, userId: string) {
       id: row.plan.id,
       name: row.plan.name,
       description: row.plan.description,
-      mode: row.plan.mode,
+      mode: effectiveMode,
       cycle: row.plan.cycle,
-      tokenLimit: row.plan.tokenLimit,
+      tokenLimit: effectiveMode === 'token' ? Number(snapshot.tokenLimit ?? row.plan.tokenLimit) : null,
       costLimit: row.plan.costLimit === null ? null : Number(row.plan.costLimit),
       price: Number(row.plan.price),
       version: version ? { ...version, price: Number(version.price), privateUsageRateMultiplier: Number(version.privateUsageRateMultiplier) } : null,

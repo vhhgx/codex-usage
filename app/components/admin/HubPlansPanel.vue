@@ -13,7 +13,7 @@ interface Plan {
   price: number
   status: 'active' | 'disabled'
   subscriberCount: number
-  currentVersion?: { billingMode?: string; supplyMode?: string; quotaUnit?: string; maxPoolAccounts?: number | null; privateUsageBilling?: string; privateUsageRateMultiplier?: number }
+  currentVersion?: { billingMode?: string; supplyMode?: string; tokenLimit?: number | null; quotaUnit?: string; maxPoolAccounts?: number | null; privateUsageBilling?: string; privateUsageRateMultiplier?: number }
 }
 
 const { data, refresh } = await useFetch<{ plans: Plan[] }>('/api/admin/plans')
@@ -26,9 +26,8 @@ const deleting = ref<Plan | null>(null)
 const form = reactive({
   name: '',
   description: '',
-  mode: 'unlimited' as Plan['mode'],
   cycle: 'none' as Plan['cycle'],
-  tokenLimit: null as number | null,
+  tokenLimitMillions: null as number | null,
   costLimit: null as number | null,
   price: 0,
   status: 'active' as Plan['status'],
@@ -43,8 +42,8 @@ const form = reactive({
 function openCreate() {
   editing.value = null
   Object.assign(form, {
-    name: '', description: '', mode: 'unlimited', cycle: 'none',
-    tokenLimit: null, costLimit: null, price: 0, status: 'active', billingMode: 'unlimited', supplyMode: 'platform_only', quotaUnit: 'raw_token', maxPoolAccounts: null, privateUsageBilling: 'free', privateUsageRateMultiplier: 1
+    name: '', description: '', cycle: 'none',
+    tokenLimitMillions: null, costLimit: null, price: 0, status: 'active', billingMode: 'unlimited', supplyMode: 'platform_only', quotaUnit: 'raw_token', maxPoolAccounts: null, privateUsageBilling: 'free', privateUsageRateMultiplier: 1
   })
   error.value = ''
   showForm.value = true
@@ -55,9 +54,11 @@ function openEdit(plan: Plan) {
   Object.assign(form, {
     name: plan.name,
     description: plan.description || '',
-    mode: plan.mode,
     cycle: plan.cycle,
-    tokenLimit: plan.tokenLimit,
+    tokenLimitMillions: (() => {
+      const value = plan.currentVersion?.tokenLimit ?? plan.tokenLimit
+      return value === null ? null : value / 1_000_000
+    })(),
     costLimit: plan.costLimit,
     price: plan.price,
     status: plan.status,
@@ -77,7 +78,17 @@ async function save() {
   error.value = ''
   try {
     const path = editing.value ? `/api/admin/plans/${editing.value.id}` : '/api/admin/plans'
-    await $fetch(path, { method: editing.value ? 'PATCH' : 'POST', body: form })
+    const tokenLimit = form.billingMode === 'token_package' && form.tokenLimitMillions !== null
+      ? Math.round(form.tokenLimitMillions * 1_000_000)
+      : null
+    await $fetch(path, {
+      method: editing.value ? 'PATCH' : 'POST',
+      body: {
+        ...form,
+        mode: form.billingMode === 'token_package' ? 'token' : form.billingMode === 'token_metered' ? 'cost' : 'unlimited',
+        tokenLimit
+      }
+    })
     await refresh()
     showForm.value = false
     showToast(editing.value ? '套餐已更新' : '套餐已创建', 'success')
@@ -105,11 +116,12 @@ async function remove() {
   }
 }
 
-const modeLabel = (plan: Plan) => plan.mode === 'unlimited'
-  ? '不限量'
-  : plan.mode === 'token'
-    ? `${formatTokenCount(Number(plan.tokenLimit || 0))} Token`
-    : `$${Number(plan.costLimit || 0).toLocaleString('zh-CN')}`
+const modeLabel = (plan: Plan) => {
+  const billingMode = plan.currentVersion?.billingMode || (plan.mode === 'token' ? 'token_package' : plan.mode === 'cost' ? 'token_metered' : 'unlimited')
+  if (billingMode === 'unlimited') return '不限量'
+  if (billingMode === 'token_package') return `${formatTokenCount(Number(plan.currentVersion?.tokenLimit ?? plan.tokenLimit ?? 0))} Token`
+  return `$${Number(plan.costLimit || 0).toLocaleString('zh-CN')}`
+}
 const cycleLabel = (cycle: Plan['cycle']) => cycle === 'week' ? '7 天' : cycle === 'month' ? '1 个月' : '长期'
 
 defineExpose({ openCreate })
@@ -133,7 +145,7 @@ defineExpose({ openCreate })
           <label><span>套餐名称</span><input v-model="form.name" required maxlength="120"></label>
           <label><span>套餐说明</span><textarea v-model="form.description" rows="3" maxlength="1000" /></label>
           <div class="form-grid"><label><span>计费方式</span><AppSelect v-model="form.billingMode"><option value="unlimited">不限量订阅</option><option value="token_package">Token 套餐包</option><option value="token_metered">按 Token 计费</option></AppSelect></label><label><span>资源供给</span><AppSelect v-model="form.supplyMode"><option value="platform_only">仅平台公共资源</option><option value="platform_then_private">额度后接续专属池</option><option value="private_only">始终使用专属池</option></AppSelect></label><label><span>有效周期</span><AppSelect v-model="form.cycle"><option value="none">长期</option><option value="week">7 天</option><option value="month">1 个月</option></AppSelect></label></div>
-          <div v-if="form.billingMode === 'token_package'" class="form-grid"><label><span>Token 口径</span><AppSelect v-model="form.quotaUnit"><option value="raw_token">原始 Token</option><option value="weighted_token">加权 Token</option></AppSelect></label><label><span>Token 额度</span><input v-model.number="form.tokenLimit" type="number" min="1" step="1" required></label><label><span>专属池最大账号数</span><input v-model.number="form.maxPoolAccounts" type="number" min="1" step="1"></label></div>
+          <div v-if="form.billingMode === 'token_package'" class="form-grid"><label><span>Token 口径</span><AppSelect v-model="form.quotaUnit"><option value="raw_token">原始 Token（输入+缓存+输出）</option><option value="weighted_token">加权 Token</option></AppSelect></label><label><span>Token 额度（M）</span><input v-model.number="form.tokenLimitMillions" type="number" min="0.000001" step="0.000001" required></label><label><span>专属池最大账号数</span><input v-model.number="form.maxPoolAccounts" type="number" min="1" step="1"></label></div>
           <div class="form-grid"><label v-if="form.billingMode === 'token_metered'"><span>金额额度（兼容旧模型）</span><input v-model.number="form.costLimit" type="number" min="0.00000001" step="0.00000001"></label><label><span>售价（USD）</span><input v-model.number="form.price" type="number" min="0" step="0.01"></label><label v-if="editing"><span>状态</span><AppSelect v-model="form.status"><option value="active">启用</option><option value="disabled">停用</option></AppSelect></label></div>
           <p v-if="error" class="form-error">{{ error }}</p>
           <footer><button class="button button--secondary" type="button" @click="showForm = false">取消</button><button class="button button--primary" :disabled="saving">{{ saving ? '保存中' : '保存套餐' }}</button></footer>

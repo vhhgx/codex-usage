@@ -29,9 +29,10 @@ const router = useRouter()
 const { data: planData, status: planStatus } = useLazyFetch<{ subscription: PlanView | null }>('/api/console/plan')
 const activeTab = computed<ResourceTab>(() => route.query.tab === 'pool' ? 'pool' : 'relays')
 const plan = computed(() => planData.value?.subscription || null)
-const tokenLimit = computed(() => Number(plan.value?.plan.entitlementSnapshot?.tokenLimit ?? plan.value?.plan.tokenLimit) || null)
+const billingMode = computed(() => plan.value?.plan.entitlementSnapshot?.billingMode || (plan.value?.plan.mode === 'token' ? 'token_package' : plan.value?.plan.mode === 'cost' ? 'token_metered' : 'unlimited'))
+const tokenLimit = computed(() => billingMode.value === 'token_package' ? Number(plan.value?.plan.entitlementSnapshot?.tokenLimit ?? plan.value?.plan.tokenLimit ?? 0) : null)
 const remainingTokens = computed(() => tokenLimit.value === null ? null : Math.max(0, tokenLimit.value - Number(plan.value?.usage.tokens || 0)))
-const packageType = computed(() => plan.value?.plan.mode === 'unlimited' ? '全包套餐' : plan.value?.plan.mode === 'token' ? '半包套餐' : '按量套餐')
+const packageType = computed(() => billingMode.value === 'token_package' ? 'Token 套餐包' : billingMode.value === 'token_metered' ? '按 Token 计费' : '不限量订阅')
 const compact = (value: number) => new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 2 }).format(value || 0)
 const date = (value: number | null | undefined) => value ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium' }).format(value) : '长期有效'
 function selectTab(tab: ResourceTab) {

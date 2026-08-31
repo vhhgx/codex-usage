@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { ServicePlan, UserSubscription } from '../server/db/schema'
 import { subscriptionAdmissionScope } from '../server/services/hub-limits'
-import { effectivePlatformExpiry, isPlatformAccessExpired } from '../server/services/customer-management'
+import { effectivePlatformExpiry, isPlatformAccessExpired, planValues } from '../server/services/customer-management'
 
 function subscription(overrides: Partial<UserSubscription> = {}): UserSubscription {
   const startsAt = new Date('2026-08-01T00:00:00.000Z')
@@ -53,6 +53,20 @@ describe('customer plan admission scope', () => {
     expect(subscriptionAdmissionScope(subscription(), plan({ mode: 'cost', tokenLimit: null, costLimit: '25.5' })))
       .toMatchObject({ periods: [{ tokenLimit: null, costLimit: '25.5' }] })
     expect(subscriptionAdmissionScope(subscription(), plan({ mode: 'unlimited', tokenLimit: null }))).toBeNull()
+  })
+})
+
+describe('customer plan input', () => {
+  it('lets the new billing mode override a stale legacy mode', () => {
+    expect(planValues({ name: '600M 套餐', mode: 'unlimited', billingMode: 'token_package', tokenLimit: 600_000_000 })).toMatchObject({
+      mode: 'token',
+      tokenLimit: 600_000_000,
+      costLimit: null
+    })
+  })
+
+  it('rejects a Token package without a positive whole-token quota', () => {
+    expect(() => planValues({ name: '无额度套餐', billingMode: 'token_package', tokenLimit: null })).toThrowError(/正整数额度/)
   })
 })
 
