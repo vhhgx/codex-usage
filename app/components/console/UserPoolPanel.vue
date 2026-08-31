@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { IconArrowDown, IconArrowUp, IconCircleCheck, IconCloudUpload, IconCopy, IconDeviceMobile, IconEdit, IconExternalLink, IconFileCode, IconLogin2, IconMessageCode, IconPlayerPlay, IconPlus, IconRefresh, IconSearch, IconShieldLock, IconTrash } from '@tabler/icons-vue'
+import { IconArrowDown, IconArrowUp, IconCircleCheck, IconCloudUpload, IconDeviceMobile, IconEdit, IconFileCode, IconMessageCode, IconPlayerPlay, IconPlus, IconRefresh, IconSearch, IconShieldLock, IconTrash } from '@tabler/icons-vue'
 import {
   ACCOUNT_DELIVERY_FIELDS,
   ACCOUNT_VAULT_STATUSES,
@@ -13,14 +13,14 @@ import {
   type SmsReceiverView
 } from '#shared/types/accounting'
 import { convertCredentialDocuments, parseCredentialSourceText, type CredentialSourceDocument } from '#shared/utils/credential-converter'
+import { verifyAndEnableUserPoolAccounts, type UserPoolRequest } from '#shared/utils/user-pool-activation'
 
 interface Pool { id: string; displayName: string; status: string; maxAccounts: number | null; accountCount: number; availableAccountCount: number; lastError: string | null }
 interface Account { id: string; displayName: string; email: string | null; platform: string; accountType: string; status: string; schedulable: boolean; source: string; lastVerifiedAt: number | null; lastError: string | null; createdAt?: number; updatedAt?: number }
 interface ImportRow { key: string; name: string; email: string | null; notes: string | null; platform: string; type: string; credentials: Record<string, unknown>; extra: Record<string, unknown>; concurrency: number; priority: number; rateMultiplier: number; expiresAt: number | null; autoPauseOnExpired: boolean; source: string }
-interface OAuthForm { name: string; authorizationUrl: string; flowId: string; callbackUrl: string; expiresAt: number | null }
 type PageTab = 'accounts' | 'receivers'
 type ImportMode = 'manual' | 'upload' | 'batch' | 'convert'
-type PoolDrawer = 'import' | 'oauth' | 'edit' | 'receiver'
+type PoolDrawer = 'import' | 'edit' | 'receiver'
 type ReceiverCreateMode = 'single' | 'batch'
 type PoolData = { pool: Pool | null; accounts: Account[] }
 type ReceiverData = { items: SmsReceiverView[] }
@@ -51,8 +51,6 @@ const showCredentialPaste = ref(false)
 const importRows = ref<ImportRow[]>([])
 const importNotice = ref('')
 const error = ref('')
-const oauthError = ref('')
-const oauth = reactive<OAuthForm>({ name: '', authorizationUrl: '', flowId: '', callbackUrl: '', expiresAt: null })
 const editForm = reactive({ displayName: '', schedulable: false })
 const editReceiverId = ref('')
 const receiverCreateMode = ref<ReceiverCreateMode>('single')
@@ -400,42 +398,24 @@ async function importAccounts() {
     if (!isCurrentDrawer('import', requestEpoch)) return
     importNotice.value = `批量导入完成：成功 ${result.created?.length || 0}，失败 ${result.failed?.length || 0}`
     if (result.failed?.length) error.value = result.failed.map(item => `${item.name}：${item.error}`).join('；')
-    await Promise.all([reloadPoolData(), reloadVaultData()])
-    if (!isCurrentDrawer('import', requestEpoch)) return
     if (!result.failed?.length) closeDrawer()
-    toast.show(importNotice.value, result.failed?.length ? 'error' : 'success')
+    toast.show(`${importNotice.value}${result.created?.length ? '，正在后台验证' : ''}`, result.failed?.length ? 'error' : 'success')
+    void verifyAndEnableImportedAccounts(result.created || [])
   } catch (value) { if (isCurrentDrawer('import', requestEpoch)) error.value = failureMessage(value, '导入账号失败') }
   finally { saving.value = false }
 }
-function openOAuth() {
-  if (!openDrawer('oauth')) return
-  Object.assign(oauth, { name: '', authorizationUrl: '', flowId: '', callbackUrl: '', expiresAt: null }); oauthError.value = ''
-}
-async function startOAuth() {
-  if (saving.value || drawer.value !== 'oauth') return
-  const requestEpoch = drawerEpoch
-  saving.value = true; oauthError.value = ''
-  try {
-    const result = await $fetch<{ authorizationUrl: string; flowId: string; expiresAt: number }>('/api/console/pool/oauth/start', { method: 'POST' })
-    if (!isCurrentDrawer('oauth', requestEpoch)) return
-    Object.assign(oauth, result)
-  } catch (value) { if (isCurrentDrawer('oauth', requestEpoch)) oauthError.value = failureMessage(value, '生成授权链接失败') }
-  finally { saving.value = false }
-}
-async function completeOAuth() {
-  if (!oauth.flowId || !oauth.callbackUrl.trim()) { oauthError.value = '请粘贴 localhost 开头的完整回调 URL'; return }
-  if (saving.value || drawer.value !== 'oauth') return
-  const requestEpoch = drawerEpoch
-  const payload = { flowId: oauth.flowId, callbackUrl: oauth.callbackUrl, name: oauth.name }
-  saving.value = true; oauthError.value = ''
-  try {
-    await $fetch('/api/console/pool/oauth/complete', { method: 'POST', body: payload })
-    if (!isCurrentDrawer('oauth', requestEpoch)) return
-    await reloadPoolData()
-    if (!isCurrentDrawer('oauth', requestEpoch)) return
-    closeDrawer(); toast.show('OpenAI 账号已授权并保持不可调度，请先验活', 'success')
-  } catch (value) { if (isCurrentDrawer('oauth', requestEpoch)) oauthError.value = failureMessage(value, '完成 OpenAI 授权失败') }
-  finally { saving.value = false }
+async function verifyAndEnableImportedAccounts(imported: Account[]) {
+  if (!imported.length) return
+  const request = $fetch as unknown as UserPoolRequest
+  const results = await verifyAndEnableUserPoolAccounts(imported.map(account => account.id), request)
+  await Promise.allSettled([reloadPoolData(), reloadUsageData(), reloadVaultData()])
+  const enabled = results.filter(result => result.enabled).length
+  const failed = results.length - enabled
+  if (!failed) {
+    toast.show(`已验证并启用 ${enabled} 个账号`, 'success')
+    return
+  }
+  toast.show(`自动验证完成：启用 ${enabled}，失败 ${failed}；失败账号保持停用`, 'error')
 }
 function openEdit(account: Account) { if (!openDrawer('edit')) return; editing.value = account; Object.assign(editForm, { displayName: account.displayName, schedulable: account.schedulable }); editReceiverId.value = receiverForAccount(account.id)?.id || ''; error.value = '' }
 async function saveEdit() {
@@ -465,9 +445,6 @@ async function remove() {
   try { await $fetch(`/api/console/pool/accounts/${deleting.value.id}`, { method: 'DELETE' }); deleting.value = null; await reloadPoolData(); toast.show('账号已删除', 'success') }
   catch (value) { toast.show(failureMessage(value, '删除账号失败'), 'error') } finally { loading.value = false }
 }
-function openUrl() { if (oauth.authorizationUrl) window.open(oauth.authorizationUrl, '_blank', 'noopener,noreferrer') }
-function selectOAuthUrl(event: Event) { (event.target as HTMLInputElement).select() }
-async function copyUrl() { if (oauth.authorizationUrl) { await navigator.clipboard.writeText(oauth.authorizationUrl); toast.show('授权链接已复制', 'success') } }
 function openReceiverCreate(item?: SmsReceiverView) {
   if (!openDrawer('receiver')) return
   editingReceiver.value = item || null
@@ -542,7 +519,7 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
 
 <template>
   <div class="pool-page">
-    <header class="resource-panel-header"><div><span class="admin-kicker">PRIVATE POOL</span><h2>专属号池</h2><p>账号与接码资源只进入自己的隔离分组，用量与公共号池保持同样的额度窗口展示。</p></div><div v-if="poolStatus !== 'pending' || data" class="resource-panel-actions"><button v-if="pool" class="button button--quiet button--small" :disabled="loading || saving || receiverBusy" @click="refreshPool"><IconRefresh :size="15" />刷新用量</button><template v-if="activeTab === 'accounts'"><button class="button button--secondary" :disabled="!pool || saving || receiverBusy" @click="openOAuth"><IconLogin2 :size="17" />Auth 登录</button><button class="button button--primary" :disabled="!pool || saving || receiverBusy" @click="openImport('manual')"><IconPlus :size="17" />导入账号</button></template><button v-else class="button button--primary" :disabled="!pool || saving || receiverBusy" @click="openReceiverCreate()"><IconPlus :size="17" />新增接码</button><button v-if="!pool" class="button button--primary" :disabled="provisioning || poolEntitlement.pending || poolEntitlement.allowed !== true" @click="provision"><IconShieldLock :size="17" />{{ provisioning ? '创建中…' : poolEntitlement.pending ? '读取套餐' : '创建专属号池' }}</button></div></header>
+    <header class="resource-panel-header"><div><span class="admin-kicker">PRIVATE POOL</span><h2>专属号池</h2><p>账号与接码资源只进入自己的隔离分组，用量与公共号池保持同样的额度窗口展示。</p></div><div v-if="poolStatus !== 'pending' || data" class="resource-panel-actions"><button v-if="pool" class="button button--quiet button--small" :disabled="loading || saving || receiverBusy" @click="refreshPool"><IconRefresh :size="15" />刷新用量</button><button v-if="activeTab === 'accounts'" class="button button--primary" :disabled="!pool || saving || receiverBusy" @click="openImport('manual')"><IconPlus :size="17" />导入账号</button><button v-else class="button button--primary" :disabled="!pool || saving || receiverBusy" @click="openReceiverCreate()"><IconPlus :size="17" />新增接码</button><button v-if="!pool" class="button button--primary" :disabled="provisioning || poolEntitlement.pending || poolEntitlement.allowed !== true" @click="provision"><IconShieldLock :size="17" />{{ provisioning ? '创建中…' : poolEntitlement.pending ? '读取套餐' : '创建专属号池' }}</button></div></header>
     <nav v-if="pool" class="admin-page-tabs pool-tabs" role="tablist" aria-label="专属资源管理" aria-orientation="horizontal"><button id="pool-tab-accounts" type="button" role="tab" aria-controls="pool-panel-accounts" :aria-selected="activeTab === 'accounts'" :tabindex="activeTab === 'accounts' ? 0 : -1" :class="{ active: activeTab === 'accounts' }" @keydown="onPageTabKeydown($event, 'accounts')" @click="selectPageTab('accounts')"><IconShieldLock :size="17" />账号管理</button><button id="pool-tab-receivers" type="button" role="tab" aria-controls="pool-panel-receivers" :aria-selected="activeTab === 'receivers'" :tabindex="activeTab === 'receivers' ? 0 : -1" :class="{ active: activeTab === 'receivers' }" @keydown="onPageTabKeydown($event, 'receivers')" @click="selectPageTab('receivers')"><IconDeviceMobile :size="17" />接码管理</button></nav>
     <section v-if="pool && activeTab === 'accounts'" id="pool-panel-accounts" class="pool-tab-panel" role="tabpanel" aria-labelledby="pool-tab-accounts" tabindex="0">
       <p class="pool-status-line"><span>{{ pool.status === 'active' ? '运行中' : '需处理' }}</span><span>{{ pool.displayName }}</span><span class="tabular-nums">账号 {{ pool.accountCount }}<template v-if="pool.maxAccounts"> / {{ pool.maxAccounts }}</template></span><span class="tabular-nums">可调度 {{ pool.availableAccountCount }}</span><span class="tabular-nums">待授权 {{ vaultAccounts.length }}</span><span>仅自己可用，不跨用户故障转移</span></p>
@@ -593,15 +570,13 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
           <button type="button" class="button button--quiet button--small" @click="showCredentialPaste = !showCredentialPaste">{{ showCredentialPaste ? '收起粘贴内容' : '粘贴 JSON 内容' }}</button>
           <textarea v-if="showCredentialPaste" v-model="importText" rows="8" spellcheck="false" placeholder="粘贴凭据 JSON" />
           <button v-if="showCredentialPaste" type="button" class="button button--secondary button--small" @click="parsePastedCredentials">解析内容</button>
-          <div v-if="importRows.length" class="import-account-list"><article v-for="(row, index) in importRows" :key="row.key" class="import-account-row"><header><span>{{ index + 1 }}</span><div><strong>{{ row.name }}</strong><small>{{ row.email || '未提供邮箱' }} · {{ row.platform }} / {{ row.type }}</small></div><code>{{ row.concurrency }} 并发 · P{{ row.priority }}</code></header><small class="pool-import-note">强制绑定当前专属分组，导入后先保持不可调度。</small></article></div>
+          <div v-if="importRows.length" class="import-account-list"><article v-for="(row, index) in importRows" :key="row.key" class="import-account-row"><header><span>{{ index + 1 }}</span><div><strong>{{ row.name }}</strong><small>{{ row.email || '未提供邮箱' }} · {{ row.platform }} / {{ row.type }}</small></div><code>{{ row.concurrency }} 并发 · P{{ row.priority }}</code></header><small class="pool-import-note">强制绑定当前专属分组，导入后自动验证并启用调度。</small></article></div>
         </section>
 
         <p v-if="importNotice" class="form-notice">{{ importNotice }}</p><p v-if="error || deliveryError" class="form-error pre-line">{{ error || deliveryError }}</p>
-        <footer><span v-if="importMode === 'batch'">{{ deliveryPreview.length }} 个账号</span><span v-else-if="importMode === 'upload' || importMode === 'convert'">{{ importRows.length }} 个账号</span><button type="button" class="button button--secondary" :disabled="saving" @click="requestCloseDrawer">取消</button><button class="button button--primary" :disabled="saving || (importMode === 'batch' ? !deliverySource || Boolean(deliveryConfigurationError) || !deliveryPreview.length : (importMode === 'upload' || importMode === 'convert') ? !importReady : false)">{{ saving ? '处理中' : importMode === 'manual' ? '保存账号' : importMode === 'batch' ? '确认导入' : '导入并停用' }}</button></footer>
+        <footer><span v-if="importMode === 'batch'">{{ deliveryPreview.length }} 个账号</span><span v-else-if="importMode === 'upload' || importMode === 'convert'">{{ importRows.length }} 个账号</span><button type="button" class="button button--secondary" :disabled="saving" @click="requestCloseDrawer">取消</button><button class="button button--primary" :disabled="saving || (importMode === 'batch' ? !deliverySource || Boolean(deliveryConfigurationError) || !deliveryPreview.length : (importMode === 'upload' || importMode === 'convert') ? !importReady : false)">{{ saving ? '处理中' : importMode === 'manual' ? '保存账号' : importMode === 'batch' ? '确认导入' : '验证并使用' }}</button></footer>
       </form>
     </AppDrawer>
-
-    <AppDrawer :open="drawer === 'oauth'" kicker="SUB2API OAUTH" title="Auth 登录" @close="requestCloseDrawer"><form class="admin-form" :aria-busy="saving" :inert="saving" @submit.prevent="oauth.flowId ? completeOAuth() : startOAuth"><template v-if="!oauth.flowId"><p class="pool-drawer-copy">通过 OpenAI Auth 完成授权，账号会进入当前专属分组，授权完成后先保持不可调度。</p><div class="form-grid"><label><span>账号名称</span><input v-model="oauth.name" placeholder="留空时使用 OpenAI 账号邮箱"></label></div></template><template v-else><section class="oauth-link-section"><header><div><h3>授权链接</h3><span>{{ oauth.expiresAt ? `有效至 ${date(oauth.expiresAt)}` : '15 分钟内有效' }}</span></div><div><button type="button" class="button button--quiet button--small" @click="copyUrl"><IconCopy :size="15" />复制</button><button type="button" class="button button--secondary button--small" @click="openUrl"><IconExternalLink :size="15" />打开</button></div></header><input :value="oauth.authorizationUrl" readonly aria-label="OpenAI 授权链接" @focus="selectOAuthUrl"></section><label><span>localhost 回调 URL *</span><textarea v-model="oauth.callbackUrl" rows="5" required spellcheck="false" placeholder="http://localhost:1455/auth/callback?code=...&state=..."></textarea></label></template><p v-if="oauthError" class="form-error">{{ oauthError }}</p><footer><button type="button" class="button button--secondary" :disabled="saving" @click="requestCloseDrawer">取消</button><button v-if="oauth.flowId" type="button" class="button button--quiet" :disabled="saving" @click="openOAuth">重新生成</button><button class="button button--primary" :disabled="saving || (Boolean(oauth.flowId) && !oauth.callbackUrl.trim())"><IconLogin2 :size="16" />{{ saving ? '处理中' : oauth.flowId ? '完成授权' : '生成授权链接' }}</button></footer></form></AppDrawer>
 
     <AppDrawer v-if="editing" :open="drawer === 'edit'" kicker="SUB2API ACCOUNT" :title="`编辑 ${editing.displayName}`" @close="requestCloseDrawer"><form class="admin-form" :aria-busy="saving" :inert="saving" @submit.prevent="saveEdit"><label><span>账号名称 *</span><input v-model="editForm.displayName" required maxlength="160"></label><label><span>接码手机号</span><AppSelect v-model="editReceiverId"><option value="">不绑定接码</option><option v-for="item in receivers.filter(receiver => receiver.status === 'active' && (receiver.availableSlots > 0 || receiver.id === receiverForAccount(editing!.id)?.id))" :key="item.id" :value="item.id">{{ item.phone }} · {{ item.availableSlots }} 个空余</option></AppSelect></label><label class="switch"><input v-model="editForm.schedulable" type="checkbox"><span />允许调度</label><p class="pool-drawer-copy">平台、账号类型和所属分组由专属号池托管，不能在用户侧修改。</p><p v-if="error" class="form-error">{{ error }}</p><footer><button type="button" class="button button--secondary" :disabled="saving" @click="requestCloseDrawer">取消</button><button class="button button--primary" :disabled="saving">{{ saving ? '保存中' : '保存配置' }}</button></footer></form></AppDrawer>
     <AppDrawer :open="drawer === 'receiver'" kicker="SMS RECEIVER" :title="editingReceiver ? '编辑接码' : '新增接码'" @close="requestCloseDrawer">
@@ -680,10 +655,10 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
 .pool-table-wrap td > code { margin-top:.25rem; color:var(--text-muted); font-size:.68rem; }
 .pool-error { max-width:240px; overflow:hidden; color:var(--hub-danger) !important; text-overflow:ellipsis; white-space:nowrap; }
 .credential-editor { display:grid; gap:.85rem; }
-.credential-editor > header,.oauth-link-section > header { display:flex; align-items:center; justify-content:space-between; gap:1rem; }
-.credential-editor > header > div,.oauth-link-section > header > div:first-child { display:grid; gap:.25rem; }
-.credential-editor h3,.oauth-link-section h3 { margin:0; font-size:.86rem; }
-.credential-editor header span,.oauth-link-section header span { color:var(--text-muted); font-size:.7rem; }
+.credential-editor > header { display:flex; align-items:center; justify-content:space-between; gap:1rem; }
+.credential-editor > header > div { display:grid; gap:.25rem; }
+.credential-editor h3 { margin:0; font-size:.86rem; }
+.credential-editor header span { color:var(--text-muted); font-size:.7rem; }
 .credential-editor label input[type=file] { display:none; }
 .credential-selection { min-height:64px; display:flex; align-items:center; gap:.65rem; padding:.8rem; border:1px dashed var(--line-strong); background:var(--surface-soft); }
 .credential-selection > div { min-width:0; display:grid; gap:.2rem; }
@@ -698,9 +673,6 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
 .import-account-row > header strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .import-account-row > header small,.import-account-row > header code,.pool-import-note,.pool-drawer-copy { color:var(--text-muted); font-size:.68rem; }
 .pool-import-note { display:block; margin-top:.45rem; }
-.oauth-link-section { display:grid; gap:.6rem; padding:.8rem; border:1px solid var(--line-subtle); background:var(--surface-soft); }
-.oauth-link-section > header > div:last-child { display:flex; gap:.35rem; }
-.oauth-link-section input { min-width:0; width:100%; }
 .form-notice { padding:.65rem .8rem; border:1px solid var(--hub-success-line); color:var(--hub-success); background:var(--hub-success-soft); font-size:.72rem; }
 .pool-empty { min-height:220px; display:grid; place-items:center; align-content:center; gap:.5rem; text-align:center; }
 .pool-empty p { margin:0; color:var(--text-muted); }
