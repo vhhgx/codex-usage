@@ -64,7 +64,7 @@ import { getActiveSubscription } from './customer-management'
 import { holdUserWallet, releaseUserWallet, settleUserWallet } from './user-wallet'
 import { visibleChannels } from './channel-access'
 import { getUserFailoverSourceIds } from './user-route-preferences'
-import { ChatToResponsesStream, chatToResponsesResponse, responsesToChatRequest } from './protocols/responses-chat'
+import { ChatToResponsesStream, chatToResponsesResponse, responsesRequestNeedsChatCompatibility, responsesToChatRequest } from './protocols/responses-chat'
 import { userModelRouteLanes, userRadarPreference } from './user-model-routing'
 import { cachedCodexRadar, selectRadarEffort } from './codex-radar'
 import { requestReasoningEffort } from '#shared/utils/request-log'
@@ -1011,7 +1011,13 @@ export async function handleHubRequest(event: H3Event, path: string) {
       tools: parsed.metadata?.tools,
       sessionId: getHeader(event, 'x-zephyr-session-id') || null
     })
-    const routeOptions = { userId, keyId: key.id, protocol: inboundProtocol, affinityKey }
+    const routeOptions = {
+      userId,
+      keyId: key.id,
+      protocol: inboundProtocol,
+      affinityKey,
+      preferResponsesToChat: inboundProtocol === 'openai_responses' && responsesRequestNeedsChatCompatibility(parsed.json)
+    }
     const sourceIds = await getUserFailoverSourceIds(event, userId)
     const modelLanes = await userModelRouteLanes(event, userId, parsed.model)
     ;[privatePool] = await useDatabase(event).select().from(userPoolGroups).where(and(eq(userPoolGroups.ownerUserId, userId), eq(userPoolGroups.status, 'active'))).limit(1)

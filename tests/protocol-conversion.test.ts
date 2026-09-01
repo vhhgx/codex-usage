@@ -1,13 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import { anthropicToOpenAiChat, anthropicUsage, openAiChatToAnthropic } from '../server/services/protocols/anthropic-openai'
 import { pipeOpenAiChatAsAnthropic } from '../server/services/protocols/anthropic-stream'
-import { advanceRouteFailoverState, compareRouteCandidates, keyRouteSources, modelMappingAllowsRouting, orderedRouteSourceNodes, packagePolicyAllowsRouteSource, type RouteFailoverState } from '../server/services/hub-routing'
-import { ChatToResponsesStream, chatToResponsesResponse, responsesToChatRequest } from '../server/services/protocols/responses-chat'
+import { advanceRouteFailoverState, compareRouteCandidates, keyRouteSources, modelMappingAllowsRouting, orderedRouteSourceNodes, packagePolicyAllowsRouteSource, protocolBindingAllowsRouting, type RouteFailoverState } from '../server/services/hub-routing'
+import { ChatToResponsesStream, chatToResponsesResponse, responsesRequestNeedsChatCompatibility, responsesToChatRequest } from '../server/services/protocols/responses-chat'
 
 describe('Anthropic and OpenAI protocol conversion', () => {
   it('converts Responses instructions, tools and tool results to Chat Completions', () => {
     const result = responsesToChatRequest({ model: 'public', instructions: 'Be precise', input: [{ role: 'user', content: [{ type: 'input_text', text: 'Read it' }] }, { type: 'function_call', call_id: 'call-1', name: 'read', arguments: '{"path":"a"}' }, { type: 'function_call_output', call_id: 'call-1', output: 'ok' }], tools: [{ type: 'function', name: 'read', parameters: { type: 'object' } }], reasoning: { effort: 'high' } }, 'upstream')
     expect(result).toMatchObject({ model: 'upstream', reasoning_effort: 'high', messages: [{ role: 'system', content: 'Be precise' }, { role: 'user', content: 'Read it' }, { role: 'assistant' }, { role: 'tool', tool_call_id: 'call-1', content: 'ok' }] })
+  })
+
+  it('detects Codex-only Responses fields that require a Chat compatibility route', () => {
+    expect(responsesRequestNeedsChatCompatibility({ input: 'hello' })).toBe(false)
+    expect(responsesRequestNeedsChatCompatibility({ input: [{ type: 'message', role: 'user', content: 'hello' }] })).toBe(false)
+    expect(responsesRequestNeedsChatCompatibility({ input: [{ type: 'additional_tools', role: 'developer', tools: [] }] })).toBe(true)
+    expect(responsesRequestNeedsChatCompatibility({ input: 'hello', client_metadata: { source: 'codex' } })).toBe(true)
   })
 
   it('converts a Chat response and usage to a Responses response', () => {
@@ -102,6 +109,20 @@ describe('Anthropic and OpenAI protocol conversion', () => {
     const directSecond = { channel: { priority: 20, name: 'second' }, conversionMode: 'passthrough' as const }
     expect([directSecond, convertedFirst].sort((left, right) => compareRouteCandidates(left, right, 'user_relay'))).toEqual([convertedFirst, directSecond])
     expect([convertedFirst, directSecond].sort((left, right) => compareRouteCandidates(left, right, 'platform'))).toEqual([directSecond, convertedFirst])
+  })
+
+  it('uses Chat compatibility for Codex substitution requests without changing standard Responses routing', () => {
+    expect(protocolBindingAllowsRouting('openai_responses', 'openai_chat', 'native')).toBe(false)
+    expect(protocolBindingAllowsRouting('openai_responses', 'openai_chat', 'responses_via_chat')).toBe(true)
+    expect(protocolBindingAllowsRouting('openai_responses', 'openai_chat', 'native', { substitution: true, preferResponsesToChat: true })).toBe(true)
+
+    const direct = { channel: { priority: 10, name: 'relay' }, conversionMode: 'passthrough' as const, modelMappingKind: 'substitution', laneSubstitution: false, preferResponsesToChat: true }
+    const converted = { channel: { priority: 10, name: 'relay' }, conversionMode: 'responses_to_chat' as const, modelMappingKind: 'substitution', laneSubstitution: false, preferResponsesToChat: true }
+    expect([direct, converted].sort((left, right) => compareRouteCandidates(left, right, 'user_relay'))).toEqual([converted, direct])
+    expect([
+      { ...direct, preferResponsesToChat: false },
+      { ...converted, preferResponsesToChat: false }
+    ].sort((left, right) => compareRouteCandidates(left, right, 'user_relay'))[0]?.conversionMode).toBe('passthrough')
   })
 
   it('treats an explicit private relay model mapping as substitution authorization', () => {

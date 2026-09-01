@@ -29,6 +29,7 @@ export interface RouteCandidate {
   normalizedPrice?: number | null
   modelMappingKind: string
   laneSubstitution: boolean
+  preferResponsesToChat: boolean
 }
 
 export interface SupplyDecision {
@@ -92,14 +93,38 @@ function channelCanRoute(channel: typeof channels.$inferSelect) {
     || channel.ownerKind === 'platform' && channel.healthStatus === 'unknown' && channel.clientIdentityMode === 'passthrough'
 }
 
-type CandidateOrderValue = Pick<RouteCandidate, 'conversionMode'> & { channel: Pick<RouteCandidate['channel'], 'priority' | 'name'> }
+type CandidateOrderValue = Pick<RouteCandidate, 'conversionMode'> & Partial<Pick<RouteCandidate, 'modelMappingKind' | 'laneSubstitution' | 'preferResponsesToChat'>> & { channel: Pick<RouteCandidate['channel'], 'priority' | 'name'> }
+
+function candidateConversionRank(candidate: CandidateOrderValue) {
+  const substitution = candidate.modelMappingKind === 'substitution' || candidate.laneSubstitution === true
+  if (candidate.preferResponsesToChat && substitution) {
+    if (candidate.conversionMode === 'responses_to_chat') return 0
+    if (candidate.conversionMode === 'passthrough') return 1
+    return 2
+  }
+  return candidate.conversionMode === 'passthrough' ? 0 : 1
+}
 
 export function compareRouteCandidates(left: CandidateOrderValue, right: CandidateOrderValue, supplySource: RouteCandidate['supplySource']) {
   const priority = left.channel.priority - right.channel.priority
-  const conversion = Number(left.conversionMode !== 'passthrough') - Number(right.conversionMode !== 'passthrough')
+  const conversion = candidateConversionRank(left) - candidateConversionRank(right)
   return supplySource === 'user_relay'
     ? priority || conversion || left.channel.name.localeCompare(right.channel.name)
     : conversion || priority || left.channel.name.localeCompare(right.channel.name)
+}
+
+export function protocolBindingAllowsRouting(
+  requestedProtocol: 'anthropic_messages' | 'openai_responses' | 'openai_chat',
+  bindingProtocol: 'anthropic_messages' | 'openai_responses' | 'openai_chat',
+  capabilityMode: string,
+  options: { allowConversion?: boolean; substitution?: boolean; preferResponsesToChat?: boolean } = {}
+) {
+  if (bindingProtocol === requestedProtocol) return true
+  if (requestedProtocol === 'anthropic_messages' && bindingProtocol === 'openai_chat') return options.allowConversion === true
+  if (requestedProtocol === 'openai_responses' && bindingProtocol === 'openai_chat') {
+    return capabilityMode === 'responses_via_chat' || options.substitution === true && options.preferResponsesToChat === true
+  }
+  return false
 }
 
 export function modelMappingAllowsRouting(mappingKind: string, supplySource: RouteCandidate['supplySource'], substitutionLane = false) {
@@ -210,7 +235,7 @@ export async function routeCandidates(
   groupId: string | null = null,
   supplySource: 'platform' | 'private_pool' | 'user_relay' = 'platform',
   poolGroupId?: string,
-  options: { userId?: string; keyId?: string; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat'; allowConversion?: boolean; affinityKey?: string; channelId?: string; relayGroupId?: string; requestedModel?: string; substitution?: boolean; orderMode?: 'manual' | 'price_asc' } = {}
+  options: { userId?: string; keyId?: string; protocol?: 'anthropic_messages' | 'openai_responses' | 'openai_chat'; allowConversion?: boolean; affinityKey?: string; channelId?: string; relayGroupId?: string; requestedModel?: string; substitution?: boolean; preferResponsesToChat?: boolean; orderMode?: 'manual' | 'price_asc' } = {}
 ) {
   const db = useDatabase(event)
   const requestedProtocol = options.protocol || endpointProtocol(endpoint)
@@ -240,9 +265,13 @@ export async function routeCandidates(
     : []
   const eligible = applyGroupChannelPolicy(
     rows.filter((row) => {
-      const protocolMatches = row.protocolBinding.protocol === requestedProtocol
-        || options.allowConversion === true && requestedProtocol === 'anthropic_messages' && row.protocolBinding.protocol === 'openai_chat'
-        || requestedProtocol === 'openai_responses' && row.protocolBinding.protocol === 'openai_chat' && row.protocolBinding.capabilityMode === 'responses_via_chat'
+      const substitution = row.model.mappingKind === 'substitution' || options.substitution === true
+      const protocolMatches = protocolBindingAllowsRouting(
+        requestedProtocol,
+        row.protocolBinding.protocol,
+        row.protocolBinding.capabilityMode,
+        { allowConversion: options.allowConversion, substitution, preferResponsesToChat: options.preferResponsesToChat }
+      )
       const capabilityEndpoint = (requestedProtocol === 'anthropic_messages' || requestedProtocol === 'openai_responses') && row.protocolBinding.protocol === 'openai_chat'
         ? '/v1/chat/completions'
         : endpoint
@@ -296,6 +325,7 @@ export async function routeCandidates(
       normalizedPrice: row.modelPrice?.inputPerMillion === null || row.modelPrice?.inputPerMillion === undefined || row.modelPrice?.outputPerMillion === null || row.modelPrice?.outputPerMillion === undefined ? null : Number(row.modelPrice.inputPerMillion) + Number(row.modelPrice.outputPerMillion),
       modelMappingKind: row.model.mappingKind,
       laneSubstitution: options.substitution === true,
+      preferResponsesToChat: options.preferResponsesToChat === true,
       conversionMode: requestedProtocol === row.protocolBinding.protocol ? 'passthrough' : requestedProtocol === 'anthropic_messages' ? 'anthropic_to_openai' : requestedProtocol === 'openai_responses' ? 'responses_to_chat' : 'openai_to_anthropic',
       affinityReused: false
     })

@@ -4,6 +4,15 @@ import { openAiUsage } from './anthropic-openai'
 
 type Json = Record<string, unknown>
 
+export function responsesRequestNeedsChatCompatibility(body: Json | null | undefined) {
+  if (!body) return false
+  if (body.client_metadata !== undefined) return true
+  return Array.isArray(body.input) && body.input.some((raw) => {
+    const item = record(raw)
+    return item?.type === 'additional_tools'
+  })
+}
+
 function contentText(value: unknown) {
   if (typeof value === 'string') return value
   if (!Array.isArray(value)) return ''
