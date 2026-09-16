@@ -1,11 +1,30 @@
 <script setup lang="ts">
-import { IconBraces, IconCalendarCheck, IconCheck, IconChecks, IconChevronDown, IconChevronUp, IconCloudDownload, IconCopy, IconDotsVertical, IconEdit, IconExternalLink, IconEye, IconEyeOff, IconGripVertical, IconPlugConnected, IconPlus, IconRefresh, IconServerBolt, IconSettings, IconTrash, IconWallet, IconX } from '@tabler/icons-vue'
+import { IconBraces, IconCalendarCheck, IconCheck, IconChecks, IconChevronDown, IconChevronUp, IconCloudDownload, IconCopy, IconDotsVertical, IconEdit, IconExternalLink, IconEye, IconEyeOff, IconGripVertical, IconLoader2, IconPlugConnected, IconPlus, IconRefresh, IconServerBolt, IconSettings, IconTrash, IconWallet, IconX } from '@tabler/icons-vue'
 import type { ChannelModelView, ChannelProtocol, ChannelProtocolBindingView, ChannelView, RelayModelScope, RelayPlatformType, UserModelRoutePolicyView, UserRelayAccountView, UserRelayGroupView } from '#shared/types/hub'
 import { relayPresetCapabilityMode, relayProviderPresets } from '#shared/relay-provider-presets'
+
+const iconStroke = 1.5
+
+function balanceStatus(balance: number | null) {
+  if (balance === null) return 'unknown'
+  if (balance <= 0) return 'low'
+  if (balance < 10) return 'warning'
+  return 'healthy'
+}
 
 const { data, refresh, status: relayStatus } = useLazyFetch<{ groups: UserRelayGroupView[] }>('/api/console/relay-groups')
 const { data: routingData, execute: loadRouting, refresh: refreshRouting } = useLazyFetch<{ models: string[]; radar: { enabled: boolean; maxEffort: string }; policies: UserModelRoutePolicyView[] }>('/api/console/model-routing', { immediate: false })
 const { data: radarData, execute: loadRadar } = useLazyFetch<{ models: Array<{ model: string; reasoningEffort: string; intelligenceScore: number }>; updatedAt: number | null }>('/api/codex-radar', { immediate: false })
+
+// Mobile detection for drag-drop alternative
+const isMobile = ref(false)
+onMounted(() => {
+  isMobile.value = window.matchMedia('(max-width: 768px)').matches
+  const mediaQuery = window.matchMedia('(max-width: 768px)')
+  const handler = (e: MediaQueryListEvent) => { isMobile.value = e.matches }
+  mediaQuery.addEventListener('change', handler)
+  onUnmounted(() => mediaQuery.removeEventListener('change', handler))
+})
 const toast = useAppToast()
 const busy = ref(false)
 const formSaving = ref(false)
@@ -656,6 +675,36 @@ async function dropAccount(group: UserRelayGroupView, targetId: string) {
   try { await $fetch(`/api/console/relay-groups/${group.id}/account-order`, { method: 'PUT', body: { orderedIds: ids } }); await refresh() }
   catch (value) { const failure = value as { data?: { message?: string }; message?: string }; toast.show(failure.data?.message || failure.message || '保存账号顺序失败', 'error') }
 }
+
+// Mobile: move account up/down
+function moveAccountUp(group: UserRelayGroupView, index: number) {
+  if (index === 0) return
+  const ids = group.accounts.map(a => a.id)
+  const [moved] = ids.splice(index, 1)
+  if (!moved) return
+  ids.splice(index - 1, 0, moved)
+  $fetch(`/api/console/relay-groups/${group.id}/account-order`, { method: 'PUT', body: { orderedIds: ids } })
+    .then(() => refresh())
+    .catch((value) => {
+      const failure = value as { data?: { message?: string }; message?: string }
+      toast.show(failure.data?.message || failure.message || '保存账号顺序失败', 'error')
+    })
+}
+
+function moveAccountDown(group: UserRelayGroupView, index: number) {
+  const ids = group.accounts.map(a => a.id)
+  if (index === ids.length - 1) return
+  const [moved] = ids.splice(index, 1)
+  if (!moved) return
+  ids.splice(index + 1, 0, moved)
+  $fetch(`/api/console/relay-groups/${group.id}/account-order`, { method: 'PUT', body: { orderedIds: ids } })
+    .then(() => refresh())
+    .catch((value) => {
+      const failure = value as { data?: { message?: string }; message?: string }
+      toast.show(failure.data?.message || failure.message || '保存账号顺序失败', 'error')
+    })
+}
+
 onBeforeUnmount(removeAccountDragListeners)
 async function openDuplicate(item: ChannelView) {
   invalidateDuplicateRequests()
@@ -749,10 +798,20 @@ function groupBalanceSummary(group: UserRelayGroupView) {
             :data-relay-group-id="activeGroup.id"
             :data-relay-account-id="account.id"
           >
-            <button v-if="activeGroup.accountOrderMode === 'manual'" type="button" class="relay-row-drag" :aria-label="`拖拽调整 ${account.accountLabel || account.name} 的顺序`" title="拖拽调整账号顺序" @pointerdown="startAccountDrag(activeGroup, account.id, $event)"><IconGripVertical :size="17" /><span>{{ index + 1 }}</span></button>
+            <button v-if="activeGroup.accountOrderMode === 'manual'" type="button" class="relay-row-drag" :aria-label="`拖拽调整 ${account.accountLabel || account.name} 的顺序`" title="拖拽调整账号顺序" @pointerdown="startAccountDrag(activeGroup, account.id, $event)"><IconGripVertical :size="17" :stroke-width="iconStroke" /><span>{{ index + 1 }}</span></button>
+
+            <!-- Mobile: Up/Down buttons -->
+            <div v-if="activeGroup.accountOrderMode === 'manual' && isMobile" class="relay-row-arrows">
+              <button type="button" class="icon-button icon-button--mini" :disabled="index === 0" :aria-label="`${account.accountLabel || account.name} 上移`" title="上移" @click="moveAccountUp(activeGroup, index)">
+                <IconChevronUp :size="14" :stroke-width="iconStroke" />
+              </button>
+              <button type="button" class="icon-button icon-button--mini" :disabled="index === activeGroup.accounts.length - 1" :aria-label="`${account.accountLabel || account.name} 下移`" title="下移" @click="moveAccountDown(activeGroup, index)">
+                <IconChevronDown :size="14" :stroke-width="iconStroke" />
+              </button>
+            </div>
             <div class="relay-identity"><span><IconServerBolt :size="19" /></span><div><strong>{{ account.accountLabel || account.name }}</strong><a class="relay-url" :href="account.baseUrl" target="_blank" rel="noopener noreferrer" :title="`打开 ${account.baseUrl}`"><IconExternalLink :size="12" />{{ account.baseUrl }}</a><small>{{ account.name }} · 仅自己 · {{ account.models.filter(model => model.enabled).length }} 个模型</small></div></div>
             <small class="relay-capability-line" :title="account.lastHealthError || accountCapabilitySummary(account)">{{ accountCapabilitySummary(account) }}</small>
-            <div class="relay-balance"><template v-if="account.state.balanceError"><strong>查询失败</strong><small :title="account.state.balanceError || undefined">{{ account.state.balanceError }}</small></template><template v-else-if="account.state.balanceStatus === 'success'"><strong>{{ formatBalance(account.state.remainingBalance, account.state.currency) }}</strong><small>购买 {{ formatBalance(account.state.purchasedQuota, account.state.currency) }} · 赠送 {{ formatBalance(account.state.giftQuota, account.state.currency) }}</small></template><template v-else><strong>余额待查</strong><small>{{ activeGroup.platformType === 'generic' ? '通用站未配置余额接口' : '点击刷新余额' }}</small></template></div>
+            <div class="relay-balance" :data-status="balanceStatus(account.state.remainingBalance)"><template v-if="account.state.balanceError"><strong>查询失败</strong><small :title="account.state.balanceError || undefined">{{ account.state.balanceError }}</small></template><template v-else-if="account.state.balanceStatus === 'success'"><strong>{{ formatBalance(account.state.remainingBalance, account.state.currency) }}</strong><small>购买 {{ formatBalance(account.state.purchasedQuota, account.state.currency) }} · 赠送 {{ formatBalance(account.state.giftQuota, account.state.currency) }}</small></template><template v-else><strong>余额待查</strong><small>{{ activeGroup.platformType === 'generic' ? '通用站未配置余额接口' : '点击刷新余额' }}</small></template></div>
             <div class="table-actions"><button type="button" class="button button--quiet button--small relay-model-button" :disabled="!account.models.length" @click="openModels(account)"><IconBraces :size="14" />查看模型 <span>{{ account.models.filter(model => model.enabled).length }}</span></button><button type="button" class="icon-button" title="刷新余额" :aria-label="`${account.name} 刷新余额`" :disabled="balanceLoading === account.id || activeGroup.platformType === 'generic' || (activeGroup.platformType === 'newapi' && !account.checkinConfigured)" @click="refreshBalance(account)"><IconWallet :size="16" /></button><button v-if="account.checkinEnabled && account.checkinConfigured" type="button" class="icon-button" :class="{ 'is-complete': checkedInToday(account) }" :title="checkedInToday(account) ? '今日已签到' : '签到'" :aria-label="`${account.name} ${checkedInToday(account) ? '今日已签到' : '签到'}`" :disabled="checkingIn === account.id || checkedInToday(account)" @click="checkin(account)"><IconCalendarCheck :size="17" /></button><button type="button" class="icon-button" :title="connectivityTesting === account.id ? '正在检查连接' : '检查连接'" :aria-label="`${account.name} 检查连接`" :aria-busy="connectivityTesting === account.id" @click="testConnectivity(account)"><IconPlugConnected :class="{ 'is-spinning': connectivityTesting === account.id }" :size="17" /></button><button v-if="!isOfficialRelay(account)" type="button" class="icon-button" :title="testing === account.id ? '协议测试进行中' : '协议测试'" :aria-label="testing === account.id ? `${account.name} 协议测试进行中` : `${account.name} 协议测试`" :aria-busy="testing === account.id" @click="requestTest(account)"><IconRefresh :class="{ 'is-spinning': testing === account.id }" :size="17" /></button><details class="relay-more"><summary class="icon-button" title="更多操作" aria-label="更多操作"><IconDotsVertical :size="17" /></summary><div class="relay-more-menu"><button type="button" :disabled="Boolean(syncing)" :aria-busy="syncing === account.id" :title="syncing === account.id ? '正在同步模型' : syncing ? '其他中转正在同步模型' : '同步模型'" @click="closeRelayActionMenu($event); sync(account)"><IconCloudDownload :class="{ 'is-spinning': syncing === account.id }" :size="15" />{{ syncing === account.id ? '同步中' : '同步模型' }}</button><button type="button" @click="closeRelayActionMenu($event); openDuplicate(account)"><IconCopy :size="15" />复制中转</button><button type="button" @click="closeRelayActionMenu($event); edit(account)"><IconEdit :size="15" />编辑</button><button type="button" class="danger" @click="closeRelayActionMenu($event); deleting = account"><IconTrash :size="15" />删除</button></div></details></div>
           </article>
         </div>
@@ -770,9 +829,10 @@ function groupBalanceSummary(group: UserRelayGroupView) {
       <label for="relay-upstream-token"><span>上游 API Key *</span><span class="relay-key-input"><span class="relay-secret-input"><input id="relay-upstream-token" v-model="form.apiKey" name="relay_upstream_token" :type="showApiKey ? 'text' : 'password'" :disabled="credentialsLoading" :placeholder="credentialsLoading ? '正在读取凭据…' : ''" required autocomplete="new-password" autocapitalize="none" spellcheck="false" data-1p-ignore data-lpignore="true"><button type="button" class="icon-button" :title="showApiKey ? '隐藏 API Key' : '显示 API Key'" :aria-label="showApiKey ? '隐藏 API Key' : '显示 API Key'" :disabled="credentialsLoading" @click="showApiKey = !showApiKey"><IconEyeOff v-if="showApiKey" :size="16" /><IconEye v-else :size="16" /></button></span><button type="button" class="button button--secondary button--small" :disabled="credentialsLoading || discovering || !form.baseUrl || !form.apiKey" @click="discoverModels"><IconCloudDownload :size="15" />{{ discovering ? '获取中' : '获取模型' }}</button></span></label>
       <section v-if="form.platformType === 'newapi'" class="form-section relay-checkin"><header><div><h3>NewAPI 控制台</h3><span>余额与签到</span></div><label class="switch"><input v-model="form.checkinEnabled" type="checkbox"><span />启用签到</label></header><div class="form-grid"><label for="relay-console-token"><span>控制台访问令牌<template v-if="form.checkinEnabled"> *</template></span><span class="relay-secret-input"><input id="relay-console-token" v-model="form.checkinToken" name="relay_console_token" :type="showCheckinToken ? 'text' : 'password'" :disabled="credentialsLoading" :placeholder="credentialsLoading ? '正在读取凭据…' : 'NewAPI access token'" :required="form.checkinEnabled" autocomplete="new-password" autocapitalize="none" spellcheck="false" data-1p-ignore data-lpignore="true"><button type="button" class="icon-button" :title="showCheckinToken ? '隐藏令牌' : '显示令牌'" :aria-label="showCheckinToken ? '隐藏令牌' : '显示令牌'" :disabled="credentialsLoading" @click="showCheckinToken = !showCheckinToken"><IconEyeOff v-if="showCheckinToken" :size="16" /><IconEye v-else :size="16" /></button></span></label><label for="relay-console-account-reference"><span>用户 ID（可选）</span><input id="relay-console-account-reference" v-model="form.checkinUserId" name="relay_console_account_reference" :disabled="credentialsLoading" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="用于 New-Api-User"></label></div></section>
       <section class="form-section"><header><div><h3>模型品类</h3><span>{{ form.providerPresetId ? '官方服务已按产品能力固定品类' : '只声明站点提供哪些模型，协议和认证由保存后的检测自动识别' }}</span></div></header><div v-if="!form.providerPresetId" class="protocol-picker"><button v-for="option in scopeOptions" :key="option.id" type="button" class="protocol-option scope-option" :class="{ active: form.modelScopes.includes(option.id) }" :aria-pressed="form.modelScopes.includes(option.id)" @click="toggleScope(option.id)"><IconCheck :size="15" /><span><strong>{{ option.label }}</strong><small>{{ option.detail }}</small></span></button></div><div v-else class="relay-model-badges"><span v-for="scope in form.modelScopes" :key="scope">{{ scope === 'gpt' ? 'GPT' : scope === 'claude' ? 'Claude' : '其他厂商' }}</span></div></section>
+      <section v-if="editing" class="form-section"><header><div><h3>协议支持</h3><span>由后台自动探测，无需手动配置</span></div></header><div v-if="editing.protocols.length" class="relay-protocol-status"><div v-for="protocol in editing.protocols.filter(p => p.enabled)" :key="protocol.protocol" class="protocol-status-item" :data-status="protocol.verificationStatus"><IconCheck v-if="protocol.verificationStatus === 'verified'" :size="16" :stroke-width="iconStroke" /><IconX v-else-if="protocol.verificationStatus === 'failed'" :size="16" :stroke-width="iconStroke" /><IconLoader2 v-else class="is-spinning" :size="16" :stroke-width="iconStroke" /><span><strong>{{ protocolLabel(protocol.protocol) }}</strong><small v-if="protocol.verificationStatus === 'verified'">{{ protocol.authScheme === 'bearer' ? 'Bearer' : 'x-api-key' }} · {{ date(protocol.verifiedAt) }}</small><small v-else-if="protocol.verificationStatus === 'failed'" class="error-hint">{{ protocol.lastError || '验证失败' }}</small><small v-else>待检测</small></span></div></div><p v-else class="form-hint">保存后系统会自动探测 Messages、Responses 和 Chat 三种协议。</p></section>
       <section class="form-section relay-compat-settings"><header><div><h3>兼容设置</h3><span>模型只在你点击获取或同步时更新</span></div></header><label class="switch"><input v-model="form.clientIdentityMode" type="checkbox" true-value="passthrough" false-value="standard"><span />透传真实 Claude Code / Codex 客户端身份</label></section>
       <section v-if="discoveredModels.length" class="form-section relay-discovered"><header><div><h3>已获取模型</h3><span>{{ discoveredModels.length }} 个模型将直接启用</span></div><button type="button" class="button button--quiet button--small" @click="discoveredModels = []">清空</button></header><div class="relay-model-badges"><span v-for="model in discoveredModels" :key="model" :title="model">{{ model }}</span></div></section>
-      <section class="form-section relay-mappings"><header><button type="button" class="relay-section-toggle" :aria-expanded="mappingsExpanded" @click="mappingsExpanded = !mappingsExpanded"><component :is="mappingsExpanded ? IconChevronUp : IconChevronDown" :size="16" /><span><strong>模型映射</strong><small>仅在需要修改 Hub 对外模型名或协议绑定时配置</small></span></button><button v-if="mappingsExpanded" type="button" class="button button--quiet button--small" @click="addModel"><IconPlus :size="15" />添加映射</button></header><div v-if="mappingsExpanded" class="relay-model-list"><div v-for="(model, index) in form.models" :key="model.id || index" class="relay-model-entry"><div class="relay-model-row"><input v-model="model.publicModel" placeholder="Hub 模型名（留空自动同名）"><span>→</span><input v-model="model.upstreamModel" placeholder="上游模型名"><button type="button" class="icon-button danger" title="移除模型" aria-label="移除模型" @click="removeModel(index)"><IconX :size="15" /></button></div><div class="relay-model-protocols"><button v-for="protocol in form.protocols" :key="protocol.protocol" type="button" :class="{ active: modelProtocolEnabled(model, protocol.protocol) }" :aria-pressed="modelProtocolEnabled(model, protocol.protocol)" @click="toggleModelProtocol(model, protocol.protocol)"><IconCheck :size="12" />{{ protocolLabel(protocol.protocol) }}</button></div></div></div></section>
+      <section class="form-section relay-mappings"><header><button type="button" class="relay-section-toggle" :aria-expanded="mappingsExpanded" @click="mappingsExpanded = !mappingsExpanded"><component :is="mappingsExpanded ? IconChevronUp : IconChevronDown" :size="16" /><span><strong>模型映射</strong><small>仅在需要修改 Hub 对外模型名时配置，协议由系统自动管理</small></span></button><button v-if="mappingsExpanded" type="button" class="button button--quiet button--small" @click="addModel"><IconPlus :size="15" />添加映射</button></header><div v-if="mappingsExpanded" class="relay-model-list"><div v-for="(model, index) in form.models" :key="model.id || index" class="relay-model-entry"><div class="relay-model-row"><input v-model="model.publicModel" placeholder="Hub 模型名（留空自动同名）"><span>→</span><input v-model="model.upstreamModel" placeholder="上游模型名"><button type="button" class="icon-button danger" title="移除模型" aria-label="移除模型" @click="removeModel(index)"><IconX :size="15" /></button></div></div></div></section>
       <div class="form-grid relay-settings-grid"><label><span>权重</span><input v-model.number="form.weight" type="number" min="1"></label><label><span>最大并发</span><input v-model.number="form.maxConcurrency" type="number" min="1"></label><label><span>超时（毫秒）</span><input v-model.number="form.timeoutMs" type="number" min="1000"></label></div>
       <p v-if="error" class="form-error">{{ error }}</p><footer><label class="switch"><input v-model="form.enabled" type="checkbox"><span />启用中转</label><div><button type="button" class="button button--secondary" :disabled="formSaving" @click="requestCloseForm">取消</button><button type="submit" class="button button--primary" :disabled="formSaving || credentialsLoading || discovering">{{ credentialsLoading ? '读取凭据中' : discovering ? '获取模型中' : formSaving ? '保存中' : '保存中转' }}</button></div></footer>
     </form></AppDrawer>
@@ -874,6 +934,20 @@ function groupBalanceSummary(group: UserRelayGroupView) {
 .relay-checkin > header { align-items:center; }
 .relay-empty { min-height:260px; display:grid; place-items:center; align-content:center; gap:.55rem; text-align:center; }
 .relay-empty p { margin:0; color:var(--text-muted); }
+.relay-protocol-status { display:grid; gap:.45rem; }
+.protocol-status-item { display:flex; align-items:center; gap:.5rem; padding:.55rem; border:1px solid var(--line-subtle); background:var(--surface-soft); transition:all 0.3s var(--hub-motion-ease); }
+.protocol-status-item[data-status="verified"] { border-color:var(--success-line); background:var(--success-soft); }
+.protocol-status-item[data-status="failed"] { border-color:var(--danger-line); background:var(--danger-soft); }
+.protocol-status-item > svg { flex:none; color:var(--success); animation:fade-in 0.4s var(--hub-motion-ease); }
+.protocol-status-item[data-status="failed"] > svg { color:var(--danger); }
+.protocol-status-item > span { min-width:0; display:grid; gap:.2rem; }
+.protocol-status-item strong { font-size:.72rem; }
+.protocol-status-item small { color:var(--text-muted); font-size:.67rem; }
+.protocol-status-item .error-hint { color:var(--danger); }
+@keyframes fade-in {
+  from { opacity:0; transform:scale(0.8); }
+  to { opacity:1; transform:scale(1); }
+}
 .protocol-picker { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.55rem; }
 .protocol-option { min-width:0; border:1px solid var(--line-strong); background:var(--surface-soft); }
 .protocol-option > button { width:100%; min-height:64px; display:flex; align-items:center; gap:.55rem; padding:.65rem; text-align:left; color:var(--text); border:0; background:transparent; }

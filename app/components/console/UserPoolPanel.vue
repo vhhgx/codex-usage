@@ -58,6 +58,7 @@ const editingReceiver = ref<SmsReceiverView | null>(null)
 const receiverImportText = ref('')
 const receiverError = ref('')
 const receiverBusy = ref(false)
+const receiverCredentialsLoading = ref(false)
 const receiverCodes = reactive<Record<string, SmsCodeResult | undefined>>({})
 const accountCodes = reactive<Record<string, SmsCodeResult | undefined>>({})
 const receiverForm = reactive({ phone: '', fetchUrl: '', note: '', active: true })
@@ -445,21 +446,32 @@ async function remove() {
   try { await $fetch(`/api/console/pool/accounts/${deleting.value.id}`, { method: 'DELETE' }); deleting.value = null; await reloadPoolData(); toast.show('账号已删除', 'success') }
   catch (value) { toast.show(failureMessage(value, '删除账号失败'), 'error') } finally { loading.value = false }
 }
-function openReceiverCreate(item?: SmsReceiverView) {
+async function openReceiverCreate(item?: SmsReceiverView) {
   if (!openDrawer('receiver')) return
   editingReceiver.value = item || null
   receiverCreateMode.value = 'single'
   receiverImportText.value = ''
   receiverError.value = ''
   Object.assign(receiverForm, { phone: item?.phone || '', fetchUrl: '', note: item?.note || '', active: item?.status !== 'disabled' })
+  receiverCredentialsLoading.value = Boolean(item)
+  if (!item) return
+  try {
+    const credentials = await $fetch<{ fetchUrl: string }>(`/api/console/pool/sms-receivers/${item.id}/credentials`, { method: 'POST' })
+    if (drawer.value !== 'receiver' || editingReceiver.value?.id !== item.id) return
+    receiverForm.fetchUrl = credentials.fetchUrl
+  } catch (value) {
+    receiverError.value = failureMessage(value, '读取接码接口 URL 失败')
+  } finally {
+    if (editingReceiver.value?.id === item.id) receiverCredentialsLoading.value = false
+  }
 }
 async function saveReceiver() {
-  if (receiverBusy.value || drawer.value !== 'receiver') return
+  if (receiverBusy.value || receiverCredentialsLoading.value || drawer.value !== 'receiver') return
   const requestEpoch = drawerEpoch
   const editingId = editingReceiver.value?.id || null
   const mode = receiverCreateMode.value
   const importPayload = { text: receiverImportText.value }
-  const body = { phone: receiverForm.phone, note: receiverForm.note, status: receiverForm.active ? 'active' : 'disabled', ...(receiverForm.fetchUrl ? { fetchUrl: receiverForm.fetchUrl } : {}) }
+  const body = { phone: receiverForm.phone, note: receiverForm.note, status: receiverForm.active ? 'active' : 'disabled', fetchUrl: receiverForm.fetchUrl }
   receiverBusy.value = true; receiverError.value = ''
   try {
     if (!editingId && mode === 'batch') {
@@ -549,8 +561,8 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
           <header><div><span>ACCOUNT</span><h3>账号资料</h3></div><small>身份、登录凭据与接码</small></header>
           <div class="form-grid"><label><span>邮箱 *</span><input v-model="manualForm.email" type="email" required autocomplete="off"></label><label><span>姓名</span><input v-model="manualForm.displayName" maxlength="120"></label></div>
           <div class="form-grid"><label><span>来源 *</span><AppSelect v-model="manualForm.source" required><option value="" disabled>请选择来源</option><option v-for="source in ACCOUNT_VAULT_SOURCES.filter(item => item !== 'unknown')" :key="source" :value="source">{{ accountSourceLabels[source] }}</option></AppSelect></label><label><span>账号状态</span><AppSelect v-model="manualForm.status"><option v-for="status in ACCOUNT_VAULT_STATUSES" :key="status" :value="status">{{ status }}</option></AppSelect></label></div>
-          <label><span>账号密码</span><input v-model="manualForm.password" type="password" maxlength="2000" autocomplete="new-password"></label>
-          <div class="form-grid"><label><span>邮箱验证码链接</span><input v-model="manualForm.emailCodeUrl" type="url" maxlength="4000" placeholder="https://"></label><label><span>2FA 密钥</span><input v-model="manualForm.totpSecret" type="password" maxlength="512" autocomplete="off" placeholder="Base32"></label></div>
+          <label><span>账号密码</span><AppSecretInput v-model="manualForm.password" secret-label="账号密码" maxlength="2000" autocomplete="new-password" /></label>
+          <div class="form-grid"><label><span>邮箱验证码链接</span><AppSecretInput v-model="manualForm.emailCodeUrl" secret-label="邮箱验证码链接" visible-type="url" maxlength="4000" placeholder="https://" /></label><label><span>2FA 密钥</span><AppSecretInput v-model="manualForm.totpSecret" secret-label="2FA 密钥" maxlength="512" autocomplete="off" placeholder="Base32" /></label></div>
           <label><span>接码手机号</span><AppSelect v-model="manualForm.smsReceiverId"><option value="">自动分配可用手机号</option><option v-for="item in receivers.filter(receiver => receiver.status === 'active' && receiver.availableSlots > 0)" :key="item.id" :value="item.id">{{ item.phone }} · {{ item.bindingCount }}/3</option></AppSelect><small>没有可用号码时仍会创建账号。</small></label>
           <label><span>备注</span><textarea v-model="manualForm.remark" maxlength="2000" rows="4" /></label>
         </section>
@@ -582,9 +594,9 @@ const sourceLabel = (value: string) => value === 'oauth' ? 'Auth 登录' : value
     <AppDrawer :open="drawer === 'receiver'" kicker="SMS RECEIVER" :title="editingReceiver ? '编辑接码' : '新增接码'" @close="requestCloseDrawer">
       <form class="admin-form" :aria-busy="receiverBusy" :inert="receiverBusy" @submit.prevent="saveReceiver">
         <nav v-if="!editingReceiver" class="admin-page-tabs import-mode-tabs" role="tablist" aria-label="接码新增方式" aria-orientation="horizontal"><button id="receiver-create-tab-single" type="button" role="tab" aria-controls="receiver-create-panel-single" :aria-selected="receiverCreateMode === 'single'" :tabindex="receiverCreateMode === 'single' ? 0 : -1" :class="{ active: receiverCreateMode === 'single' }" @keydown="onReceiverCreateTabKeydown($event, 'single')" @click="switchReceiverCreateMode('single')">单个添加</button><button id="receiver-create-tab-batch" type="button" role="tab" aria-controls="receiver-create-panel-batch" :aria-selected="receiverCreateMode === 'batch'" :tabindex="receiverCreateMode === 'batch' ? 0 : -1" :class="{ active: receiverCreateMode === 'batch' }" @keydown="onReceiverCreateTabKeydown($event, 'batch')" @click="switchReceiverCreateMode('batch')">批量导入</button></nav>
-        <section v-if="editingReceiver || receiverCreateMode === 'single'" id="receiver-create-panel-single" class="receiver-create-panel" :role="editingReceiver ? undefined : 'tabpanel'" :aria-labelledby="editingReceiver ? undefined : 'receiver-create-tab-single'" :tabindex="editingReceiver ? undefined : 0"><label><span>接码手机号 *</span><input v-model="receiverForm.phone" required maxlength="40" inputmode="tel"></label><label><span>{{ editingReceiver ? '接码接口 URL（留空保持不变）' : '接码接口 URL *' }}</span><input v-model="receiverForm.fetchUrl" type="url" :required="!editingReceiver" maxlength="3000" placeholder="https://"></label><label><span>备注</span><input v-model="receiverForm.note" maxlength="500"></label><label class="switch"><input v-model="receiverForm.active" type="checkbox"><span />启用接码</label></section>
+        <section v-if="editingReceiver || receiverCreateMode === 'single'" id="receiver-create-panel-single" class="receiver-create-panel" :role="editingReceiver ? undefined : 'tabpanel'" :aria-labelledby="editingReceiver ? undefined : 'receiver-create-tab-single'" :tabindex="editingReceiver ? undefined : 0"><label><span>接码手机号 *</span><input v-model="receiverForm.phone" required maxlength="40" inputmode="tel"></label><label><span>接码接口 URL *</span><AppSecretInput v-model="receiverForm.fetchUrl" secret-label="接码接口 URL" visible-type="url" required :disabled="receiverCredentialsLoading" :placeholder="receiverCredentialsLoading ? '正在读取接口 URL…' : 'https://'" maxlength="3000" /></label><label><span>备注</span><input v-model="receiverForm.note" maxlength="500"></label><label class="switch"><input v-model="receiverForm.active" type="checkbox"><span />启用接码</label></section>
         <section v-else id="receiver-create-panel-batch" class="receiver-create-panel" role="tabpanel" aria-labelledby="receiver-create-tab-batch" tabindex="0"><label><span>批量内容 *</span><textarea v-model="receiverImportText" rows="10" required spellcheck="false" placeholder="手机号|接码接口 URL&#10;手机号|接码接口 URL"></textarea></label></section>
-        <p v-if="receiverError" class="form-error pre-line">{{ receiverError }}</p><footer><button type="button" class="button button--secondary" :disabled="receiverBusy" @click="requestCloseDrawer">取消</button><button class="button button--primary" :disabled="receiverBusy">{{ receiverBusy ? '保存中' : editingReceiver ? '保存接码' : receiverCreateMode === 'batch' ? '批量导入' : '新增接码' }}</button></footer>
+        <p v-if="receiverError" class="form-error pre-line">{{ receiverError }}</p><footer><button type="button" class="button button--secondary" :disabled="receiverBusy || receiverCredentialsLoading" @click="requestCloseDrawer">取消</button><button class="button button--primary" :disabled="receiverBusy || receiverCredentialsLoading">{{ receiverCredentialsLoading ? '读取凭据中' : receiverBusy ? '保存中' : editingReceiver ? '保存接码' : receiverCreateMode === 'batch' ? '批量导入' : '新增接码' }}</button></footer>
       </form>
     </AppDrawer>
     <AppConfirmDialog :open="Boolean(deleting)" title="删除账号" :message="`删除“${deleting?.displayName || ''}”后，该账号会从专属号池移除。`" :busy="loading" @close="deleting = null" @confirm="remove" />
