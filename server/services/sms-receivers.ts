@@ -737,8 +737,8 @@ export async function ensureLegacySmsReceiver(event: H3Event, phoneValue: unknow
   return (await createSmsReceiver(event, { phone: phoneValue, fetchUrl: urlValue, note: '由旧账号资料迁移' }, actorId)).id
 }
 
-export async function revealSmsReceiverFetchUrl(event: H3Event, id: string) {
-  const receiver = await receiverRow(event, id)
+export async function revealSmsReceiverFetchUrl(event: H3Event, id: string, ownerUserId: string | null = null) {
+  const receiver = await receiverRow(event, id, ownerUserId)
   try { return decryptContextSecret(receiver.encryptedFetchUrl, smsContext(id), event) } catch {
     throw createError({ statusCode: 500, message: '接码接口密文无法解密，请检查加密密钥配置' })
   }

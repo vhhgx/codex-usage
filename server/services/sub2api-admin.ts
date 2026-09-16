@@ -681,6 +681,11 @@ export async function resolveManagedSub2ApiProxy(event: H3Event, opaqueId: strin
   return proxy
 }
 
+export async function getManagedSub2ApiProxyCredentials(event: H3Event, opaqueId: string) {
+  const proxy = await resolveManagedSub2ApiProxy(event, opaqueId)
+  return { password: text(proxy.raw.password) }
+}
+
 async function validDefaultProxy(event: H3Event) {
   const upstreamId = await getSub2ApiDefaultProxyUpstreamId(event)
   if (!upstreamId) return null
