@@ -305,6 +305,23 @@ html.dark {
   }
 }
 
+:root {
+  /* Visual hierarchy - Double-Bezel system */
+  --hub-bezel-outer: 0 0 0 1px var(--hub-line-subtle);
+  --hub-bezel-inner: inset 0 1px 2px rgb(0 0 0 / 4%);
+
+  /* Icon system */
+  --hub-icon-stroke: 1.5;
+
+  /* Interactive states */
+  --hub-state-transition: all 0.3s var(--hub-motion-ease);
+  --hub-focus-ring-accent: 0 0 0 2px var(--hub-accent-soft), 0 0 0 4px var(--hub-accent-line);
+
+  /* Form constraints */
+  --hub-form-max-height: 480px;
+  --hub-fields-per-step: 5;
+}
+
 @media (max-width: 720px) {
   :root { --hub-page-gutter: .875rem; }
 }

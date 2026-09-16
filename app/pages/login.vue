@@ -7,6 +7,8 @@ import {
   IconLock,
   IconUser
 } from '@tabler/icons-vue'
+
+const iconStroke = 1.5
 import type { AdminSessionView } from '#shared/types/hub'
 
 type LoginPhase = 'idle' | 'authenticating' | 'redirecting'
@@ -99,7 +101,7 @@ async function login() {
     <AppThemeButton class="admin-login__theme" />
     <section class="admin-login__intro">
       <NuxtLink to="/" class="admin-login__brand">
-        <IconActivityHeartbeat :size="24" />
+        <IconActivityHeartbeat :size="24" :stroke-width="iconStroke" />
         Zephyr Hub
       </NuxtLink>
       <div>
@@ -119,7 +121,7 @@ async function login() {
         @submit.prevent="login"
       >
         <header>
-          <IconKey :size="22" />
+          <IconKey :size="22" :stroke-width="iconStroke" />
           <div>
             <h2>账号登录</h2>
             <p>进入 Zephyr Hub</p>
@@ -129,7 +131,7 @@ async function login() {
         <label>
           <span>用户名</span>
           <div>
-            <IconUser :size="18" />
+            <IconUser :size="18" :stroke-width="iconStroke" />
             <input name="username" autocomplete="username" required :disabled="busy">
           </div>
         </label>
@@ -137,7 +139,7 @@ async function login() {
         <label>
           <span>密码</span>
           <div>
-            <IconLock :size="18" />
+            <IconLock :size="18" :stroke-width="iconStroke" />
             <input
               name="password"
               type="password"
@@ -151,8 +153,8 @@ async function login() {
         <p v-if="error" class="form-error" role="alert">{{ error }}</p>
 
         <button class="button button--primary button--full" type="submit" :disabled="busy">
-          <IconLoader2 v-if="busy" class="is-spinning" :size="18" />
-          <IconArrowRight v-else :size="18" />
+          <IconLoader2 v-if="busy" class="is-spinning" :size="18" :stroke-width="iconStroke" />
+          <IconArrowRight v-else :size="18" :stroke-width="iconStroke" />
           {{ buttonLabel }}
         </button>
 

@@ -14,7 +14,7 @@ export default defineNuxtConfig({
     '/': { redirect: '/login' },
     '/admin/login': { redirect: '/login' }
   },
-  css: ['~/assets/css/design-tokens.css', '~/assets/css/main.css', '~/assets/css/v2.css'],
+  css: ['~/assets/css/design-tokens.css', '~/assets/css/main.css', '~/assets/css/v2.css', '~/assets/css/relay-panel.css'],
   runtimeConfig: {
     databaseUrl: '',
     redisUrl: '',

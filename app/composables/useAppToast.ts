@@ -1,6 +1,6 @@
 import { clientRandomUUID } from '#shared/utils/client-random'
 
-export type AppToastTone = 'success' | 'error' | 'info'
+export type AppToastTone = 'success' | 'error' | 'warning' | 'info'
 
 export interface AppToastItem {
   id: string

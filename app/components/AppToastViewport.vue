@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { IconAlertCircle, IconCircleCheck, IconInfoCircle, IconX } from '@tabler/icons-vue'
+import { IconAlertCircle, IconAlertTriangle, IconCircleCheck, IconInfoCircle, IconX } from '@tabler/icons-vue'
+import type { AppToastTone } from '~/composables/useAppToast'
 
 const { items, dismiss } = useAppToast()
-const icon = (tone: 'success' | 'error' | 'info') => tone === 'success'
+const icon = (tone: AppToastTone) => tone === 'success'
   ? IconCircleCheck
   : tone === 'error'
     ? IconAlertCircle
-    : IconInfoCircle
+    : tone === 'warning'
+      ? IconAlertTriangle
+      : IconInfoCircle
 </script>
 
 <template>

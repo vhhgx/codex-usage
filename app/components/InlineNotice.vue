@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { IconAlertCircle, IconCircleCheck, IconInfoCircle } from '@tabler/icons-vue'
+import { IconAlertCircle, IconAlertTriangle, IconCircleCheck, IconInfoCircle } from '@tabler/icons-vue'
 
 const props = withDefaults(
   defineProps<{
-    tone?: 'info' | 'success' | 'error'
+    tone?: 'info' | 'success' | 'error' | 'warning'
     title: string
     message?: string
   }>(),
@@ -13,13 +13,14 @@ const props = withDefaults(
 const icon = computed(() => {
   if (props.tone === 'success') return IconCircleCheck
   if (props.tone === 'error') return IconAlertCircle
+  if (props.tone === 'warning') return IconAlertTriangle
   return IconInfoCircle
 })
 </script>
 
 <template>
   <div class="notice" :class="`notice--${tone}`" role="status">
-    <component :is="icon" :size="20" :stroke-width="1.8" />
+    <component :is="icon" :size="20" :stroke-width="1.5" />
     <div>
       <strong>{{ title }}</strong>
       <p v-if="message">{{ message }}</p>

@@ -1,0 +1,152 @@
+/* UserRelaysPanel mobile improvements */
+
+.relay-row-arrows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.icon-button--mini {
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  display: grid;
+  place-items: center;
+  color: var(--text-soft);
+  background: var(--surface);
+  cursor: pointer;
+  transition: var(--hub-state-transition);
+}
+
+.icon-button--mini:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--line-strong);
+}
+
+.icon-button--mini:disabled {
+  cursor: not-allowed;
+  opacity: .4;
+  filter: grayscale(0.5);
+}
+
+/* Hide drag handle on mobile when arrows are shown */
+@media (max-width: 768px) {
+  .relay-row-drag {
+    display: none;
+  }
+
+  .relay-row-arrows {
+    display: flex;
+  }
+}
+
+/* Hide arrows on desktop */
+@media (min-width: 769px) {
+  .relay-row-arrows {
+    display: none;
+  }
+}
+
+/* Model routing color coding */
+.route-substitutes {
+  padding: 0.75rem;
+  border: 1px solid var(--hub-warning-line);
+  border-radius: var(--hub-radius-panel);
+  background: var(--hub-warning-soft);
+  display: grid;
+  gap: 0.65rem;
+}
+
+.route-substitutes label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.route-substitutes label > span:first-child {
+  color: var(--hub-warning);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.route-chip-list button {
+  padding: 0.4rem 0.6rem 0.4rem 0.5rem;
+  border: 1px solid var(--hub-warning-line);
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--hub-warning);
+  background: var(--hub-warning-soft);
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: grab;
+  transition: var(--hub-state-transition);
+}
+
+.route-chip-list button:hover {
+  border-color: var(--hub-warning);
+  background: color-mix(in srgb, var(--hub-warning) 12%, transparent);
+  transform: translateY(-1px);
+}
+
+.route-chip-list button:active {
+  cursor: grabbing;
+  transform: translateY(0) scale(0.98);
+}
+
+.route-lane {
+  padding: 0.75rem;
+  border: 1px solid var(--hub-accent-line);
+  border-radius: var(--hub-radius-panel);
+  background: var(--hub-accent-soft);
+  display: grid;
+  gap: 0.65rem;
+}
+
+.route-lane > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.route-lane > header strong {
+  color: var(--hub-accent);
+  font-size: 0.875rem;
+}
+
+.route-source-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.route-source-list button {
+  padding: 0.4rem 0.6rem 0.4rem 0.5rem;
+  border: 1px solid var(--hub-accent-line);
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--hub-accent);
+  background: color-mix(in srgb, var(--hub-accent) 8%, transparent);
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: grab;
+  transition: var(--hub-state-transition);
+}
+
+.route-source-list button:hover {
+  border-color: var(--hub-accent);
+  background: color-mix(in srgb, var(--hub-accent) 15%, transparent);
+  transform: translateY(-1px);
+}
+
+.route-source-list button:active {
+  cursor: grabbing;
+  transform: translateY(0) scale(0.98);
+}
+
