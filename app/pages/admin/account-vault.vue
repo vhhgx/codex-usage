@@ -139,9 +139,9 @@ const editing = ref<AccountVaultView | null>(null)
 const accountCreateMode = ref<AccountCreateMode>('manual')
 const uploadPool = ref<'sub2api' | 'cpa'>('sub2api')
 const saving = ref(false)
+const credentialsLoading = ref(false)
 const formError = ref('')
-const emailCodeUrlTouched = ref(false)
-const totpSecretTouched = ref(false)
+const originalCredentials = reactive({ password: '', emailCodeUrl: '', totpSecret: '' })
 const deliveryText = ref('')
 const deliveryFields = ref<AccountDeliveryField[]>(['email', 'password'])
 const deliverySource = ref<AccountVaultSource | ''>('')
@@ -165,6 +165,7 @@ const exportError = ref('')
 const showReceiverForm = ref(false)
 const editingReceiver = ref<SmsReceiverView | null>(null)
 const receiverSaving = ref(false)
+const receiverCredentialsLoading = ref(false)
 const receiverError = ref('')
 const receiverCreateMode = ref<'single' | 'batch'>('single')
 const receiverImportText = ref('')
@@ -938,8 +939,8 @@ function resetForm() {
   Object.assign(form, {
     email: '', displayName: '', source: '', status: 'Codex', password: '', emailCodeUrl: '', totpSecret: '', smsReceiverId: '', remark: ''
   })
-  emailCodeUrlTouched.value = false
-  totpSecretTouched.value = false
+  Object.assign(originalCredentials, { password: '', emailCodeUrl: '', totpSecret: '' })
+  credentialsLoading.value = false
   formError.value = ''
 }
 
@@ -957,7 +958,7 @@ function openCreate() {
   showForm.value = true
 }
 
-function openEdit(item: AccountVaultView) {
+async function openEdit(item: AccountVaultView) {
   editing.value = item
   Object.assign(form, {
     email: item.email,
@@ -970,19 +971,34 @@ function openEdit(item: AccountVaultView) {
     smsReceiverId: item.smsReceiver?.id || '',
     remark: item.remark || ''
   })
-  emailCodeUrlTouched.value = false
-  totpSecretTouched.value = false
+  Object.assign(originalCredentials, { password: '', emailCodeUrl: '', totpSecret: '' })
   formError.value = ''
   accountCreateMode.value = 'manual'
   showForm.value = true
+  credentialsLoading.value = true
+  try {
+    const credentials = await $fetch<{ password: string; emailCodeUrl: string; totpSecret: string }>(`/api/admin/account-vault/${item.id}/reveal`, { method: 'POST' })
+    if (editing.value?.id !== item.id) return
+    Object.assign(form, {
+      password: credentials.password,
+      emailCodeUrl: credentials.emailCodeUrl,
+      totpSecret: credentials.totpSecret
+    })
+    Object.assign(originalCredentials, credentials)
+  } catch (value) {
+    formError.value = failure(value, '读取账号凭据失败')
+  } finally {
+    if (editing.value?.id === item.id) credentialsLoading.value = false
+  }
 }
 
 function closeForm() {
-  if (saving.value || deliveryImporting.value || importSaving.value || cpaUploadSaving.value || conversionSaving.value) return
+  if (saving.value || credentialsLoading.value || deliveryImporting.value || importSaving.value || cpaUploadSaving.value || conversionSaving.value) return
   showForm.value = false
 }
 
 async function saveVault() {
+  if (credentialsLoading.value) return
   saving.value = true
   formError.value = ''
   try {
@@ -991,12 +1007,12 @@ async function saveVault() {
       displayName: form.displayName,
       source: form.source,
       status: form.status,
-      password: form.password || undefined,
       smsReceiverId: form.smsReceiverId || null,
       remark: form.remark
     }
-    if (!editing.value || emailCodeUrlTouched.value) body.emailCodeUrl = form.emailCodeUrl
-    if (!editing.value || totpSecretTouched.value) body.totpSecret = form.totpSecret
+    if (!editing.value || form.password !== originalCredentials.password) body.password = form.password
+    if (!editing.value || form.emailCodeUrl !== originalCredentials.emailCodeUrl) body.emailCodeUrl = form.emailCodeUrl
+    if (!editing.value || form.totpSecret !== originalCredentials.totpSecret) body.totpSecret = form.totpSecret
     if (editing.value) await $fetch(`/api/admin/account-vault/${editing.value.id}`, { method: 'PATCH', body })
     else await $fetch('/api/admin/account-vault', { method: 'POST', body })
     await refreshAllData(false)
@@ -1381,21 +1397,32 @@ function openReceiverCreate() {
   receiverCreateMode.value = 'single'
   receiverImportText.value = ''
   receiverError.value = ''
+  receiverCredentialsLoading.value = false
   manualBindingError.value = ''
   showReceiverForm.value = true
 }
 
-function openReceiverEdit(item: SmsReceiverView) {
+async function openReceiverEdit(item: SmsReceiverView) {
   editingReceiver.value = item
   Object.assign(receiverForm, { phone: item.phone, fetchUrl: '', note: item.note || '', active: item.status === 'active' })
   receiverError.value = ''
   Object.assign(manualBindingForm, { email: '', displayName: '' })
   manualBindingError.value = ''
   showReceiverForm.value = true
+  receiverCredentialsLoading.value = true
+  try {
+    const credentials = await $fetch<{ fetchUrl: string }>(`/api/admin/sms-receivers/${item.id}/credentials`, { method: 'POST' })
+    if (editingReceiver.value?.id !== item.id) return
+    receiverForm.fetchUrl = credentials.fetchUrl
+  } catch (value) {
+    receiverError.value = failure(value, '读取接码接口 URL 失败')
+  } finally {
+    if (editingReceiver.value?.id === item.id) receiverCredentialsLoading.value = false
+  }
 }
 
 function closeReceiverForm() {
-  if (receiverSaving.value) return
+  if (receiverSaving.value || receiverCredentialsLoading.value) return
   showReceiverForm.value = false
   editingReceiver.value = null
   receiverImportText.value = ''
@@ -1426,6 +1453,7 @@ async function addManualBinding() {
 }
 
 async function saveReceiver() {
+  if (receiverCredentialsLoading.value) return
   if (!editingReceiver.value && receiverCreateMode.value === 'batch') {
     receiverSaving.value = true
     receiverError.value = ''
@@ -1464,7 +1492,7 @@ async function saveReceiver() {
       phone: receiverForm.phone,
       note: receiverForm.note,
       status: receiverForm.active ? 'active' : 'disabled',
-      ...(receiverForm.fetchUrl ? { fetchUrl: receiverForm.fetchUrl } : {})
+      fetchUrl: receiverForm.fetchUrl
     }
     if (editingReceiver.value) await $fetch(`/api/admin/sms-receivers/${editingReceiver.value.id}`, { method: 'PATCH', body })
     else await $fetch('/api/admin/sms-receivers', { method: 'POST', body })
@@ -1800,7 +1828,7 @@ onBeforeUnmount(() => { totpTimers.forEach(timer => window.clearTimeout(timer)) 
         </div>
         <form class="admin-form receiver-editor" @submit.prevent="saveReceiver">
           <template v-if="editingReceiver || receiverCreateMode === 'single'">
-            <div class="form-grid"><label><span>接码手机号 *</span><input v-model="receiverForm.phone" required maxlength="40" inputmode="tel" placeholder="支持 10 位或前导 1"></label><label><span>{{ editingReceiver ? '接码接口 URL（留空不修改）' : '接码接口 URL *' }}</span><input v-model="receiverForm.fetchUrl" type="url" :required="!editingReceiver" maxlength="3000" placeholder="https://"></label></div>
+            <div class="form-grid"><label><span>接码手机号 *</span><input v-model="receiverForm.phone" required maxlength="40" inputmode="tel" placeholder="支持 10 位或前导 1"></label><label><span>接码接口 URL *</span><AppSecretInput v-model="receiverForm.fetchUrl" secret-label="接码接口 URL" visible-type="url" required :disabled="receiverCredentialsLoading" :placeholder="receiverCredentialsLoading ? '正在读取接口 URL…' : 'https://'" maxlength="3000" /></label></div>
             <div class="receiver-editor__bottom"><label><span>备注</span><input v-model="receiverForm.note" maxlength="500"></label><label class="receiver-toggle"><input v-model="receiverForm.active" type="checkbox"><span><strong>启用接码</strong><small>停用后不能刷新验证码或绑定新账号</small></span></label></div>
             <section v-if="editingReceiver" class="receiver-bindings" aria-labelledby="receiver-bindings-title">
               <header><div><h3 id="receiver-bindings-title">绑定账号</h3><span class="tabular-nums">{{ editingReceiver.bindingCount }}/3</span></div><small>{{ editingReceiver.availableSlots }} 个空余名额</small></header>
@@ -1829,7 +1857,7 @@ onBeforeUnmount(() => { totpTimers.forEach(timer => window.clearTimeout(timer)) 
             </div>
           </template>
           <p v-if="receiverError" class="form-error">{{ receiverError }}</p>
-          <footer><span v-if="!editingReceiver && receiverCreateMode === 'batch'">已识别 {{ receiverImportPreview.length }} 行</span><button class="button button--secondary" type="button" @click="closeReceiverForm">取消</button><button class="button button--primary" :disabled="receiverSaving || (!editingReceiver && receiverCreateMode === 'batch' && !receiverImportPreview.length)">{{ receiverSaving ? (receiverCreateMode === 'batch' ? '导入中' : '保存中') : (!editingReceiver && receiverCreateMode === 'batch' ? `导入 ${receiverImportPreview.length} 个接码` : '保存接码') }}</button></footer>
+          <footer><span v-if="!editingReceiver && receiverCreateMode === 'batch'">已识别 {{ receiverImportPreview.length }} 行</span><button class="button button--secondary" type="button" @click="closeReceiverForm">取消</button><button class="button button--primary" :disabled="receiverSaving || receiverCredentialsLoading || (!editingReceiver && receiverCreateMode === 'batch' && !receiverImportPreview.length)">{{ receiverCredentialsLoading ? '读取凭据中' : receiverSaving ? (receiverCreateMode === 'batch' ? '导入中' : '保存中') : (!editingReceiver && receiverCreateMode === 'batch' ? `导入 ${receiverImportPreview.length} 个接码` : '保存接码') }}</button></footer>
         </form>
       </section>
       </div>
@@ -1838,7 +1866,7 @@ onBeforeUnmount(() => { totpTimers.forEach(timer => window.clearTimeout(timer)) 
     <Transition name="hub-layer">
       <div v-if="showForm" class="admin-modal-backdrop account-vault-layer" @click.self="closeForm">
       <section class="admin-modal admin-modal--wide account-editor-modal hub-layer-panel" role="dialog" aria-modal="true" :aria-label="editing ? '编辑账号' : '新增账号'">
-        <header class="account-editor-header"><div class="account-editor-heading"><span class="account-editor-title-icon"><component :is="editing ? IconEdit : IconAddressBook" :size="18" :stroke-width="1.7" /></span><div><span>ACCOUNT RECORD</span><h2 class="text-balance">{{ editing ? '编辑账号' : '新增账号' }}</h2><p>{{ editing ? '更新账号资料与验证方式' : '录入账号或导入现有凭据' }}</p></div></div><button class="icon-button" type="button" title="关闭" aria-label="关闭" :disabled="saving || deliveryImporting || importSaving || cpaUploadSaving || conversionSaving" @click="closeForm"><IconX :size="18" :stroke-width="1.8" /></button></header>
+        <header class="account-editor-header"><div class="account-editor-heading"><span class="account-editor-title-icon"><component :is="editing ? IconEdit : IconAddressBook" :size="18" :stroke-width="1.7" /></span><div><span>ACCOUNT RECORD</span><h2 class="text-balance">{{ editing ? '编辑账号' : '新增账号' }}</h2><p>{{ editing ? '更新账号资料与验证方式' : '录入账号或导入现有凭据' }}</p></div></div><button class="icon-button" type="button" title="关闭" aria-label="关闭" :disabled="saving || credentialsLoading || deliveryImporting || importSaving || cpaUploadSaving || conversionSaving" @click="closeForm"><IconX :size="18" :stroke-width="1.8" /></button></header>
         <form v-if="editing || accountCreateMode === 'manual'" class="admin-form account-editor-form" @submit.prevent="saveVault">
           <div class="account-editor-layout">
             <section class="account-editor-main">
@@ -1848,18 +1876,18 @@ onBeforeUnmount(() => { totpTimers.forEach(timer => window.clearTimeout(timer)) 
               </div>
               <div class="form-grid"><label><span>邮箱 *</span><input v-model="form.email" type="email" required autocomplete="off"></label><label><span>姓名</span><input v-model="form.displayName" maxlength="120"></label></div>
               <div class="form-grid"><label><span>来源 *</span><AppSelect v-model="form.source" required><option value="" disabled>请选择来源</option><option v-for="source in ACCOUNT_VAULT_SOURCES.filter(item => item !== 'unknown')" :key="source" :value="source">{{ sourceLabel(source) }}</option><option v-if="editing?.source === 'unknown'" value="unknown">未标注</option></AppSelect></label><label><span>账号状态</span><AppSelect v-model="form.status"><option v-for="status in ACCOUNT_VAULT_STATUSES" :key="status" :value="status">{{ status }}</option></AppSelect></label></div>
-              <label><span>{{ editing ? '新密码（留空不修改）' : '账号密码' }}</span><input v-model="form.password" type="password" maxlength="2000" autocomplete="new-password"></label>
+              <label><span>账号密码</span><AppSecretInput v-model="form.password" secret-label="账号密码" :disabled="credentialsLoading" :placeholder="credentialsLoading ? '正在读取账号密码…' : ''" maxlength="2000" autocomplete="new-password" /></label>
               <label><span>备注</span><textarea v-model="form.remark" maxlength="2000" rows="5" /></label>
             </section>
             <aside class="account-editor-aside">
               <header class="account-editor-aside-heading"><span class="account-editor-aside-icon"><IconShieldCheck :size="16" :stroke-width="1.7" /></span><div><span>SECURITY</span><h3>验证与接码</h3><p>账号安全资料</p></div><code>{{ form.status.toUpperCase() }}</code></header>
-              <label><span>邮箱验证码链接{{ editing && editing.hasEmailCodeUrl ? '（已保存；填写新链接可替换）' : '' }}</span><input v-model="form.emailCodeUrl" type="url" maxlength="4000" placeholder="https://" @input="emailCodeUrlTouched = true"></label>
-              <label><span>2FA 密钥{{ editing && editing.hasTotpSecret ? '（已保存；填写新密钥可替换）' : '' }}</span><input v-model="form.totpSecret" type="password" maxlength="512" autocomplete="off" placeholder="Base32" @input="totpSecretTouched = true"></label>
+              <label><span>邮箱验证码链接</span><AppSecretInput v-model="form.emailCodeUrl" secret-label="邮箱验证码链接" visible-type="url" :disabled="credentialsLoading" :placeholder="credentialsLoading ? '正在读取验证码链接…' : 'https://'" maxlength="4000" /></label>
+              <label><span>2FA 密钥</span><AppSecretInput v-model="form.totpSecret" secret-label="2FA 密钥" :disabled="credentialsLoading" :placeholder="credentialsLoading ? '正在读取 2FA 密钥…' : 'Base32'" maxlength="512" autocomplete="off" /></label>
               <label><span>接码手机号</span><AppSelect v-model="form.smsReceiverId"><option value="">自动分配可用手机号</option><option v-for="receiver in receiverOptions" :key="receiver.id" :value="receiver.id">{{ receiver.phone }} · {{ receiver.bindingCount }}/3</option></AppSelect><small>没有可用号码时仍会创建账号。</small></label>
             </aside>
           </div>
           <p v-if="formError" class="form-error account-editor-message">{{ formError }}</p>
-          <footer class="account-editor-footer"><AppButton @click="closeForm">取消</AppButton><AppButton variant="primary" type="submit" :loading="saving" loading-label="保存中"><IconShieldCheck :size="15" :stroke-width="1.8" />{{ editing ? '保存修改' : '保存账号' }}</AppButton></footer>
+          <footer class="account-editor-footer"><AppButton :disabled="credentialsLoading" @click="closeForm">取消</AppButton><AppButton variant="primary" type="submit" :loading="saving" :disabled="credentialsLoading" :loading-label="credentialsLoading ? '读取凭据中' : '保存中'"><IconShieldCheck :size="15" :stroke-width="1.8" />{{ credentialsLoading ? '读取凭据中' : editing ? '保存修改' : '保存账号' }}</AppButton></footer>
         </form>
 
         <form v-else-if="accountCreateMode === 'upload'" class="admin-form account-editor-form vault-upload-form" @submit.prevent="uploadSelectedPool">

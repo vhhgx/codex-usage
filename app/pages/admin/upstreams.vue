@@ -88,6 +88,8 @@ const apiFetch = $fetch as unknown as (
 const editingAccount = ref<SubAccountManagementView | null>(null);
 const editingGroup = ref<SubGroupView | null>(null);
 const editingProxy = ref<SubProxyView | null>(null);
+const proxyCredentialsLoading = ref(false);
+const originalProxyPassword = ref("");
 const credentialFileName = ref("");
 const showCredentialPaste = ref(false);
 const importRows = ref<ImportAccountRow[]>([]);
@@ -655,8 +657,10 @@ function proxyDateInput(value: number | null) {
 }
 function resetProxy() {
   Object.assign(proxyForm, { name: "", protocol: "http", host: "", port: 8080, username: "", password: "", status: "active", expiresAt: "", fallbackMode: "direct", backupProxyId: null, expiryWarnDays: 7 });
+  originalProxyPassword.value = "";
+  proxyCredentialsLoading.value = false;
 }
-function openProxy(item: SubProxyView | null = null) {
+async function openProxy(item: SubProxyView | null = null) {
   editingProxy.value = item;
   resetProxy();
   if (item) Object.assign(proxyForm, {
@@ -666,11 +670,24 @@ function openProxy(item: SubProxyView | null = null) {
   });
   error.value = "";
   modal.value = "proxy";
+  if (!item) return;
+  proxyCredentialsLoading.value = true;
+  try {
+    const credentials = await apiFetch(`/api/admin/upstreams/sub/proxies/${item.id}/credentials`, { method: "POST" }) as { password: string };
+    if (editingProxy.value?.id !== item.id) return;
+    proxyForm.password = credentials.password;
+    originalProxyPassword.value = credentials.password;
+  } catch (value) {
+    error.value = failure(value, "读取代理密码失败");
+  } finally {
+    if (editingProxy.value?.id === item.id) proxyCredentialsLoading.value = false;
+  }
 }
 async function saveProxy() {
+  if (proxyCredentialsLoading.value) return;
   const item = editingProxy.value;
   const body = { ...proxyForm, expiresAt: proxyForm.expiresAt ? new Date(proxyForm.expiresAt).getTime() : null };
-  if (item && !body.password) delete (body as Partial<typeof body>).password;
+  if (item && body.password === originalProxyPassword.value) delete (body as Partial<typeof body>).password;
   await mutate(
     () => item
       ? apiFetch(`/api/admin/upstreams/sub/proxies/${item.id}`, { method: "PATCH", body })
@@ -1671,10 +1688,10 @@ onMounted(async () => {
         <form class="admin-form" @submit.prevent="saveProxy">
           <div class="form-grid"><label><span>代理名称 *</span><input v-model="proxyForm.name" required placeholder="例如：香港出口 01"></label><label><span>状态</span><AppSelect v-model="proxyForm.status"><option value="active">运行中</option><option value="inactive">已停用</option></AppSelect></label></div>
           <div class="proxy-address-grid"><label><span>协议 *</span><AppSelect v-model="proxyForm.protocol"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option><option value="socks5h">SOCKS5H</option></AppSelect></label><label><span>主机 *</span><input v-model="proxyForm.host" required placeholder="proxy.example.com"></label><label><span>端口 *</span><input v-model.number="proxyForm.port" type="number" min="1" max="65535" required></label></div>
-          <div class="form-grid"><label><span>用户名</span><input v-model="proxyForm.username" autocomplete="off"></label><label><span>密码{{ editingProxy ? '（留空保持不变）' : '' }}</span><input v-model="proxyForm.password" type="password" autocomplete="new-password"></label></div>
+          <div class="form-grid"><label><span>用户名</span><input v-model="proxyForm.username" autocomplete="off"></label><label><span>密码</span><AppSecretInput v-model="proxyForm.password" secret-label="代理密码" :disabled="proxyCredentialsLoading" :placeholder="proxyCredentialsLoading ? '正在读取代理密码…' : ''" autocomplete="new-password" /></label></div>
           <section class="form-section"><header><h3>有效期与故障回退</h3><span>到期代理不会再自动分配给新账号</span></header><div class="form-grid form-grid--four"><label><span>到期时间</span><input v-model="proxyForm.expiresAt" type="datetime-local"></label><label><span>预警天数</span><input v-model.number="proxyForm.expiryWarnDays" type="number" min="0" max="365"></label><label><span>失败后行为</span><AppSelect v-model="proxyForm.fallbackMode"><option value="direct">回退直连</option><option value="backup">切换备用代理</option></AppSelect></label><label><span>备用代理</span><AppSelect v-model="proxyForm.backupProxyId" :disabled="proxyForm.fallbackMode !== 'backup'"><option :value="null">无</option><option v-for="item in proxiesForImport().filter(value => value.id !== editingProxy?.id)" :key="item.id" :value="item.id">{{ item.name }}</option></AppSelect></label></div></section>
           <p v-if="error" class="form-error">{{ error }}</p>
-          <footer><button type="button" class="button button--quiet" @click="modal = null">取消</button><button class="button button--primary" :disabled="saving">{{ saving ? '保存中' : editingProxy ? '保存代理' : '创建代理' }}</button></footer>
+          <footer><button type="button" class="button button--quiet" @click="modal = null">取消</button><button class="button button--primary" :disabled="saving || proxyCredentialsLoading">{{ proxyCredentialsLoading ? '读取凭据中' : saving ? '保存中' : editingProxy ? '保存代理' : '创建代理' }}</button></footer>
         </form>
       </section>
     </div>
