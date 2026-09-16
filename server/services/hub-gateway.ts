@@ -79,7 +79,19 @@ export const UPSTREAM_RESPONSE_LIMITS = {
   streamBytes: 512 * 1024 * 1024,
   streamTimeoutMs: 30 * 60 * 1000
 } as const
-let bufferedBodyBytes = 0
+
+// 使用 Map 跟踪每个请求的内存使用，而不是全局变量
+const memoryReservations = new Map<string, number>()
+let totalBufferedBodyBytes = 0
+
+// 定期清理过期的内存记录（防止泄漏）
+setInterval(() => {
+  if (memoryReservations.size > 10000) {
+    console.warn('[memory] Too many reservations tracked, clearing old entries')
+    memoryReservations.clear()
+    totalBufferedBodyBytes = 0
+  }
+}, 60000) // 每分钟检查一次
 
 async function bestEffort(task: Promise<unknown>) {
   try {
@@ -662,15 +674,17 @@ interface BodyMemoryReservation { bytes: number; released: boolean }
 
 export function reserveBodyMemory(event: H3Event, bytes: number, onCapacityExhausted: () => never = () => openAiError(503, 'Gateway request body capacity is temporarily exhausted', 'server_error', 'request_body_capacity')) {
   const reservation: BodyMemoryReservation = { bytes: 0, released: false }
+  const reservationId = `mem_${Date.now()}_${Math.random().toString(36).slice(2)}`
   const grow = (target: number) => {
     if (reservation.released) throw timeoutError('Client connection closed while reading request body')
     const delta = Math.max(0, target - reservation.bytes)
-    if (bufferedBodyBytes + delta > MAX_BUFFERED_BODY_BYTES) {
+    if (totalBufferedBodyBytes + delta > MAX_BUFFERED_BODY_BYTES) {
       setResponseHeader(event, 'retry-after', 1)
       onCapacityExhausted()
     }
-    bufferedBodyBytes += delta
+    totalBufferedBodyBytes += delta
     reservation.bytes += delta
+    memoryReservations.set(reservationId, reservation.bytes)
   }
   const release = () => {
     if (reservation.released) return
@@ -678,7 +692,8 @@ export function reserveBodyMemory(event: H3Event, bytes: number, onCapacityExhau
     event.node.req.off('aborted', release)
     event.node.res.off('close', release)
     event.node.res.off('finish', release)
-    bufferedBodyBytes = Math.max(0, bufferedBodyBytes - reservation.bytes)
+    totalBufferedBodyBytes = Math.max(0, totalBufferedBodyBytes - reservation.bytes)
+    memoryReservations.delete(reservationId)
   }
   event.node.req.once('aborted', release)
   event.node.res.once('close', release)
@@ -1352,12 +1367,17 @@ export async function handleHubRequest(event: H3Event, path: string) {
         const upstreamEndpoint = candidate.conversionMode === 'responses_to_chat' ? '/v1/chat/completions' : endpoint
         if (parsed.json) {
           let requestJson: Record<string, unknown> = parsed.json
-          if (endpoint === '/v1/responses' && !candidate.laneSubstitution && candidate.modelMappingKind !== 'substitution') {
+          if (endpoint === '/v1/responses') {
             const preference = await userRadarPreference(event, userId)
             if (preference.enabled) {
               try {
-                const effort = selectRadarEffort(await cachedCodexRadar(event), parsed.model, preference.maxEffort)
-                if (effort) requestJson = { ...requestJson, reasoning: { ...(usageRecord(requestJson.reasoning) || {}), effort } }
+                // Use the actual upstream model (may be substituted)
+                const modelForRadar = candidate.upstreamModel || parsed.model
+                const effort = selectRadarEffort(await cachedCodexRadar(event), modelForRadar, preference.maxEffort)
+                if (effort) {
+                  const currentReasoning = usageRecord(requestJson.reasoning) || {}
+                  requestJson = { ...requestJson, reasoning: { ...currentReasoning, effort } }
+                }
               } catch { /* Preserve the client effort when CodexRadar is unavailable. */ }
             }
           }

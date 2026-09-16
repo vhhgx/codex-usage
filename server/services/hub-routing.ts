@@ -11,6 +11,7 @@ import { useRedis } from '../utils/redis'
 import { getHubSettings } from './hub-settings'
 import { applyGroupChannelPolicy } from './group-policy'
 import { visibleChannels } from './channel-access'
+import { protocolMatchScore } from '#shared/utils/protocol-priority'
 
 export interface RouteCandidate {
   channel: typeof channels.$inferSelect
@@ -30,6 +31,7 @@ export interface RouteCandidate {
   modelMappingKind: string
   laneSubstitution: boolean
   preferResponsesToChat: boolean
+  protocolScore?: number
 }
 
 export interface SupplyDecision {
@@ -327,18 +329,26 @@ export async function routeCandidates(
       laneSubstitution: options.substitution === true,
       preferResponsesToChat: options.preferResponsesToChat === true,
       conversionMode: requestedProtocol === row.protocolBinding.protocol ? 'passthrough' : requestedProtocol === 'anthropic_messages' ? 'anthropic_to_openai' : requestedProtocol === 'openai_responses' ? 'responses_to_chat' : 'openai_to_anthropic',
-      affinityReused: false
+      affinityReused: false,
+      protocolScore: protocolMatchScore(requestedProtocol, row.protocolBinding.protocol, publicModel)
     })
   }
   if (supplySource === 'user_relay') {
     const rowByChannel = new Map(rows.map(row => [row.channel.id, row]))
     available.sort((left, right) => {
+      // 1. 协议匹配分数优先（高分优先）
+      const protocolDiff = (right.protocolScore || 0) - (left.protocolScore || 0)
+      if (protocolDiff !== 0) return protocolDiff
+
+      // 2. 价格排序（如果启用）
       if (options.orderMode === 'price_asc') {
         if (left.normalizedPrice === null && right.normalizedPrice !== null) return 1
         if (right.normalizedPrice === null && left.normalizedPrice !== null) return -1
         const price = (left.normalizedPrice || 0) - (right.normalizedPrice || 0)
         if (price) return price
       }
+
+      // 3. 账户排序模式
       const leftRow = rowByChannel.get(left.channel.id)
       const rightRow = rowByChannel.get(right.channel.id)
       const mode = leftRow?.relayGroup?.accountOrderMode || rightRow?.relayGroup?.accountOrderMode || 'manual'
@@ -352,15 +362,24 @@ export async function routeCandidates(
           if (balance) return balance
         }
       }
+
+      // 4. 账户排名和其他
       return left.channel.accountRank - right.channel.accountRank || compareRouteCandidates(left, right, supplySource)
     })
   } else available.sort((left, right) => {
+    // 1. 协议匹配分数优先（高分优先）
+    const protocolDiff = (right.protocolScore || 0) - (left.protocolScore || 0)
+    if (protocolDiff !== 0) return protocolDiff
+
+    // 2. 价格排序（如果启用）
     if (options.orderMode === 'price_asc') {
       if (left.normalizedPrice === null && right.normalizedPrice !== null) return 1
       if (right.normalizedPrice === null && left.normalizedPrice !== null) return -1
       const price = (left.normalizedPrice || 0) - (right.normalizedPrice || 0)
       if (price) return price
     }
+
+    // 3. 其他排序规则
     return compareRouteCandidates(left, right, supplySource)
   })
   const [pool] = await db.select().from(modelPools).where(eq(modelPools.publicModel, publicModel)).limit(1)

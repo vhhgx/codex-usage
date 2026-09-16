@@ -11,7 +11,9 @@ export default defineEventHandler(async (event) => {
   }
   const origin = getHeader(event, 'origin')
   const host = getHeader(event, 'host')
-  if (!origin || !host) return
+  if (!origin || !host) {
+    throw createError({ statusCode: 403, message: '缺少必要的请求头' })
+  }
   try {
     if (new URL(origin).host !== host) throw new Error('origin mismatch')
   } catch {

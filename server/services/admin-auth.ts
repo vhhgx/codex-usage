@@ -107,8 +107,8 @@ export async function getSession(event: H3Event): Promise<StoredSession | null> 
       authenticatedAt: parsed.authenticatedAt || now,
       reauthenticatedAt: parsed.reauthenticatedAt || parsed.authenticatedAt || now
     }
-    if (!await redis.get(currentKey)) await redis.set(currentKey, JSON.stringify(session), 'EX', SESSION_TTL_SECONDS)
-    else await redis.expire(currentKey, SESSION_TTL_SECONDS)
+    // Use SET with EX to atomically update session and TTL
+    await redis.set(currentKey, JSON.stringify(session), 'EX', SESSION_TTL_SECONDS)
     return session
   } catch {
     return null

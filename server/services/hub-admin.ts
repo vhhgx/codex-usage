@@ -533,10 +533,23 @@ export async function createChannelRecord(event: H3Event, body: UnknownRecord, a
   const type = channelType(body.type)
   if (!name || !baseUrl || !apiKey || !type) throw createError({ statusCode: 400, message: '渠道名称、类型、地址和 API Key 均为必填项' })
   try { new URL(baseUrl) } catch { throw createError({ statusCode: 400, message: '渠道地址格式不正确' }) }
+
+  // 协议和模型现在都是可选的，保存后会自动探测
   const protocols = parseChannelProtocols(body.protocols, type)
-  if (!protocols.length) throw createError({ statusCode: 400, message: '请至少选择一种上游协议' })
   const models = parseChannelModels(body.models)
-  if (!models.length) throw createError({ statusCode: 400, message: '请先获取模型或至少手工添加一个模型' })
+
+  // 如果用户没有提供协议，创建占位符（保存后会被自动探测替换）
+  const defaultProtocols = protocols.length ? protocols : [
+    { protocol: 'openai_responses' as const, enabled: true, baseUrlOverride: null, authScheme: 'bearer' as const, apiVersion: null, probeModel: null, capabilityMode: 'native' as const },
+    { protocol: 'openai_chat' as const, enabled: true, baseUrlOverride: null, authScheme: 'bearer' as const, apiVersion: null, probeModel: null, capabilityMode: 'native' as const },
+    { protocol: 'anthropic_messages' as const, enabled: true, baseUrlOverride: null, authScheme: 'x_api_key' as const, apiVersion: '2023-06-01', probeModel: null, capabilityMode: 'native' as const }
+  ]
+
+  // 如果用户没有提供模型，创建占位符（保存后会自动发现）
+  const defaultModels = models.length ? models : [
+    { publicModel: 'gpt-4o', upstreamModel: 'gpt-4o', enabled: true, endpoints: [] }
+  ]
+
   const db = useDatabase(event)
   const defaultTimeoutMs = (await getHubSettings(event)).defaultTimeoutMs
   const accessScope = body.accessScope === 'restricted' ? 'restricted' : 'all'
@@ -557,9 +570,18 @@ export async function createChannelRecord(event: H3Event, body: UnknownRecord, a
     priceMultiplier: String(nonnegativeNumber(body.priceMultiplier, 1))
   }).returning()
   if (!row) throw createError({ statusCode: 500, message: '创建渠道失败' })
-  const protocolRows = await replaceChannelProtocols(event, row.id, protocols)
-  await replaceChannelModels(event, row.id, models, protocolRows)
+  const protocolRows = await replaceChannelProtocols(event, row.id, defaultProtocols)
+  await replaceChannelModels(event, row.id, defaultModels, protocolRows)
   await replaceChannelGrants(event, row.id, accessScope === 'restricted' ? stringArray(body.grantedUserIds, 1000) : [], accessScope === 'restricted' ? stringArray(body.grantedGroupIds, 1000) : [], actorId)
+
+  // 保存后立即启动协议探测任务（异步，不等待结果）
+  if (!protocols.length) {
+    const { createProbeTask } = await import('./channel-probe-task')
+    createProbeTask(event, row.id).catch(err => {
+      console.error(`[创建渠道 ${row.id}] 启动协议探测失败:`, err)
+    })
+  }
+
   return (await listChannels(event)).find(item => item.id === row.id)!
 }
 
@@ -628,6 +650,21 @@ export async function updateChannelRecord(event: H3Event, id: string, body: Unkn
   }
   await invalidateChannelAccess(event, [id])
   return (await listChannels(event)).find(item => item.id === id)!
+}
+
+export async function getPlatformChannelCredentials(event: H3Event, id: string) {
+  const [channel] = await useDatabase(event).select({
+    id: channels.id,
+    ownerKind: channels.ownerKind,
+    encryptedApiKey: channels.encryptedApiKey
+  }).from(channels).where(eq(channels.id, id)).limit(1)
+  if (!channel) throw createError({ statusCode: 404, message: '渠道不存在' })
+  if (channel.ownerKind !== 'platform') throw createError({ statusCode: 403, message: '只能读取平台渠道凭据' })
+  try {
+    return { apiKey: decryptChannelSecret(channel.encryptedApiKey, channel.id, channel.ownerKind, event) }
+  } catch {
+    throw createError({ statusCode: 500, message: '渠道 API Key 无法解密，请检查加密密钥配置' })
+  }
 }
 
 function keyView(row: typeof hubKeys.$inferSelect, models: string[], channelIds: string[], ownerUserName: string | null = null, groupName: string | null = null): HubKeyView {
