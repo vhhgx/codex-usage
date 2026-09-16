@@ -1,12 +1,11 @@
-import { auditedMutation, requireAdminWrite, writeAudit } from '../../../services/admin-auth'
+import { requireAdmin } from '../../../services/admin-auth'
 import { deleteProbeModel } from '../../../services/probe-model-catalog'
 
 export default defineEventHandler(async (event) => {
-  const admin = await requireAdminWrite(event)
-  const id = getRouterParam(event, 'id') || ''
-  return auditedMutation(event, async () => {
-    await deleteProbeModel(event, id)
-    await writeAudit(event, admin.userId, 'probe_model.delete', 'probe_model', id)
-    return { success: true }
-  })
+  await requireAdmin(event)
+  const id = getRouterParam(event, 'id')
+  if (!id) throw createError({ statusCode: 400, message: '缺少模型ID' })
+
+  await deleteProbeModel(event, id)
+  return { success: true }
 })
