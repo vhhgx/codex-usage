@@ -14,7 +14,7 @@ import {
   IconTrash,
   IconX
 } from '@tabler/icons-vue'
-import type { HubKeyDetailView, HubKeyUsagePeriod, HubKeyView, KeyActivityResponse } from '#shared/types/hub'
+import type { ChannelView, HubKeyDetailView, HubKeyUsagePeriod, HubKeyView, KeyActivityResponse } from '#shared/types/hub'
 import type { HubGroupView, HubUserView } from '#shared/types/access-control'
 import { activityLogQuery } from '#shared/utils/admin-log-query'
 import { scheduleActivityRefresh } from '#shared/utils/activity-refresh'
@@ -26,6 +26,7 @@ useSeoMeta({ title: 'Hub Keys | Zephyr Hub' })
 const { data, refresh } = await useFetch<{ keys: HubKeyView[] }>('/api/admin/keys')
 const { data: userData } = await useFetch<{ users: HubUserView[] }>('/api/admin/users')
 const { data: groupData } = await useFetch<{ groups: HubGroupView[] }>('/api/admin/groups')
+const { data: channelData } = await useFetch<{ channels: ChannelView[] }>('/api/admin/channels')
 const { data: activity, refresh: refreshActivity } = await useFetch<KeyActivityResponse>('/api/admin/key-activity')
 const { show: showToast } = useAppToast()
 const search = ref('')
@@ -55,7 +56,7 @@ const endpointOptions = ['/v1/models', '/v1/chat/completions', '/v1/responses', 
 
 type KeyForm = Record<string, string | string[]>
 const emptyForm = (): KeyForm => ({
-  name: '', note: '', expiresAt: '', expiresInDays: '', allowedModels: '', allowedEndpoints: [], rpmLimit: '60', concurrencyLimit: '5', priceMultiplier: '1',
+  name: '', note: '', expiresAt: '', expiresInDays: '', allowedModels: '', allowedEndpoints: [], channelIds: [], rpmLimit: '60', concurrencyLimit: '5', priceMultiplier: '1',
   ownerUserId: '', groupId: '',
   totalRequestLimit: '', totalTokenLimit: '', totalCostLimit: '', dailyRequestLimit: '', dailyTokenLimit: '', dailyCostLimit: '',
   weeklyRequestLimit: '', weeklyTokenLimit: '', weeklyCostLimit: '', monthlyRequestLimit: '', monthlyTokenLimit: '', monthlyCostLimit: '',
@@ -67,6 +68,10 @@ const ownerGroups = computed(() => {
   const owner = userData.value?.users.find(user => user.id === form.ownerUserId)
   return (groupData.value?.groups || []).filter(group => owner?.groupIds.includes(group.id))
 })
+// 资源范围：平台渠道始终可选；用户私有中转只在其所有者被选中时才出现，避免把别人的私有资源授权出去。
+const channelOptions = computed(() => (channelData.value?.channels || [])
+  .filter(channel => channel.ownerKind === 'platform' || channel.ownerUserId === form.ownerUserId)
+  .sort((left, right) => left.name.localeCompare(right.name)))
 const filteredActivity = computed(() => (activity.value?.keys || []).filter(item => activityFilter.value === 'all' || activityFilter.value === 'active' && item.requests > 0 || activityFilter.value === 'recent' && item.recentlyActive || activityFilter.value === 'inactive' && item.requests === 0))
 const currentActivityBucket = computed(() => {
   if (!activity.value || activity.value.generatedAt < activity.value.from || activity.value.generatedAt >= activity.value.to) return -1
@@ -230,7 +235,7 @@ function periodLimit(item: HubKeyView, period: HubKeyUsagePeriod, metric: 'Reque
           <td><div class="table-primary"><span class="key-glyph"><IconKey :size="16" /></span><div><strong>{{ item.name }}</strong><code>{{ item.maskedKey }}</code><small v-if="item.note">{{ item.note }}</small></div></div></td>
           <td><strong>{{ item.ownerUserName || '未归属' }}</strong><small class="table-sub">{{ item.groupName || '未分组' }}</small></td>
           <td><span class="status-dot" :data-status="item.status"><i />{{ item.status === 'active' ? '运行中' : item.status === 'expired' ? '已到期' : '已停用' }}</span></td>
-          <td><strong>{{ item.allowedModels.length || '全部' }}</strong><small class="table-sub">个模型 · {{ item.allowedEndpoints.length || '全部' }} 个端点</small></td>
+          <td><strong>{{ item.allowedModels.length || '全部' }}</strong><small class="table-sub">个模型 · {{ item.channelIds.length || '全部' }} 渠道 · {{ item.allowedEndpoints.length || '全部' }} 端点</small></td>
           <td><code>{{ item.rpmLimit || '∞' }} RPM</code><small class="table-sub">{{ item.concurrencyLimit || '∞' }} 并发</small></td>
           <td><span class="table-date"><IconCalendarTime :size="15" />{{ timestamp(item.expiresAt) }}</span></td>
           <td>{{ timestamp(item.lastUsedAt) }}</td>
@@ -247,8 +252,11 @@ function periodLimit(item: HubKeyView, period: HubKeyUsagePeriod, metric: 'Reque
           <div class="form-grid"><label><span>名称 *</span><input v-model="form.name" required placeholder="例如：研发团队"></label><label><span>备注</span><input v-model="form.note" placeholder="用途或负责人"></label></div>
           <div class="form-grid"><label><span>所属用户 *</span><AppSelect v-model="form.ownerUserId" required><option value="" disabled>选择用户</option><option v-for="user in userData?.users || []" :key="user.id" :value="user.id">{{ user.displayName || user.username }}</option></AppSelect></label><label><span>所属分组 *</span><AppSelect v-model="form.groupId" required><option value="" disabled>选择该用户所属分组</option><option v-for="group in ownerGroups" :key="group.id" :value="group.id">{{ group.name }}</option></AppSelect></label></div>
           <div class="form-grid form-grid--expiry"><label><span>到期时间</span><input v-model="form.expiresAt" type="datetime-local" @input="form.expiresInDays = ''"></label><div class="expiry-presets"><span>{{ editing ? '从现在起' : '创建后到期' }}</span><div><button v-for="days in [1, 7, 30]" :key="days" type="button" :class="{ active: form.expiresInDays === String(days) }" @click="setExpiry(days)">{{ days }} 天</button><button type="button" @click="form.expiresAt = ''; form.expiresInDays = ''">永久</button></div></div></div>
+          <section class="form-section"><header><h3>资源范围</h3><span>每一项留空/不勾选都表示不限制</span></header>
+          <fieldset class="endpoint-picker channel-picker"><legend>允许渠道（不选择表示全部）</legend><label v-for="channel in channelOptions" :key="channel.id"><input v-model="form.channelIds" type="checkbox" :value="channel.id"><span>{{ channel.name }}<small class="table-sub">{{ channel.ownerKind === 'platform' ? '平台' : channel.ownerUserName || '用户私有' }} · {{ channel.type.toUpperCase() }}</small></span></label><p v-if="!channelOptions.length" class="form-hint">暂无可选渠道</p></fieldset>
           <div class="form-grid"><label><span>允许模型（逗号分隔，留空为全部）</span><input v-model="form.allowedModels" placeholder="gpt-5.4, gpt-image-1.5"></label><label><span>价格倍率</span><input v-model="form.priceMultiplier" type="number" min="0" step="0.01"></label></div>
           <fieldset class="endpoint-picker"><legend>允许端点（不选择表示全部）</legend><label v-for="endpoint in endpointOptions" :key="endpoint"><input v-model="form.allowedEndpoints" type="checkbox" :value="endpoint"><span>{{ endpoint.replace('/v1/', '') }}</span></label></fieldset>
+          </section>
           <section class="form-section"><header><h3>速率限制</h3><span>留空表示无限制</span></header><div class="form-grid"><label><span>每分钟请求数</span><input v-model="form.rpmLimit" type="number" min="1"></label><label><span>最大并发</span><input v-model="form.concurrencyLimit" type="number" min="1"></label></div></section>
           <section class="form-section"><header><h3>周期额度</h3><span>请求 / Token / USD</span></header><div class="quota-form-grid">
             <template v-for="period in [{id:'total',label:'总额度'},{id:'daily',label:'每日'},{id:'weekly',label:'每周'},{id:'monthly',label:'每月'}]" :key="period.id"><strong>{{ period.label }}</strong><input v-model="form[`${period.id}RequestLimit`]" type="number" min="1" placeholder="请求数"><input v-model="form[`${period.id}TokenLimit`]" type="number" min="1" placeholder="Token"><input v-model="form[`${period.id}CostLimit`]" type="number" min="0" step="0.01" placeholder="USD"></template>

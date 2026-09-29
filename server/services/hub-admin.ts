@@ -770,6 +770,12 @@ function keyValues(body: UnknownRecord, createdAt = new Date()) {
   }
 }
 
+async function assertChannelsExist(event: H3Event, channelIds: string[]) {
+  if (!channelIds.length) return
+  const rows = await useDatabase(event).select({ id: channels.id }).from(channels).where(inArray(channels.id, channelIds))
+  if (rows.length !== channelIds.length) throw createError({ statusCode: 400, message: '允许渠道包含不存在的渠道' })
+}
+
 async function resolveKeyOwnership(event: H3Event, ownerUserIdRaw: unknown, groupIdRaw: unknown, actorId?: string) {
   const db = useDatabase(event)
   const ownerUserId = text(ownerUserIdRaw, 100) || actorId || ''
@@ -808,6 +814,7 @@ export async function createHubKeyRecord(event: H3Event, body: UnknownRecord, ac
   const encrypted = encryptHubKeySecret(plainKey, keyId, credentialId, event)
   const models = stringArray(body.allowedModels, 200)
   const channelIds = stringArray(body.channelIds, 500)
+  await assertChannelsExist(event, channelIds)
   const row = await db.transaction(async (tx) => {
     const [created] = await tx.insert(hubKeys).values({
       id: keyId,
@@ -944,6 +951,8 @@ export async function updateHubKeyRecord(event: H3Event, id: string, body: Unkno
   const ownership = 'ownerUserId' in body || 'groupId' in body
     ? await resolveKeyOwnership(event, body.ownerUserId ?? existing.ownerUserId, body.groupId ?? existing.groupId)
     : { ownerUserId: existing.ownerUserId, groupId: existing.groupId }
+  const nextChannelIds = 'channelIds' in body ? stringArray(body.channelIds, 500) : null
+  if (nextChannelIds) await assertChannelsExist(event, nextChannelIds)
   await db.transaction(async (tx) => {
     await tx.update(hubKeys).set({ ...values, ...ownership, status, updatedAt: new Date() }).where(eq(hubKeys.id, id))
     if ('allowedModels' in body) {
@@ -951,10 +960,9 @@ export async function updateHubKeyRecord(event: H3Event, id: string, body: Unkno
       await tx.delete(keyModelRules).where(eq(keyModelRules.keyId, id))
       if (models.length) await tx.insert(keyModelRules).values(models.map(publicModel => ({ keyId: id, publicModel })))
     }
-    if ('channelIds' in body) {
-      const channelIds = stringArray(body.channelIds, 500)
+    if (nextChannelIds) {
       await tx.delete(keyChannelRules).where(eq(keyChannelRules.keyId, id))
-      if (channelIds.length) await tx.insert(keyChannelRules).values(channelIds.map(channelId => ({ keyId: id, channelId })))
+      if (nextChannelIds.length) await tx.insert(keyChannelRules).values(nextChannelIds.map(channelId => ({ keyId: id, channelId })))
     }
   })
   return (await listHubKeys(event)).find(item => item.id === id)!
