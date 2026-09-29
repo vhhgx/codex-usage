@@ -36,14 +36,16 @@ function platformExpiry(value: unknown) {
 function nullableInteger(value: unknown, min = 0) {
   if (value === null || value === undefined || value === '') return null
   const parsed = Number(value)
-  if (!Number.isSafeInteger(parsed) || parsed < min) throw createError({ statusCode: 400, message: '限制值格式不正确' })
+  // 与 Hub Key 限额保持同一口径：非法值报错，而不是静默变成「无限制」。
+  if (!Number.isSafeInteger(parsed) || parsed < min) throw createError({ statusCode: 400, message: `限制值必须是大于等于 ${min} 的整数，留空表示不限制` })
   return parsed
 }
 
-function nullableMoney(value: unknown) {
+function nullableMoney(value: unknown, label = '金额限制') {
   if (value === null || value === undefined || value === '') return null
   const parsed = Number(value)
-  if (!Number.isFinite(parsed) || parsed < 0) throw createError({ statusCode: 400, message: '金额限制格式不正确' })
+  if (!Number.isFinite(parsed) || parsed < 0) throw createError({ statusCode: 400, message: `${label}必须是非负金额，留空表示不限制` })
+  if (parsed > 1_000_000_000_000) throw createError({ statusCode: 400, message: `${label}超出可用范围` })
   return String(parsed)
 }
 

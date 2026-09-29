@@ -27,10 +27,14 @@ function integer(value: unknown, min: number, max: number, fallback: number) {
   return Number.isInteger(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback
 }
 
-function nullableInteger(value: unknown, min = 0) {
+function nullableInteger(value: unknown, min = 0, label = '限制值') {
   if (value === null || value === undefined || value === '') return null
   const parsed = Number(value)
-  return Number.isSafeInteger(parsed) && parsed >= min ? parsed : null
+  // 非法值必须显式报错：静默转成 null 等于「无限制」，会把输入错误变成放开额度。
+  if (!Number.isSafeInteger(parsed) || parsed < min) {
+    throw createError({ statusCode: 400, message: `${label}必须是大于等于 ${min} 的整数，留空表示不限制` })
+  }
+  return parsed
 }
 
 export function channelUpdateInvalidatesHealth(body: Record<string, unknown>) {
@@ -40,10 +44,14 @@ export function channelUpdateInvalidatesHealth(body: Record<string, unknown>) {
     || Boolean(text(body.apiKey, 2000))
 }
 
-function nullableMoney(value: unknown) {
+function nullableMoney(value: unknown, label = '金额限制') {
   if (value === null || value === undefined || value === '') return null
   const parsed = Number(value)
-  return Number.isFinite(parsed) && parsed >= 0 ? String(parsed) : null
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw createError({ statusCode: 400, message: `${label}必须是非负金额，留空表示不限制` })
+  }
+  if (parsed > 1_000_000_000_000) throw createError({ statusCode: 400, message: `${label}超出可用范围` })
+  return String(parsed)
 }
 
 function nonnegativeNumber(value: unknown, fallback: number) {
@@ -782,12 +790,22 @@ export async function createHubKeyRecord(event: H3Event, body: UnknownRecord, ac
   const values = keyValues(body)
   if (!values.name) throw createError({ statusCode: 400, message: '请输入 Key 名称' })
   if (values.expiresAt && values.expiresAt <= new Date()) throw createError({ statusCode: 400, message: '到期时间必须晚于当前时间' })
-  const plainKey = createHubKey()
+  const db = useDatabase(event)
+  // 支持「自定义 Key」（用于迁移已有 Key）。此前该字段被静默忽略，用户以为设置成功。
+  const providedKey = text(body.key, 512)
+  const plainKey = providedKey ? validateHubKeySecret(providedKey) : createHubKey()
+  if (providedKey) {
+    const keyHash = hashHubKey(plainKey, event)
+    const [[duplicateKey], [duplicateCredential]] = await Promise.all([
+      db.select({ id: hubKeys.id }).from(hubKeys).where(eq(hubKeys.keyHash, keyHash)).limit(1),
+      db.select({ id: hubKeyCredentials.id }).from(hubKeyCredentials).where(eq(hubKeyCredentials.keyHash, keyHash)).limit(1)
+    ])
+    if (duplicateKey || duplicateCredential) throw createError({ statusCode: 409, message: '这个 Key 值已被使用，请换一个' })
+  }
   const ownership = await resolveKeyOwnership(event, body.ownerUserId, body.groupId, actorId)
   const keyId = randomUUID()
   const credentialId = randomUUID()
   const encrypted = encryptHubKeySecret(plainKey, keyId, credentialId, event)
-  const db = useDatabase(event)
   const models = stringArray(body.allowedModels, 200)
   const channelIds = stringArray(body.channelIds, 500)
   const row = await db.transaction(async (tx) => {
