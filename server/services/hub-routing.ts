@@ -86,7 +86,11 @@ export function channelHealthAllowsRouting(channel: Pick<typeof channels.$inferS
   return channel.healthStatus === 'healthy'
 }
 
-function channelCanRoute(channel: typeof channels.$inferSelect) {
+/**
+ * 单一「渠道是否可路由」判定：路由层与所有对外模型列表都必须用它，
+ * 否则会出现「列表里有、请求 503」或「能请求、列表里没有」。
+ */
+export function channelCanRoute(channel: Pick<typeof channels.$inferSelect, 'ownerKind' | 'healthStatus' | 'clientIdentityMode'>) {
   // A user's newly added relay has no health result yet. Let the first real
   // request validate it; failed relays remain blocked by the unhealthy state
   // and circuit breaker.
@@ -295,8 +299,22 @@ export async function routeCandidates(
 ) {
   const db = useDatabase(event)
   const requestedProtocol = options.protocol || endpointProtocol(endpoint)
-  const modelMatch = options.substitution && options.requestedModel
-    ? or(eq(channelModels.publicModel, publicModel), and(eq(channelModels.publicModel, options.requestedModel), eq(channelModels.mappingKind, 'substitution'), eq(channelModels.canonicalModel, canonicalModelId(publicModel))))
+  // 替代车道：既接受「替代名本身就是一个 public model」，也接受「某渠道把
+  // publicModel=请求模型 映射为 upstreamModel=替代名」。此前只按
+  // canonicalModel 等值匹配，带版本号的上游名（claude-3-5-sonnet-20241022）
+  // 会永不命中。
+  const substitutionMatch = options.substitution && options.requestedModel
+    ? and(
+        eq(channelModels.publicModel, options.requestedModel),
+        eq(channelModels.mappingKind, 'substitution'),
+        or(
+          eq(channelModels.upstreamModel, publicModel),
+          eq(channelModels.canonicalModel, canonicalModelId(publicModel))
+        )
+      )
+    : undefined
+  const modelMatch = substitutionMatch
+    ? or(eq(channelModels.publicModel, publicModel), substitutionMatch)
     : eq(channelModels.publicModel, publicModel)
   const rows = await db.select({ channel: channels, model: channelModels, modelPrice: channelModelPrices, modelBinding: channelModelBindings, protocolBinding: channelProtocolBindings, relayGroup: userRelayGroups, accountState: userRelayAccountStates })
     .from(channelModelBindings)

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { compareUserRelayOrder, type UserRelayOrderKey } from '../server/services/hub-routing'
+import { channelCanRoute, compareUserRelayOrder, type UserRelayOrderKey } from '../server/services/hub-routing'
 
 function key(overrides: Partial<UserRelayOrderKey> = {}): UserRelayOrderKey {
   return {
@@ -52,5 +52,29 @@ describe('compareUserRelayOrder', () => {
     const first = key({ name: 'first', accountRank: 10, balance: null })
     const second = key({ name: 'second', accountRank: 20, balance: 999 })
     expect(compareUserRelayOrder(first, second, 'balance_desc')).toBeLessThan(0)
+  })
+})
+
+describe('channelCanRoute', () => {
+  const channel = (ownerKind: 'platform' | 'user', healthStatus: string, clientIdentityMode = 'standard') =>
+    ({ ownerKind, healthStatus, clientIdentityMode }) as never
+
+  it('健康渠道可路由', () => {
+    expect(channelCanRoute(channel('platform', 'healthy'))).toBe(true)
+    expect(channelCanRoute(channel('user', 'healthy'))).toBe(true)
+  })
+
+  it('已知不健康的渠道不可路由', () => {
+    expect(channelCanRoute(channel('platform', 'unhealthy'))).toBe(false)
+    expect(channelCanRoute(channel('user', 'unhealthy'))).toBe(false)
+  })
+
+  it('用户中转未探测（unknown）时允许首次尝试', () => {
+    expect(channelCanRoute(channel('user', 'unknown'))).toBe(true)
+  })
+
+  it('平台渠道只有 passthrough 身份模式才允许 unknown 首次尝试', () => {
+    expect(channelCanRoute(channel('platform', 'unknown', 'passthrough'))).toBe(true)
+    expect(channelCanRoute(channel('platform', 'unknown', 'standard'))).toBe(false)
   })
 })

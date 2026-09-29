@@ -1,8 +1,9 @@
-import { and, asc, count, desc, eq, gte, inArray, lte, or, sql } from 'drizzle-orm'
+import { and, asc, count, desc, eq, gte, inArray, lte, ne, or, sql } from 'drizzle-orm'
 import type { H3Event } from 'h3'
 import { useDatabase } from '../db'
-import { channelModels, channels, groupChannelRules, groupMemberships, groupModelRules, groups, hubKeys, modelPrices, requestLogs, usageRollups, userPoolAccounts, userPoolGroups, userRelayGroups } from '../db/schema'
+import { channelModelBindings, channelModels, channelProtocolBindings, channels, groupChannelRules, groupMemberships, groupModelRules, groups, hubKeys, modelPrices, requestLogs, usageRollups, userPoolAccounts, userPoolGroups, userRelayGroups } from '../db/schema'
 import { hubKeyUsageDetail, requestLogDetail, requestResourceFallback } from './hub-analytics'
+import { channelCanRoute } from './hub-routing'
 import { createHubKeyRecord, listHubKeys, revealHubKeySecret, updateHubKeyRecord } from './hub-admin'
 import { getHubSettings } from './hub-settings'
 import { startOfZoned } from '../utils/time-zone'
@@ -185,11 +186,22 @@ export async function getUserModels(event: H3Event, userId: string) {
       channelType: channels.type,
       ownerKind: channels.ownerKind,
       ownerUserId: channels.ownerUserId,
+      healthStatus: channels.healthStatus,
+      clientIdentityMode: channels.clientIdentityMode,
       relayGroupEnabled: userRelayGroups.enabled
-    }).from(channelModels)
+    }).from(channelModelBindings)
+      .innerJoin(channelModels, eq(channelModelBindings.channelModelId, channelModels.id))
+      .innerJoin(channelProtocolBindings, eq(channelModelBindings.protocolBindingId, channelProtocolBindings.id))
       .innerJoin(channels, eq(channelModels.channelId, channels.id))
       .leftJoin(userRelayGroups, eq(channels.userRelayGroupId, userRelayGroups.id))
-      .where(and(eq(channelModels.enabled, true), eq(channels.enabled, true), eq(channels.healthStatus, 'healthy'), or(eq(channels.ownerKind, 'platform'), eq(userRelayGroups.enabled, true)))),
+      .where(and(
+        eq(channelModels.enabled, true),
+        eq(channelModelBindings.enabled, true),
+        eq(channelProtocolBindings.enabled, true),
+        eq(channels.enabled, true),
+        ne(channelProtocolBindings.verificationStatus, 'failed'),
+        or(eq(channels.ownerKind, 'platform'), eq(userRelayGroups.enabled, true))
+      )),
     db.select().from(modelPrices).where(lte(modelPrices.effectiveAt, new Date())).orderBy(desc(modelPrices.effectiveAt)),
     db.select({ poolId: userPoolGroups.id, poolName: userPoolGroups.displayName })
       .from(userPoolGroups)
@@ -212,6 +224,7 @@ export async function getUserModels(event: H3Event, userId: string) {
     const groupChannels = channelRules.filter(rule => rule.groupId === groupId)
     const allowedChannels = new Set(groupChannels.filter(rule => rule.enabled).map(rule => rule.channelId))
     for (const row of modelRows) {
+      if (!channelCanRoute(row)) continue
       if (allowedModels.size && !allowedModels.has(row.publicModel)) continue
       if (groupChannels.length && !allowedChannels.has(row.channelId)) continue
       const channelVisible = visibleSet.has(row.channelId)

@@ -50,7 +50,7 @@ import {
   type ChannelConcurrencyLease,
   type HubConcurrencyLease
 } from './hub-limits'
-import { advanceRouteFailoverState, orderedRouteSourceNodes, packagePolicyAllowsRouteSource, recordChannelFailure, recordChannelSuccess, rememberAffinitySelection, routeCandidates, selectSupplySource, userRelayAccountAllowsRouting, type RouteFailoverState, type SupplyDecision } from './hub-routing'
+import { advanceRouteFailoverState, channelCanRoute, orderedRouteSourceNodes, packagePolicyAllowsRouteSource, recordChannelFailure, recordChannelSuccess, rememberAffinitySelection, routeCandidates, selectSupplySource, userRelayAccountAllowsRouting, type RouteFailoverState, type SupplyDecision } from './hub-routing'
 import { getHubSettings } from './hub-settings'
 import { recordUsageRollups } from './hub-rollups'
 import { acquireIdempotency, completeIdempotency, failIdempotency } from './hub-idempotency'
@@ -612,6 +612,12 @@ export function normalizeResponseForArchive(
   }
 }
 
+/**
+ * 计费口径：按「客户端请求的 public model」定价（model_prices.publicModel 即该模型）。
+ * 替代车道（请求 A、实际由 B 提供）仍按 A 计费：价格表以 public model 配置，请求方
+ * 应为其请求的模型付费；实际上游模型记录在 request_logs.upstreamModel 与
+ * pricingSnapshot.upstreamModel 中，便于对账与后续调整口径。
+ */
 export async function calculateCost(event: H3Event, model: string, usage: UsageValue, request: Record<string, unknown> | null, multipliers: number) {
   const [price] = await useDatabase(event).select().from(modelPrices)
     .where(and(eq(modelPrices.publicModel, model), lte(modelPrices.effectiveAt, new Date())))
@@ -830,7 +836,7 @@ export async function listAccessibleModels(event: H3Event, key: typeof hubKeys.$
   const restrictedChannels = channelRules.length > 0
   const enabledChannels = new Set(channelRules.filter(rule => rule.enabled).map(rule => rule.channelId))
   for (const row of rows) {
-    const routable = (row.healthStatus === 'healthy' || row.ownerKind === 'user' && row.healthStatus === 'unknown' || row.ownerKind === 'platform' && row.healthStatus === 'unknown' && row.clientIdentityMode === 'passthrough')
+    const routable = channelCanRoute(row)
       && row.verificationStatus !== 'failed'
       && (row.ownerKind !== 'user' || !row.routingState || row.routingState === 'active')
     const privatePoolEligible = key.routeMode !== 'platform_only'
@@ -1595,7 +1601,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
             cost: String(cost),
             billableTokens: usage.totalTokens,
             billedAmount: String(cost),
-            pricingSnapshot: { model: parsed.model, channelMultiplier: Number(candidate.channel.priceMultiplier), groupMultiplier: Number(group.priceMultiplier), keyMultiplier: Number(key.priceMultiplier) },
+            pricingSnapshot: { model: parsed.model, billedModel: parsed.model, upstreamModel: candidate.upstreamModel, channelMultiplier: Number(candidate.channel.priceMultiplier), groupMultiplier: Number(group.priceMultiplier), keyMultiplier: Number(key.priceMultiplier) },
             firstByteMs: firstByteMs ?? Date.now() - startedAt,
             durationMs: Date.now() - startedAt,
             failoverCount: routeFailoverState.count,
@@ -1677,7 +1683,7 @@ export async function handleHubRequest(event: H3Event, path: string) {
           cost: String(cost),
           billableTokens: usage.totalTokens,
           billedAmount: String(cost),
-          pricingSnapshot: { model: parsed.model, channelMultiplier: Number(candidate.channel.priceMultiplier), groupMultiplier: Number(group.priceMultiplier), keyMultiplier: Number(key.priceMultiplier) },
+          pricingSnapshot: { model: parsed.model, billedModel: parsed.model, upstreamModel: candidate.upstreamModel, channelMultiplier: Number(candidate.channel.priceMultiplier), groupMultiplier: Number(group.priceMultiplier), keyMultiplier: Number(key.priceMultiplier) },
           firstByteMs,
           durationMs: Date.now() - startedAt,
           failoverCount: routeFailoverState.count,
