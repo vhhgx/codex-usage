@@ -9,9 +9,9 @@ import { invalidateChannelAccess } from '../../../services/channel-access'
 export default defineEventHandler(async (event) => {
   const admin = await requireAdmin(event)
   const id = getRouterParam(event, 'id') || ''
-  const [existing] = await useDatabase(event).update(channels).set({ enabled: false, updatedAt: new Date() })
-    .where(eq(channels.id, id)).returning({ id: channels.id })
+  const [existing] = await useDatabase(event).select({ id: channels.id }).from(channels).where(eq(channels.id, id)).limit(1)
   if (!existing) throw createError({ statusCode: 404, message: '渠道不存在' })
+  // 先确认没有在途请求，再进入删除流程。判定失败时不改动渠道的任何状态。
   if (!await beginChannelDeletion(event, id)) {
     throw createError({ statusCode: 409, message: '渠道仍有进行中的请求，请等待请求结束后再删除' })
   }

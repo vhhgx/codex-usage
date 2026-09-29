@@ -8,9 +8,9 @@ import { deleteHubKeyPreservingRollups } from '../../../services/hub-deletion'
 export default defineEventHandler(async (event) => {
   const admin = await requireAdmin(event)
   const id = getRouterParam(event, 'id') || ''
-  const [existing] = await useDatabase(event).update(hubKeys).set({ status: 'disabled', updatedAt: new Date() })
-    .where(eq(hubKeys.id, id)).returning({ id: hubKeys.id })
+  const [existing] = await useDatabase(event).select({ id: hubKeys.id }).from(hubKeys).where(eq(hubKeys.id, id)).limit(1)
   if (!existing) throw createError({ statusCode: 404, message: 'Hub Key 不存在' })
+  // 先确认没有在途请求，再进入删除流程。判定失败时不改动 Key 的任何状态。
   if (!await beginHubKeyDeletion(event, id)) {
     throw createError({ statusCode: 409, message: 'Hub Key 仍有进行中的请求，请停用并等待请求结束后再删除' })
   }
