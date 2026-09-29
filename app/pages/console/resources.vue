@@ -26,7 +26,25 @@ interface PlanView {
 
 const route = useRoute()
 const router = useRouter()
-const { data: planData, status: planStatus } = useLazyFetch<{ subscription: PlanView | null }>('/api/console/plan')
+const { data: planData, status: planStatus, refresh } = useLazyFetch<{ subscription: PlanView | null }>('/api/console/plan')
+const { show: showToast } = useAppToast()
+const confirmingDisable = ref(false)
+const planBusy = ref(false)
+async function disablePlan() {
+  if (planBusy.value) return
+  planBusy.value = true
+  try {
+    await $fetch('/api/console/plan/disable', { method: 'POST' })
+    await refresh()
+    confirmingDisable.value = false
+    showToast('套餐已停用，Hub Key 将无法调用；需要恢复请联系管理员', 'success')
+  } catch (value) {
+    const failure = value as { data?: { message?: string }; message?: string }
+    showToast(failure.data?.message || failure.message || '停用套餐失败', 'error')
+  } finally {
+    planBusy.value = false
+  }
+}
 const activeTab = computed<ResourceTab>(() => route.query.tab === 'pool' ? 'pool' : 'relays')
 const plan = computed(() => planData.value?.subscription || null)
 const billingMode = computed(() => plan.value?.plan.entitlementSnapshot?.billingMode || (plan.value?.plan.mode === 'token' ? 'token_package' : plan.value?.plan.mode === 'cost' ? 'token_metered' : 'unlimited'))
@@ -57,7 +75,7 @@ function onResourceTabKeydown(event: KeyboardEvent, current: ResourceTab) {
   <div class="admin-page resources-page">
     <header class="admin-page__header"><div><span class="admin-kicker">PLAN & RESOURCES</span><h1 class="text-balance">套餐与资源</h1><p class="text-pretty">查看套餐权限和额度，管理仅供自己使用的中转与专属号池。</p></div></header>
     <section class="package-summary" :data-status="plan?.status || 'none'">
-      <article class="package-summary__identity"><span><IconRoute :size="17" />当前套餐</span><strong>{{ planStatus === 'pending' && !planData ? '加载中…' : !plan ? '未分配套餐' : plan.status === 'disabled' ? '套餐已停用' : plan.plan.name }}</strong><small>{{ planStatus === 'pending' && !planData ? '正在读取套餐状态' : !plan ? '请联系管理员配置套餐' : plan.status === 'disabled' ? '管理员已停用该套餐，Hub Key 暂时无法调用' : `${packageType} · ${date(plan.expiresAt)}` }}</small></article>
+      <article class="package-summary__identity"><span><IconRoute :size="17" />当前套餐</span><strong>{{ planStatus === 'pending' && !planData ? '加载中…' : !plan ? '未分配套餐' : plan.status === 'disabled' ? '套餐已停用' : plan.plan.name }}</strong><small>{{ planStatus === 'pending' && !planData ? '正在读取套餐状态' : !plan ? '请联系管理员配置套餐' : plan.status === 'disabled' ? '管理员已停用该套餐，Hub Key 暂时无法调用' : `${packageType} · ${date(plan.expiresAt)}` }}</small><div v-if="plan" class="package-summary__actions"><template v-if="plan.status === 'disabled'"><span class="status-label" data-status="disabled">已停用，联系管理员恢复</span></template><template v-else-if="plan.status === 'active'"><template v-if="!confirmingDisable"><button type="button" class="button button--quiet button--small" @click="confirmingDisable = true">停用我的套餐</button></template><template v-else><button type="button" class="button button--danger button--small" :disabled="planBusy" @click="disablePlan">{{ planBusy ? '停用中' : '确认停用' }}</button><button type="button" class="button button--quiet button--small" :disabled="planBusy" @click="confirmingDisable = false">取消</button></template></template></div></article>
       <article><span>今日套餐 Token</span><strong class="tabular-nums">{{ planStatus === 'pending' && !planData ? '—' : compact(plan?.usage.today.tokens || 0) }}</strong><small>{{ planStatus === 'pending' && !planData ? '正在加载' : `${compact(plan?.usage.today.requests || 0)} 次请求` }}</small></article>
       <article><span>本周期套餐 Token</span><strong class="tabular-nums">{{ planStatus === 'pending' && !planData ? '—' : compact(plan?.usage.tokens || 0) }}</strong><small>{{ planStatus === 'pending' && !planData ? '正在加载' : `自 ${date(plan?.startsAt)} 起` }}</small></article>
       <article><span>{{ remainingTokens === null ? '套餐额度' : '剩余 Token' }}</span><strong class="tabular-nums">{{ planStatus === 'pending' && !planData ? '—' : remainingTokens === null ? '不限量' : compact(remainingTokens) }}</strong><small>{{ planStatus === 'pending' && !planData ? '正在加载' : tokenLimit === null ? '仅统计套餐供给' : `总额度 ${compact(tokenLimit)}` }}</small></article>
@@ -88,4 +106,5 @@ function onResourceTabKeydown(event: KeyboardEvent, current: ResourceTab) {
 .resource-tab-panel { padding-top:1.25rem; }
 @media (max-width:900px) { .package-summary { grid-template-columns:repeat(2,1fr); } .package-summary article:nth-child(2) { border-right:0; } .package-summary article:nth-child(-n+2) { border-bottom:1px solid var(--hub-line-row); } }
 @media (max-width:600px) { .package-summary { grid-template-columns:1fr; } .package-summary article { min-height:100px; border-right:0; border-bottom:1px solid var(--hub-line-row); } .package-summary article:nth-child(-n+2) { border-bottom:1px solid var(--hub-line-row); } }
+.package-summary__actions { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; margin-top:.55rem; }
 </style>
