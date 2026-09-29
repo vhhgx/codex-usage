@@ -208,11 +208,16 @@ export async function createAccountVaultEntry(event: H3Event, body: UnknownRecor
     const totpSecret = normalizeTotpSecret(body.totpSecret)
     if (Boolean(accessToken) !== Boolean(refreshToken)) throw createError({ statusCode: 400, message: 'Access Token 和 Refresh Token 必须同时提供' })
     const password = accountPassword(body.password, false)
+    const base = accountValues(body)
     const values = {
-      ...accountValues(body),
-      purchaseDate: zonedDateKey(new Date(), 'Asia/Shanghai'),
-      warrantyDate: null,
-      warrantyStatus: '无质保'
+      ...base,
+      // 仅当未显式填写时才套用默认值（发货导入没有购买/质保信息）。
+      // 此前无条件覆盖，导致通过接口录入的真实购买日期与质保状态被丢弃。
+      purchaseDate: base.purchaseDate ?? zonedDateKey(new Date(), 'Asia/Shanghai'),
+      warrantyDate: base.warrantyDate ?? null,
+      warrantyStatus: body.warrantyStatus === undefined || body.warrantyStatus === null || body.warrantyStatus === ''
+        ? '无质保'
+        : base.warrantyStatus
     }
     if (values.source === 'unknown') throw createError({ statusCode: 400, message: '请选择账号来源' })
     let receiverId = typeof body.smsReceiverId === 'string' && body.smsReceiverId ? body.smsReceiverId : null
