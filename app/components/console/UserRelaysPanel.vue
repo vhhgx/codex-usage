@@ -756,6 +756,8 @@ function groupCapabilitySummary(group: UserRelayGroupView) {
 }
 function accountCapabilitySummary(account: ChannelView) {
   const scopes = account.modelScopes.map(scope => scope === 'gpt' ? 'GPT' : scope === 'claude' ? 'Claude' : '其他厂商').join(' / ') || '品类待设置'
+  // 暂停的账号必须一眼可辨：它不会参与路由，不能被显示成「可用」。
+  if (!account.enabled) return `${scopes} · 已暂停 · 不参与路由`
   const verified = account.protocols.filter(item => item.enabled && item.verificationStatus === 'verified').map(item => item.protocol === 'openai_chat' && item.capabilityMode === 'responses_via_chat' ? 'Responses→Chat' : protocolLabel(item.protocol)).join(' · ')
   const state = account.healthStatus === 'healthy' ? '可用' : account.healthStatus === 'unhealthy' ? '需处理' : '待检测'
   return `${scopes} · ${verified || state} · ${date(account.lastHealthCheckAt)}`
