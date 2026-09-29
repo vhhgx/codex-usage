@@ -25,6 +25,8 @@ import { anthropicToOpenAiChat, anthropicUsage, openAiChatToAnthropic, openAiUsa
 import { pipeOpenAiChatAsAnthropic } from './protocols/anthropic-stream'
 import type { CanonicalUsage } from './protocols/canonical'
 import { getUserFailoverSourceIds } from './user-route-preferences'
+import { userModelRouteLanes } from './user-model-routing'
+import { acquireIdempotency, completeIdempotency, failIdempotency } from './hub-idempotency'
 import { classifyRelayFailure, relayFailureAffectsAccount, relayFailureAllowsFailover } from './relay-platform'
 import { MAX_UPSTREAM_RETRIES, shouldRetryUpstream, shouldRetryUpstreamError, upstreamRetryDelay, waitForUpstreamRetry } from './upstream-retry'
 import { markUserRelayFailure } from './user-relays'
@@ -171,24 +173,58 @@ export async function handleAnthropicMessages(event: H3Event) {
   event.context.hubRequestedModel = requestedModel
   if (keyModels.length && !keyModels.some(rule => rule.publicModel === requestedModel)) anthropicError(403, 'This Hub Key cannot use the requested model', 'permission_error')
   if (groupModels.length && !groupModels.some(rule => rule.publicModel === requestedModel)) anthropicError(403, 'This group cannot use the requested model', 'permission_error')
+  const requestId = typeof event.context.hubRequestId === 'string' ? event.context.hubRequestId : `req_${crypto.randomUUID().replace(/-/g, '')}`
+  const streaming = body.stream === true
+  // 与 OpenAI 端点一致的幂等语义：非流式可重放首次响应，流式不支持幂等键。
+  const idempotency = await acquireIdempotency(event, key.id, endpoint, raw, streaming)
+  if (idempotency?.replay) {
+    const replay = idempotency.replay
+    const replayOk = replay.status >= 200 && replay.status < 400
+    await bestEffort(useDatabase(event).insert(requestLogs).values({
+      requestId,
+      keyId: key.id,
+      userId,
+      groupId: group.id,
+      endpoint,
+      requestedModel,
+      inboundProtocol: 'anthropic_messages',
+      status: replayOk ? 'success' : 'error',
+      httpStatus: replay.status,
+      errorCode: 'idempotent_replay',
+      durationMs: 0,
+      completedAt: new Date()
+    }))
+    await bestEffort(recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: null, model: requestedModel, endpoint, status: replayOk ? 'success' : 'error', inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0, durationMs: 0, failovers: 0, admitted: false }))
+    await bestEffort(touchKeyCredential(event, key.id))
+    setResponseStatus(event, replay.status)
+    setResponseHeader(event, 'content-type', replay.contentType)
+    setResponseHeader(event, 'x-idempotent-replayed', 'true')
+    return replay.body
+  }
   const affinityKey = hashCacheAffinity(event, { scope: `${userId}:${key.id}`, protocol: 'anthropic_messages', model: requestedModel, system: body.system, tools: body.tools, sessionId: getHeader(event, 'x-zephyr-session-id') || null })
   const routeOptions = { userId, keyId: key.id, protocol: 'anthropic_messages' as const, allowConversion: true, affinityKey }
   const sourceIds = await getUserFailoverSourceIds(event, userId)
-  const sourceNodes = orderedRouteSourceNodes(key.routeMode, sourceIds)
+  const modelLanes = await userModelRouteLanes(event, userId, requestedModel)
   const [privatePool] = await useDatabase(event).select().from(userPoolGroups).where(and(eq(userPoolGroups.ownerUserId, userId), eq(userPoolGroups.status, 'active'))).limit(1)
   const privatePoolAvailable = Boolean(privatePool && (await useDatabase(event).select({ id: userPoolAccounts.id }).from(userPoolAccounts).where(and(eq(userPoolAccounts.poolGroupId, privatePool.id), eq(userPoolAccounts.status, 'active'), eq(userPoolAccounts.schedulable, true))).limit(1))[0])
-  const candidateBatches = await Promise.all(sourceNodes.map(async node => ({
-    node,
-    candidates: node.source === 'platform'
-      ? await routeCandidates(event, requestedModel, endpoint, group.id, 'platform', undefined, routeOptions)
-      : node.source === 'private_pool'
-        ? privatePoolAvailable ? await routeCandidates(event, requestedModel, endpoint, group.id, 'private_pool', privatePool!.id, routeOptions) : []
-        : await routeCandidates(event, requestedModel, endpoint, group.id, 'user_relay', undefined, { ...routeOptions, channelId: node.channelId, relayGroupId: node.relayGroupId })
-  })))
+  const candidateBatches: Array<{ node: ReturnType<typeof orderedRouteSourceNodes>[number]; candidates: Awaited<ReturnType<typeof routeCandidates>> }> = []
+  for (const lane of modelLanes) {
+    const laneSourceIds = [...lane.orderedSourceIds.filter(id => sourceIds.includes(id)), ...sourceIds.filter(id => !lane.orderedSourceIds.includes(id))]
+    const laneNodes = orderedRouteSourceNodes(key.routeMode, laneSourceIds)
+    const laneOptions = { ...routeOptions, requestedModel, substitution: lane.substitution, orderMode: lane.orderMode }
+    const laneBatches = await Promise.all(laneNodes.map(async node => ({
+      node,
+      candidates: node.source === 'platform'
+        ? await routeCandidates(event, lane.actualModel, endpoint, group.id, 'platform', undefined, laneOptions)
+        : node.source === 'private_pool'
+          ? (privatePoolAvailable ? await routeCandidates(event, lane.actualModel, endpoint, group.id, 'private_pool', privatePool!.id, laneOptions) : [])
+          : await routeCandidates(event, lane.actualModel, endpoint, group.id, 'user_relay', undefined, { ...laneOptions, channelId: node.channelId, relayGroupId: node.relayGroupId })
+    })))
+    candidateBatches.push(...laneBatches)
+  }
   const initialCandidates = candidateBatches.flatMap(batch => batch.candidates)
   if (!initialCandidates.length) anthropicError(503, `No healthy channel supports model ${requestedModel}`, 'api_error')
   const reservation = await estimateReservation(event, requestedModel, endpoint, body, raw.length, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Math.max(...initialCandidates.map(candidate => Number(candidate.channel.priceMultiplier)))))
-  const requestId = typeof event.context.hubRequestId === 'string' ? event.context.hubRequestId : `req_${crypto.randomUUID().replace(/-/g, '')}`
   let packageDecision: SupplyDecision | null = null
   let billingMode = 'unlimited'
   let packageSupplyMode = 'platform_only'
@@ -278,6 +314,7 @@ export async function handleAnthropicMessages(event: H3Event) {
     // the candidate actually selected and are activated below.
     concurrencyLease = await admitHubRequest(event, key, group, reservation.tokens, 0, { scopeMode: 'base_only' })
   } catch (error) {
+    if (idempotency) await failIdempotency(event, idempotency.record.id, false).catch(() => {})
     if (walletHeld && walletHoldKey) await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {})
     throw error
   }
@@ -302,11 +339,13 @@ export async function handleAnthropicMessages(event: H3Event) {
     }).returning()
   } catch (error) {
     await settleBaseAdmission()
+    if (idempotency) await failIdempotency(event, idempotency.record.id, false).catch(() => {})
     if (walletHeld && walletHoldKey) await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {})
     throw error
   }
   if (!log) {
     await settleBaseAdmission()
+    if (idempotency) await failIdempotency(event, idempotency.record.id, false).catch(() => {})
     if (walletHeld && walletHoldKey) await releaseUserWallet(event, userId, walletHoldKey, `request:${requestId}:release`, requestId).catch(() => {})
     anthropicError(500, 'Unable to initialize request log')
   }
@@ -315,6 +354,7 @@ export async function handleAnthropicMessages(event: H3Event) {
     if (requestObject) await bestEffort(useDatabase(event).update(requestLogs).set({ requestBodyObject: requestObject }).where(eq(requestLogs.id, log.id)))
   } catch (error) {
     await settleBaseAdmission()
+    if (idempotency) await failIdempotency(event, idempotency.record.id, false).catch(() => {})
     throw error
   }
 
@@ -324,6 +364,8 @@ export async function handleAnthropicMessages(event: H3Event) {
   let routeFailoverState: RouteFailoverState = { candidateKey: null, count: 0 }
   let lastCandidate: typeof candidates[number] | null = null
   let responseStarted = false
+  // 是否已经向上游发出过请求：决定幂等记录在失败时能否安全重试。
+  let upstreamStarted = false
   // A wallet settlement has a distinct idempotency key from a release. Keep
   // the intended amount until settlement is confirmed so cleanup never
   // converts a timed-out settlement into a conflicting release.
@@ -462,6 +504,7 @@ export async function handleAnthropicMessages(event: H3Event) {
         let response: Response
         let prefetchedResponseBuffer: Buffer | null = null
         let responseFailureClass = null as ReturnType<typeof classifyRelayFailure> | null
+        upstreamStarted = true
         for (let retryIndex = 0; ; retryIndex++) {
           attempts += 1
           attemptStarted = Date.now()
@@ -615,6 +658,7 @@ export async function handleAnthropicMessages(event: H3Event) {
         )
         const cost = supplyDecision.source === 'user_relay' ? 0 : await calculateCost(event, requestedModel, usageForBilling(usage), body, effectivePriceMultiplier(Number(group.priceMultiplier), Number(key.priceMultiplier), Number(candidate.channel.priceMultiplier)))
         const responseObject = await storeBodySafe(event, requestId, 'response', output, 'application/json')
+        if (idempotency) await bestEffort(completeIdempotency(event, idempotency.record.id, response.status, 'application/json; charset=utf-8', responseObject))
         await bestEffort(useDatabase(event).insert(requestAttempts).values({ requestLogId: log.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, attempt: attempts, status: response.ok ? 'success' : 'failed', httpStatus: response.status, durationMs: Date.now() - started, failureClass: response.ok ? null : classifyRelayFailure(response.status, output.toString('utf8')), ...resourceFields(candidate) }))
         await bestEffort(useDatabase(event).update(requestLogs).set({
           channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, outboundProtocol: candidate.protocolBinding.protocol, conversionMode: candidate.conversionMode,
@@ -623,7 +667,8 @@ export async function handleAnthropicMessages(event: H3Event) {
           upstreamModel: candidate.upstreamModel, status: response.ok ? 'success' : 'error', httpStatus: response.status, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
           cachedTokens: usage.cachedTokens, cacheCreationTokens: usage.cacheCreationTokens, reasoningTokens: usage.reasoningTokens, totalTokens: usage.totalTokens,
           cost: String(cost), billableTokens: usage.totalTokens, billedAmount: String(cost), firstByteMs: Date.now() - started, durationMs: Date.now() - started,
-          failoverCount: routeFailoverState.count, responseBodyObject: responseObject, responseBodyHash: contentHash(output), errorMessage: response.ok ? null : redactSensitiveText(output.toString('utf8'), 2000), completedAt: new Date()
+          failoverCount: routeFailoverState.count, responseBodyObject: responseObject, responseBodyHash: contentHash(output), errorMessage: response.ok ? null : redactSensitiveText(output.toString('utf8'), 2000), completedAt: new Date(),
+          pricingSnapshot: { model: requestedModel, billedModel: requestedModel, upstreamModel: candidate.upstreamModel, channelMultiplier: Number(candidate.channel.priceMultiplier), groupMultiplier: Number(group.priceMultiplier), keyMultiplier: Number(key.priceMultiplier) }
         }).where(eq(requestLogs.id, log.id)))
         await bestEffort(recordUsageRollups(event, { keyId: key.id, userId, groupId: group.id, channelId: candidate.channel.id, protocolBindingId: candidate.protocolBinding.id, protocol: candidate.protocolBinding.protocol, model: requestedModel, endpoint, status: response.ok ? 'success' : 'error', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, cacheCreationTokens: usage.cacheCreationTokens, affinityReused: affinityWasReused, affinityEligible: true, totalTokens: usage.totalTokens, cost, durationMs: Date.now() - started, failovers: routeFailoverState.count }))
         await settleAdmissions(usage.totalTokens, cost)
@@ -701,6 +746,7 @@ export async function handleAnthropicMessages(event: H3Event) {
     }
     anthropicError(503, 'All matching channels are at their concurrency limit', 'overloaded_error')
   } catch (error) {
+    if (idempotency) await failIdempotency(event, idempotency.record.id, upstreamStarted).catch(() => {})
     if (admittedChannel) await releaseTrackedChannel(admittedChannel)
     if (!settled) {
       if (!baseAdmissionSettled) await settleBaseAdmission()
