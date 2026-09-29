@@ -158,17 +158,25 @@ const groupChoiceOptions = computed(() => activeGroups.value.map(group => ({
   hint: `${group.keyCount} 个 Key · ${group.description || '管理访问分组'}`,
   icon: IconRoute
 })))
-const planChoiceOptions = computed(() => activePlans.value.map((plan, index) => ({
-  value: plan.id,
-  label: plan.name,
-  hint: plan.description || '按当前套餐策略提供访问额度',
-  icon: planIcon(index)
-})))
+const planChoiceOptions = computed(() => [
+  ...activePlans.value.map((plan, index) => ({
+    value: plan.id,
+    label: plan.name,
+    hint: plan.description || '按当前套餐策略提供访问额度',
+    icon: planIcon(index)
+  })),
+  { value: '', label: '不分配套餐（停用访问）', hint: '保存后该用户所有 Hub Key 立即无法调用', icon: IconShieldCheck }
+])
 const groupFilterOptions = computed(() => [
   { value: '', label: '全部分组' },
   ...(groupData.value?.groups || []).map(group => ({ value: group.id, label: group.name }))
 ])
 const detailIdentity = computed(() => detail.value?.user || detailUser.value)
+
+function planCellLabel(user: ManagedUserView) {
+  if (!user.subscription) return user.role === 'user' ? '默认不限量' : '—'
+  return user.subscription.status === 'disabled' ? '已停用' : user.subscription.planName
+}
 
 function defaultPlanId() {
   return activePlans.value.find(plan => plan.id === '00000000-0000-4000-8000-000000000002')?.id
@@ -228,18 +236,16 @@ function openEdit(user: ManagedUserView) {
   showPassword.value = false
   formError.value = ''
   const assigned = user.subscription
-  selectedPlanId.value = assigned?.planId || defaultPlanId()
+  // 已停用的订阅在表单里显示为「不分配套餐」，再次保存不会把它悄悄激活。
+  selectedPlanId.value = assigned?.status === 'disabled' ? '' : (assigned?.planId || defaultPlanId())
   originalPlanId.value = assigned?.planId || ''
   showForm.value = true
 }
 
 async function save() {
-  if (form.role === 'user' && !selectedPlanId.value) {
-    formError.value = '请先创建或启用一个用户套餐'
-    return
-  }
   saving.value = true
   formError.value = ''
+  const wantsNoPlan = form.role === 'user' && selectedPlanId.value === ''
   try {
     if (editing.value) {
       await $fetch(`/api/admin/users/${editing.value.id}`, {
@@ -252,15 +258,17 @@ async function save() {
           status: form.status,
           platformAccessExpiresAt: form.platformAccessExpiresAt ? new Date(form.platformAccessExpiresAt).toISOString() : null,
           groupIds: form.groupIds,
-          planId: form.role === 'user' && selectedPlanId.value !== originalPlanId.value ? selectedPlanId.value : undefined
+          planId: form.role === 'user' && !wantsNoPlan && selectedPlanId.value !== originalPlanId.value ? selectedPlanId.value : undefined
         }
       })
+      if (wantsNoPlan) await $fetch('/api/admin/plans/unassign', { method: 'POST', body: { userId: editing.value.id } })
       if (resetPassword.value) {
         await $fetch(`/api/admin/users/${editing.value.id}/reset-password`, { method: 'POST', body: { password: resetPassword.value } })
       }
       showToast('用户资料已保存', 'success')
     } else {
-      await $fetch<{ user: HubUserView }>('/api/admin/users', { method: 'POST', body: { ...form, platformAccessExpiresAt: form.platformAccessExpiresAt ? new Date(form.platformAccessExpiresAt).toISOString() : null, planId: form.role === 'user' ? selectedPlanId.value : undefined } })
+      const created = await $fetch<{ user: HubUserView }>('/api/admin/users', { method: 'POST', body: { ...form, platformAccessExpiresAt: form.platformAccessExpiresAt ? new Date(form.platformAccessExpiresAt).toISOString() : null, planId: form.role === 'user' && !wantsNoPlan ? selectedPlanId.value : undefined } })
+      if (wantsNoPlan && created.user?.id) await $fetch('/api/admin/plans/unassign', { method: 'POST', body: { userId: created.user.id } })
       showToast('用户已创建', 'success')
     }
     await Promise.all([refresh(), refreshGroups(), refreshPlans()])
@@ -417,7 +425,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleEscape))
               </td>
               <td data-label="角色 / 状态"><div class="users-role-cell"><strong>{{ roleLabel(user.role) }}</strong><span class="status-label" :data-status="statusTone(user.status)"><i />{{ statusLabel(user.status) }}</span></div></td>
               <td data-label="分组"><span class="users-text-cell">{{ user.groupNames.join('、') || '未分组' }}</span></td>
-              <td data-label="套餐"><span class="users-plan-cell"><strong>{{ user.subscription?.planName || (user.role === 'user' ? '默认不限量' : '—') }}</strong><small :data-expired="Boolean(user.platformAccessExpiresAt && user.platformAccessExpiresAt <= Date.now())">{{ platformExpiryLabel(user) }}</small></span></td>
+              <td data-label="套餐"><span class="users-plan-cell"><strong>{{ planCellLabel(user) }}</strong><small :data-expired="Boolean(user.platformAccessExpiresAt && user.platformAccessExpiresAt <= Date.now())">{{ platformExpiryLabel(user) }}</small></span></td>
               <td data-label="Key"><NuxtLink :to="{ path: '/admin/keys', query: { owner: user.id } }" class="users-key-link"><IconKey :size="14" :stroke-width="1.8" />{{ user.keyCount }}</NuxtLink></td>
               <td data-label="最后登录"><span class="users-date">{{ date(user.lastLoginAt) }}</span></td>
               <td data-label="操作"><div class="table-actions users-table-actions"><button class="icon-button" type="button" title="用户详情" aria-label="用户详情" @click="openDetail(user)"><IconChartBar :size="16" :stroke-width="1.8" /></button><button class="icon-button" type="button" title="重置密码" aria-label="重置密码" @click="openEdit(user)"><IconKey :size="16" :stroke-width="1.8" /></button><button class="icon-button" type="button" title="编辑用户" aria-label="编辑用户" @click="openEdit(user)"><IconEdit :size="16" :stroke-width="1.8" /></button><button class="icon-button danger" type="button" title="删除用户" aria-label="删除用户" :disabled="user.keyCount > 0" @click="deletingUser = user"><IconTrash :size="16" :stroke-width="1.8" /></button></div></td>

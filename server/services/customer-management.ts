@@ -264,6 +264,30 @@ export async function assignPlan(event: H3Event, userId: string, planId: string,
   return getUserPlan(event, userId)
 }
 
+/**
+ * 完整关闭一个用户的套餐：把订阅行置为 disabled，但**保留这一行**。
+ * 不能删除订阅行——ensureDefaultSubscription 会在用户下次访问时补一个
+ * 「默认不限量」，导致用户永远无法被真正关闭。
+ */
+export async function unassignUserPlan(event: H3Event, userId: string, actorId?: string) {
+  const db = useDatabase(event)
+  const [user] = await db.select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1)
+  if (!user) throw createError({ statusCode: 400, message: '用户不存在' })
+  const plan = await ensureDefaultPlan(event, actorId)
+  await db.insert(userSubscriptions).values({
+    userId,
+    planId: plan.id,
+    planVersionId: plan.currentVersionId || null,
+    entitlementSnapshot: {},
+    status: 'disabled',
+    assignedBy: actorId || null
+  }).onConflictDoUpdate({
+    target: userSubscriptions.userId,
+    set: { status: 'disabled', assignedBy: actorId || null, updatedAt: new Date() }
+  })
+  return getUserPlan(event, userId)
+}
+
 export async function getUserPlan(event: H3Event, userId: string) {
   await ensureDefaultSubscription(event, userId)
   const db = useDatabase(event)
