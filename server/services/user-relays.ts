@@ -216,7 +216,18 @@ export async function getUserRelayBalance(event: H3Event, ownerUserId: string, i
     try { payload = raw ? JSON.parse(raw) : {} } catch { throw createError({ statusCode: 502, message: '余额接口未返回有效 JSON' }) }
     const values = group.platformType === 'newapi' ? parseNewApiBalance(payload) : parseSub2ApiBalance(payload)
     const now = new Date()
-    const depleted = values.remainingBalance !== null && values.remainingBalance <= 0
+    const hasBalance = values.remainingBalance !== null
+    const depleted = hasBalance && values.remainingBalance! <= 0
+    // 只有在真的解析出余额时才改写 routingState：上游返回空数据不能把
+    // credential_error/depleted 洗回 active，否则会把坏账号重新放回路由。
+    const routingStatePatch = hasBalance
+      ? {
+          routingState: depleted ? 'depleted' as const : 'active' as const,
+          stateReasonCode: depleted ? 'balance_zero' : null,
+          stateReasonMessage: depleted ? '余额刷新结果为零，等待下次手工刷新' : null,
+          stateChangedAt: now
+        }
+      : {}
     await useDatabase(event).insert(userRelayAccountStates).values({
       channelId: id,
       totalQuota: values.totalQuota === null ? null : String(values.totalQuota),
@@ -240,14 +251,14 @@ export async function getUserRelayBalance(event: H3Event, ownerUserId: string, i
         totalQuota: values.totalQuota === null ? null : String(values.totalQuota), purchasedQuota: values.purchasedQuota === null ? null : String(values.purchasedQuota),
         giftQuota: values.giftQuota === null ? null : String(values.giftQuota), usedQuota: values.usedQuota === null ? null : String(values.usedQuota),
         remainingBalance: values.remainingBalance === null ? null : String(values.remainingBalance), currency: values.currency, balanceSource: values.source,
-        balanceStatus: 'success', balanceFetchedAt: now, balanceError: null, routingState: depleted ? 'depleted' : 'active',
-        stateReasonCode: depleted ? 'balance_zero' : null, stateReasonMessage: depleted ? '余额刷新结果为零，等待下次手工刷新' : null,
-        stateChangedAt: now, version: sql`${userRelayAccountStates.version} + 1`, updatedAt: now
+        balanceStatus: 'success', balanceFetchedAt: now, balanceError: null, ...routingStatePatch,
+        version: sql`${userRelayAccountStates.version} + 1`, updatedAt: now
       }
     })
     return {
       id, name: relay.name, quota: values.totalQuota, purchasedQuota: values.purchasedQuota, giftQuota: values.giftQuota,
-      usedQuota: values.usedQuota, remaining: values.remainingBalance, currency: values.currency, fetchedAt: now.getTime(), routingState: depleted ? 'depleted' : 'active'
+      usedQuota: values.usedQuota, remaining: values.remainingBalance, currency: values.currency, fetchedAt: now.getTime(),
+      routingState: hasBalance ? (depleted ? 'depleted' : 'active') : null
     }
   } catch (error) {
     const detail = upstreamNetworkError(error)
@@ -569,6 +580,15 @@ export async function updateUserRelay(event: H3Event, ownerUserId: string, id: s
   if (connectionChanged) {
     patch.healthStatus = 'unknown'
     patch.lastHealthError = null
+    // 凭据/连接变更代表「我已修好，重试」。此前 credential_error/depleted 没有任何
+    // 退出路径（generic 站又无法靠余额刷新恢复），修好配置后仍永久不可路由。
+    await useDatabase(event).update(userRelayAccountStates).set({
+      routingState: 'active',
+      stateReasonCode: null,
+      stateReasonMessage: null,
+      stateChangedAt: new Date(),
+      updatedAt: new Date()
+    }).where(eq(userRelayAccountStates.channelId, id))
   }
   await useDatabase(event).update(channels).set(patch).where(and(eq(channels.id, id), eq(channels.ownerUserId, ownerUserId)))
   if ('protocols' in body) protocols = await replaceChannelProtocols(event, id, protocols as ReturnType<typeof parseChannelProtocols>)
