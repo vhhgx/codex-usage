@@ -123,8 +123,9 @@ export function sortRelayAccounts(accounts: UserRelayAccountView[], mode: RelayA
     const state = schedulable(left) - schedulable(right)
     if (state) return state
     if (mode !== 'manual') {
-      const leftBalance = left.state.remainingBalance
-      const rightBalance = right.state.remainingBalance
+      // 余额查询失败时保留的是旧值，不能参与排序，否则显示顺序会与实际额度不符。
+      const leftBalance = left.state.balanceStatus === 'error' ? null : left.state.remainingBalance
+      const rightBalance = right.state.balanceStatus === 'error' ? null : right.state.remainingBalance
       if (leftBalance !== null || rightBalance !== null) {
         if (leftBalance === null) return 1
         if (rightBalance === null) return -1

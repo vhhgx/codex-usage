@@ -4,7 +4,7 @@ import type { H3Event } from 'h3'
 import { createError } from 'h3'
 import { useDatabase } from '../db'
 import { channelModelBindings, channelModelPrices, channelModels, channelProtocolBindings, channels, groupChannelRules, modelPools, userPoolAccounts, userPoolGroups, userRelayAccountStates, userRelayGroups } from '../db/schema'
-import { canonicalModelId } from '#shared/utils/model-routing'
+import { canonicalModelId, modelScope } from '#shared/utils/model-routing'
 import { decryptChannelSecret, decryptContextSecret } from '../utils/hub-crypto'
 import { redactSensitiveText } from '../utils/upstream'
 import { useRedis } from '../utils/redis'
@@ -113,6 +113,60 @@ export function compareRouteCandidates(left: CandidateOrderValue, right: Candida
   return supplySource === 'user_relay'
     ? priority || conversion || left.channel.name.localeCompare(right.channel.name)
     : conversion || priority || left.channel.name.localeCompare(right.channel.name)
+}
+
+/** 用户中转账号的完整排序键。字段都已提前解析，便于单测。 */
+export interface UserRelayOrderKey {
+  accountRank: number
+  protocolScore: number
+  /** 0 = 渠道声明了该模型品类（或未声明，视为全部支持），1 = 明确未声明。 */
+  scopeOrder: number
+  /** 仅在上次余额查询成功时才有值；报错/未知时为 null，不参与排序。 */
+  balance: number | null
+  normalizedPrice: number | null
+  priority: number
+  name: string
+}
+
+/**
+ * 用户中转账号的选路顺序（与前端面板顺序保持一致）：
+ * 1. 手工顺序（accountRank）最优先；
+ * 2. 协议原生匹配（gpt 默认 responses，仅 chat 时由协议层转换）；
+ * 3. 渠道是否声明支持该模型品类；
+ * 4. 可信的余额（报错/未知时不参与）；
+ * 5. 单价（仅当用户为该模型显式选择 price_asc）；
+ * 末位用渠道 priority / 名称兜底。
+ * 当站点组选择了余额排序时，余额优先，手工顺序退为次级。
+ */
+export function compareUserRelayOrder(
+  left: UserRelayOrderKey,
+  right: UserRelayOrderKey,
+  mode: 'manual' | 'balance_asc' | 'balance_desc',
+  orderMode: 'manual' | 'price_asc' = 'manual'
+): number {
+  const rankDiff = left.accountRank - right.accountRank
+  const protocolDiff = right.protocolScore - left.protocolScore
+  const scopeDiff = left.scopeOrder - right.scopeOrder
+  const balanceDiff = left.balance === null || right.balance === null
+    ? 0
+    : mode === 'balance_asc' ? left.balance - right.balance : right.balance - left.balance
+  const priceDiff = orderMode !== 'price_asc' || left.normalizedPrice === null || right.normalizedPrice === null
+    ? 0
+    : left.normalizedPrice - right.normalizedPrice
+  if (mode === 'manual') {
+    if (rankDiff) return rankDiff
+    if (protocolDiff) return protocolDiff
+    if (scopeDiff) return scopeDiff
+    if (balanceDiff) return balanceDiff
+    if (priceDiff) return priceDiff
+  } else {
+    if (balanceDiff) return balanceDiff
+    if (rankDiff) return rankDiff
+    if (protocolDiff) return protocolDiff
+    if (scopeDiff) return scopeDiff
+    if (priceDiff) return priceDiff
+  }
+  return left.priority - right.priority || left.name.localeCompare(right.name)
 }
 
 export function protocolBindingAllowsRouting(
@@ -335,36 +389,36 @@ export async function routeCandidates(
   }
   if (supplySource === 'user_relay') {
     const rowByChannel = new Map(rows.map(row => [row.channel.id, row]))
+    const requestedScope = modelScope(options.requestedModel || publicModel)
+    const orderKeys = new Map<string, UserRelayOrderKey>()
+    const orderModes = new Map<string, 'manual' | 'balance_asc' | 'balance_desc'>()
+    for (const candidate of available) {
+      const row = rowByChannel.get(candidate.channel.id)
+      const state = row?.accountState
+      // 余额只有在上次查询成功时才可信：报错时留下的旧值不能拿来排序。
+      const balance = !state || state.balanceStatus === 'error' || state.remainingBalance === null
+        ? null
+        : (Number.isFinite(Number(state.remainingBalance)) ? Number(state.remainingBalance) : null)
+      const scopes = candidate.channel.modelScopes || []
+      orderKeys.set(candidate.channel.id, {
+        accountRank: candidate.channel.accountRank,
+        protocolScore: candidate.protocolScore || 0,
+        scopeOrder: scopes.length === 0 || scopes.includes(requestedScope) ? 0 : 1,
+        balance,
+        normalizedPrice: candidate.normalizedPrice ?? null,
+        priority: candidate.channel.priority,
+        name: candidate.channel.name
+      })
+      orderModes.set(candidate.channel.id, row?.relayGroup?.accountOrderMode || 'manual')
+    }
     available.sort((left, right) => {
-      // 1. 协议匹配分数优先（高分优先）
-      const protocolDiff = (right.protocolScore || 0) - (left.protocolScore || 0)
-      if (protocolDiff !== 0) return protocolDiff
-
-      // 2. 价格排序（如果启用）
-      if (options.orderMode === 'price_asc') {
-        if (left.normalizedPrice === null && right.normalizedPrice !== null) return 1
-        if (right.normalizedPrice === null && left.normalizedPrice !== null) return -1
-        const price = (left.normalizedPrice || 0) - (right.normalizedPrice || 0)
-        if (price) return price
-      }
-
-      // 3. 账户排序模式
-      const leftRow = rowByChannel.get(left.channel.id)
-      const rightRow = rowByChannel.get(right.channel.id)
-      const mode = leftRow?.relayGroup?.accountOrderMode || rightRow?.relayGroup?.accountOrderMode || 'manual'
-      if (mode !== 'manual') {
-        const leftBalance = leftRow?.accountState?.remainingBalance === null || leftRow?.accountState?.remainingBalance === undefined ? null : Number(leftRow.accountState.remainingBalance)
-        const rightBalance = rightRow?.accountState?.remainingBalance === null || rightRow?.accountState?.remainingBalance === undefined ? null : Number(rightRow.accountState.remainingBalance)
-        if (leftBalance !== null || rightBalance !== null) {
-          if (leftBalance === null) return 1
-          if (rightBalance === null) return -1
-          const balance = mode === 'balance_asc' ? leftBalance - rightBalance : rightBalance - leftBalance
-          if (balance) return balance
-        }
-      }
-
-      // 4. 账户排名和其他
-      return left.channel.accountRank - right.channel.accountRank || compareRouteCandidates(left, right, supplySource)
+      const mode = orderModes.get(left.channel.id) || orderModes.get(right.channel.id) || 'manual'
+      return compareUserRelayOrder(
+        orderKeys.get(left.channel.id)!,
+        orderKeys.get(right.channel.id)!,
+        mode,
+        options.orderMode === 'price_asc' ? 'price_asc' : 'manual'
+      )
     })
   } else available.sort((left, right) => {
     // 1. 协议匹配分数优先（高分优先）
